@@ -147,7 +147,7 @@ def start_recording(gopro_id):
         
         try:
             data = request.get_json() or {}
-            duration = data.get('duration', 30)
+            duration = data.get('duration', 18000)  # Default to 5 hours
             
             # Generate unique filename
             timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -161,7 +161,7 @@ def start_recording(gopro_id):
                 '--wired', 
                 '--wifi_interface', gopro['interface'],
                 '-o', video_path, 
-                # str(duration)
+                str(duration)
             ]
             
             process = subprocess.Popen(
