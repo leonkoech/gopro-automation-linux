@@ -250,6 +250,82 @@ def start_recording(gopro_id):
             return jsonify({'success': False, 'error': str(e)}), 500
 
 
+import requests
+
+def get_gopro_wired_ip(gopro_id):
+    """Get the actual GoPro IP by checking what gopro-video is using"""
+    try:
+        # When gopro-video connects, the GoPro creates a network interface
+        # We can find the IP by looking at the interface's gateway
+        gopros = get_connected_gopros()
+        gopro = next((g for g in gopros if g['id'] == gopro_id), None)
+        
+        if not gopro:
+            return None
+        
+        interface = gopro['interface']
+        
+        # Use ip route to find the GoPro's IP on this interface
+        result = subprocess.run(
+            ['ip', 'route', 'show', 'dev', interface],
+            capture_output=True,
+            text=True,
+            timeout=2
+        )
+        
+        # Parse output to find the network
+        # Typical output: "172.20.110.0/24 proto kernel scope link src 172.20.110.50"
+        lines = result.stdout.strip().split('\n')
+        for line in lines:
+            if 'proto kernel' in line or 'scope link' in line:
+                # Extract network, GoPro is typically .51
+                parts = line.split()
+                for i, part in enumerate(parts):
+                    if '/' in part and '.' in part:  # CIDR notation
+                        network = part.split('/')[0]
+                        # GoPro is usually .51 in the same subnet
+                        base = '.'.join(network.split('.')[:-1])
+                        gopro_ip = f"{base}.51"
+                        
+                        # Verify this IP responds
+                        try:
+                            test = requests.get(f'http://{gopro_ip}:8080/gopro/camera/state', timeout=1)
+                            if test.status_code == 200:
+                                print(f"Found GoPro at {gopro_ip}")
+                                return gopro_ip
+                        except:
+                            pass
+        
+        # Fallback: try common IPs
+        for last_octet in [51, 1]:
+            try:
+                # Try to get our own IP on this interface
+                result = subprocess.run(
+                    ['ip', 'addr', 'show', interface],
+                    capture_output=True,
+                    text=True,
+                    timeout=2
+                )
+                # Look for inet address
+                import re
+                match = re.search(r'inet (\d+\.\d+\.\d+)\.\d+', result.stdout)
+                if match:
+                    base = match.group(1)
+                    gopro_ip = f"{base}.{last_octet}"
+                    test = requests.get(f'http://{gopro_ip}:8080/gopro/camera/state', timeout=1)
+                    if test.status_code == 200:
+                        print(f"Found GoPro at {gopro_ip}")
+                        return gopro_ip
+            except:
+                pass
+        
+        return None
+        
+    except Exception as e:
+        print(f"Error finding GoPro IP: {e}")
+        return None
+
+
 @app.route('/api/gopros/<gopro_id>/record/stop', methods=['POST'])
 def stop_recording(gopro_id):
     """Stop recording on a specific GoPro"""
@@ -261,48 +337,69 @@ def stop_recording(gopro_id):
         
         recording_info = recording_processes[gopro_id].copy()
     
-    # Get GoPro info to find interface
-    gopros = get_connected_gopros()
-    gopro = next((g for g in gopros if g['id'] == gopro_id), None)
-    
     try:
         process = recording_info['process']
         master_fd = recording_info.get('master_fd')
         video_path = recording_info['video_path']
         video_filename = recording_info['video_filename']
         
-        print(f"Attempting to stop recording for {gopro_id}")
+        print(f"=== Attempting to stop recording for {gopro_id} ===")
         
-        # Find the GoPro's IP
-        gopro_ip = get_gopro_wired_ip(gopro['interface']) if gopro else None
+        # Step 1: Find the GoPro's actual IP
+        gopro_ip = get_gopro_wired_ip(gopro_id)
+        print(f"GoPro IP detected: {gopro_ip}")
         
+        stop_sent = False
         if gopro_ip:
+            # Step 2: Send HTTP stop command FIRST (before killing process)
             try:
-                print(f"Sending stop command to GoPro at {gopro_ip}")
+                print(f"Sending stop command to http://{gopro_ip}:8080/gopro/camera/shutter/stop")
                 response = requests.get(
                     f'http://{gopro_ip}:8080/gopro/camera/shutter/stop',
                     timeout=5
                 )
+                print(f"HTTP Response: Status={response.status_code}, Body={response.text}")
+                
                 if response.status_code == 200:
-                    print("Successfully stopped recording on GoPro")
-                    time.sleep(2)  # Wait for GoPro to stop
+                    stop_sent = True
+                    print("✓ Stop command sent successfully")
+                    # Wait for GoPro to actually stop and save the file
+                    time.sleep(3)
                 else:
-                    print(f"Stop command returned status {response.status_code}")
-            except Exception as e:
-                print(f"Error sending HTTP stop command: {e}")
+                    print(f"✗ Stop command failed with status {response.status_code}")
+                    
+            except requests.exceptions.RequestException as e:
+                print(f"✗ HTTP request failed: {e}")
         else:
-            print("Could not find GoPro IP, killing process only")
+            print("✗ Could not detect GoPro IP")
         
-        # Kill the gopro-video process
+        if not stop_sent:
+            print("WARNING: Could not send stop command to GoPro - it may continue recording!")
+        
+        # Step 3: Check file size BEFORE killing process
+        file_size_before = os.path.getsize(video_path) if os.path.exists(video_path) else 0
+        print(f"Video file size before process kill: {file_size_before} bytes")
+        
+        # Step 4: Now terminate the gopro-video process gracefully
+        # Use SIGTERM first (not SIGINT) and wait longer
         try:
             pgid = os.getpgid(process.pid)
+            print(f"Sending SIGTERM to process group {pgid}")
             os.killpg(pgid, signal.SIGTERM)
-            process.wait(timeout=5)
-        except (ProcessLookupError, subprocess.TimeoutExpired):
+            
+            # Wait up to 10 seconds for graceful shutdown
+            process.wait(timeout=10)
+            print(f"Process exited with code: {process.returncode}")
+            
+        except subprocess.TimeoutExpired:
+            print("Process didn't exit gracefully, sending SIGKILL")
             try:
                 os.killpg(os.getpgid(process.pid), signal.SIGKILL)
-            except ProcessLookupError:
+                process.wait(timeout=3)
+            except (ProcessLookupError, subprocess.TimeoutExpired):
                 pass
+        except ProcessLookupError:
+            print("Process already terminated")
         
         # Close PTY
         if master_fd:
@@ -311,32 +408,41 @@ def stop_recording(gopro_id):
             except OSError:
                 pass
         
-        time.sleep(1)
+        # Wait for file system to sync
+        time.sleep(2)
         
-        # Clean up
+        # Clean up from recording_processes
         with recording_lock:
             if gopro_id in recording_processes:
                 del recording_processes[gopro_id]
         
-        # Check video file
+        # Step 5: Check final video file status
         video_exists = os.path.exists(video_path)
         file_size = os.path.getsize(video_path) if video_exists else 0
         
+        print(f"=== Stop Recording Results ===")
+        print(f"Video exists: {video_exists}")
+        print(f"File size: {file_size} bytes")
+        print(f"HTTP stop sent: {stop_sent}")
+        print(f"GoPro IP used: {gopro_ip}")
+        
         return jsonify({
-            'success': True,
-            'message': 'Recording stopped',
+            'success': stop_sent,  # Only claim success if we actually sent the stop command
+            'message': 'Recording stopped' if stop_sent else 'Process killed but stop command may not have reached GoPro',
             'video_filename': video_filename,
             'video_exists': video_exists,
             'file_size': file_size,
-            'gopro_ip': gopro_ip
+            'gopro_ip': gopro_ip,
+            'http_stop_sent': stop_sent,
+            'warning': None if stop_sent and file_size > 0 else 'Recording may not have stopped properly on GoPro'
         })
         
     except Exception as e:
-        print(f"Error stopping recording: {str(e)}")
+        print(f"✗ Error stopping recording: {str(e)}")
         import traceback
         traceback.print_exc()
         return jsonify({'success': False, 'error': str(e)}), 500
-    
+
 @app.route('/api/videos', methods=['GET'])
 def list_videos():
     """List all recorded videos"""
@@ -412,38 +518,6 @@ def monitor_recording(gopro_id):
                 del recording_processes[gopro_id]
         
         print(f"Recording finished for {gopro_id}")
-
-def get_gopro_wired_ip(interface):
-    """Get the GoPro's IP address on the wired interface"""
-    try:
-        # GoPro typically uses 172.2X.110.51 on wired connections
-        # We can try to ping common IPs or use ARP
-        import subprocess
-        
-        # Try common GoPro wired IPs based on interface
-        common_ips = [
-            '172.20.110.51',
-            '172.21.110.51', 
-            '172.22.110.51',
-            '172.23.110.51',
-            '172.24.110.51',
-            '172.25.110.51',
-        ]
-        
-        for ip in common_ips:
-            try:
-                # Try to connect to GoPro's HTTP API
-                response = requests.get(f'http://{ip}:8080/gopro/camera/state', timeout=1)
-                if response.status_code == 200:
-                    print(f"Found GoPro at {ip}")
-                    return ip
-            except:
-                continue
-        
-        return None
-    except Exception as e:
-        print(f"Error finding GoPro IP: {e}")
-        return None
 
 if __name__ == '__main__':
     print("=" * 60)
