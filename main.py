@@ -17,6 +17,7 @@ from pathlib import Path
 import pty
 import select
 import signal
+import requests
 import threading
 
 app = Flask(__name__)
@@ -260,7 +261,10 @@ def stop_recording(gopro_id):
         
         recording_info = recording_processes[gopro_id].copy()
     
-    # Release lock before doing the actual stopping
+    # Get GoPro info to find interface
+    gopros = get_connected_gopros()
+    gopro = next((g for g in gopros if g['id'] == gopro_id), None)
+    
     try:
         process = recording_info['process']
         master_fd = recording_info.get('master_fd')
@@ -268,54 +272,55 @@ def stop_recording(gopro_id):
         video_filename = recording_info['video_filename']
         
         print(f"Attempting to stop recording for {gopro_id}")
-        print(f"Process PID: {process.pid}, Poll: {process.poll()}")
         
-        # First, send SIGINT to the process group (this should trigger gopro-video to stop recording gracefully)
+        # Find the GoPro's IP
+        gopro_ip = get_gopro_wired_ip(gopro['interface']) if gopro else None
+        
+        if gopro_ip:
+            try:
+                print(f"Sending stop command to GoPro at {gopro_ip}")
+                response = requests.get(
+                    f'http://{gopro_ip}:8080/gopro/camera/shutter/stop',
+                    timeout=5
+                )
+                if response.status_code == 200:
+                    print("Successfully stopped recording on GoPro")
+                    time.sleep(2)  # Wait for GoPro to stop
+                else:
+                    print(f"Stop command returned status {response.status_code}")
+            except Exception as e:
+                print(f"Error sending HTTP stop command: {e}")
+        else:
+            print("Could not find GoPro IP, killing process only")
+        
+        # Kill the gopro-video process
         try:
             pgid = os.getpgid(process.pid)
-            print(f"Sending SIGINT to process group {pgid}")
-            os.killpg(pgid, signal.SIGINT)
-        except ProcessLookupError:
-            print("Process already terminated")
-            with recording_lock:
-                if gopro_id in recording_processes:
-                    del recording_processes[gopro_id]
-            return jsonify({'success': False, 'error': 'Process already terminated'}), 400
-        
-        # Give it time to stop gracefully (gopro-video needs time to tell the camera to stop)
-        print("Waiting for graceful shutdown...")
-        try:
-            process.wait(timeout=15)  # Increased timeout for GoPro to actually stop
-            print(f"Process exited with code: {process.returncode}")
-        except subprocess.TimeoutExpired:
-            print("Timeout expired, forcing kill...")
-            # Force kill if it doesn't stop gracefully
+            os.killpg(pgid, signal.SIGTERM)
+            process.wait(timeout=5)
+        except (ProcessLookupError, subprocess.TimeoutExpired):
             try:
                 os.killpg(os.getpgid(process.pid), signal.SIGKILL)
-                process.wait(timeout=5)
-            except (ProcessLookupError, subprocess.TimeoutExpired):
+            except ProcessLookupError:
                 pass
         
-        # Close the PTY master
+        # Close PTY
         if master_fd:
             try:
                 os.close(master_fd)
             except OSError:
                 pass
         
-        # Give filesystem a moment to sync
         time.sleep(1)
         
-        # Clean up from recording_processes
+        # Clean up
         with recording_lock:
             if gopro_id in recording_processes:
                 del recording_processes[gopro_id]
         
-        # Check if video file was actually created
+        # Check video file
         video_exists = os.path.exists(video_path)
         file_size = os.path.getsize(video_path) if video_exists else 0
-        
-        print(f"Video exists: {video_exists}, Size: {file_size}")
         
         return jsonify({
             'success': True,
@@ -323,7 +328,7 @@ def stop_recording(gopro_id):
             'video_filename': video_filename,
             'video_exists': video_exists,
             'file_size': file_size,
-            'warning': 'Video file is empty or not found' if file_size == 0 else None
+            'gopro_ip': gopro_ip
         })
         
     except Exception as e:
@@ -331,7 +336,7 @@ def stop_recording(gopro_id):
         import traceback
         traceback.print_exc()
         return jsonify({'success': False, 'error': str(e)}), 500
-
+    
 @app.route('/api/videos', methods=['GET'])
 def list_videos():
     """List all recorded videos"""
@@ -407,6 +412,38 @@ def monitor_recording(gopro_id):
                 del recording_processes[gopro_id]
         
         print(f"Recording finished for {gopro_id}")
+
+def get_gopro_wired_ip(interface):
+    """Get the GoPro's IP address on the wired interface"""
+    try:
+        # GoPro typically uses 172.2X.110.51 on wired connections
+        # We can try to ping common IPs or use ARP
+        import subprocess
+        
+        # Try common GoPro wired IPs based on interface
+        common_ips = [
+            '172.20.110.51',
+            '172.21.110.51', 
+            '172.22.110.51',
+            '172.23.110.51',
+            '172.24.110.51',
+            '172.25.110.51',
+        ]
+        
+        for ip in common_ips:
+            try:
+                # Try to connect to GoPro's HTTP API
+                response = requests.get(f'http://{ip}:8080/gopro/camera/state', timeout=1)
+                if response.status_code == 200:
+                    print(f"Found GoPro at {ip}")
+                    return ip
+            except:
+                continue
+        
+        return None
+    except Exception as e:
+        print(f"Error finding GoPro IP: {e}")
+        return None
 
 if __name__ == '__main__':
     print("=" * 60)
