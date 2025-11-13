@@ -128,78 +128,58 @@ def start_recording(gopro_id):
     """Start recording on a specific GoPro"""
     global recording_processes
     
-    # Verify GoPro exists
     gopros = get_connected_gopros()
     gopro = next((g for g in gopros if g['id'] == gopro_id), None)
-    
     if not gopro:
-        return jsonify({
-            'success': False,
-            'error': 'GoPro not found'
-        }), 404
-    
+        return jsonify({'success': False, 'error': 'GoPro not found'}), 404
+
     with recording_lock:
         if gopro_id in recording_processes:
-            return jsonify({
-                'success': False,
-                'error': 'Already recording on this GoPro'
-            }), 400
-        
+            return jsonify({'success': False, 'error': 'Already recording'}), 400
+
         try:
             data = request.get_json() or {}
-            duration = data.get('duration', 18000)  # Default to 5 hours
-            
-            # Generate unique filename
+            duration = data.get('duration', 1800)  # safer default: 30 min
+
             timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
             video_filename = f'gopro_{gopro["name"]}_{timestamp}.mp4'
             video_path = os.path.expanduser(os.path.join(VIDEO_STORAGE_DIR, video_filename))
 
-            
-            # Start recording process 
             cmd = [
-                'gopro-video', 
-                '--wired', 
+                'gopro-video',
+                '--wired',
                 '--wifi_interface', gopro['interface'],
-                '-o', video_path, 
+                '-o', video_path,
                 '--record_time', str(duration)
             ]
-            
-            process = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                preexec_fn=os.setsid
-            )
-            
+
+            # Run in a separate thread so Flask isn't blocked
+            def run_record():
+                subprocess.run(cmd, check=True)
+
+            thread = threading.Thread(target=run_record, daemon=True)
+            thread.start()
+
             recording_processes[gopro_id] = {
-                'process': process,
+                'thread': thread,
                 'video_path': video_path,
                 'video_filename': video_filename,
                 'start_time': datetime.now().isoformat(),
                 'duration': duration
             }
-            
-            # Start monitoring thread
-            threading.Thread(
-                target=monitor_recording, 
-                args=(gopro_id,), 
-                daemon=True
-            ).start()
-            
+
             return jsonify({
                 'success': True,
                 'message': f'Recording started for {duration}s',
                 'video_filename': video_filename,
                 'gopro_id': gopro_id
             })
-            
+
         except Exception as e:
             if gopro_id in recording_processes:
                 del recording_processes[gopro_id]
-            return jsonify({
-                'success': False,
-                'error': str(e)
-            }), 500
+            return jsonify({'success': False, 'error': str(e)}), 500
+
 
 @app.route('/api/gopros/<gopro_id>/record/stop', methods=['POST'])
 def stop_recording(gopro_id):
