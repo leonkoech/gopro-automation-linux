@@ -1,12 +1,13 @@
 #!/bin/bash
-# Installation script for GoPro Controller Service
-# Run this script to install the service to start automatically on boot
+# Cloudflare Tunnel Setup Script for Jetson Nano
+# This script installs and configures Cloudflare Tunnel (cloudflared)
+# to expose your GoPro API service securely to the internet
 
 set -e
 
-echo "========================================"
-echo "GoPro Controller Service Installer"
-echo "========================================"
+echo "=========================================="
+echo "Cloudflare Tunnel Setup for Jetson Nano"
+echo "=========================================="
 echo ""
 
 # Check if running as root
@@ -15,7 +16,7 @@ if [ "$EUID" -ne 0 ]; then
     exit 1
 fi
 
-# Get the actual user (not root)
+# Get the actual user
 ACTUAL_USER=${SUDO_USER:-$USER}
 USER_HOME=$(eval echo ~$ACTUAL_USER)
 
@@ -24,352 +25,184 @@ echo "   User: $ACTUAL_USER"
 echo "   Home: $USER_HOME"
 echo ""
 
-# Install dependencies
-echo "📦 Installing dependencies..."
-pip3 install flask flask-cors
+# Prompt for Jetson name
+read -p "Enter Jetson name (e.g., jetson-1, jetson-2, etc.): " JETSON_NAME
+if [ -z "$JETSON_NAME" ]; then
+    echo "❌ Jetson name cannot be empty"
+    exit 1
+fi
 
-# Create service directory
-SERVICE_DIR="/opt/gopro-controller"
-echo "📁 Creating service directory: $SERVICE_DIR"
-mkdir -p "$SERVICE_DIR"
+echo ""
+echo "This will create tunnel: $JETSON_NAME.uai.tech"
+echo ""
+read -p "Continue? (y/n): " CONTINUE
+if [ "$CONTINUE" != "y" ]; then
+    echo "Setup cancelled"
+    exit 0
+fi
 
-# Copy the Python script
-echo "📄 Installing GoPro Controller script..."
-cat > "$SERVICE_DIR/gopro_controller.py" << 'PYTHON_SCRIPT_EOF'
-#!/usr/bin/env python3
-"""
-GoPro Controller API Service
-REST API for remote control of GoPro cameras connected to Jetson Nano
-"""
+# Detect architecture
+ARCH=$(uname -m)
+echo "📊 Detected architecture: $ARCH"
 
-from flask import Flask, jsonify, request
-from flask_cors import CORS
-import subprocess
-import threading
-import signal
-import os
-import time
-import json
-from datetime import datetime
-from pathlib import Path
+# Download cloudflared based on architecture
+echo "📦 Downloading cloudflared..."
+if [ "$ARCH" = "aarch64" ] || [ "$ARCH" = "arm64" ]; then
+    # ARM64 for Jetson Nano
+    wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-arm64 -O /usr/local/bin/cloudflared
+elif [ "$ARCH" = "x86_64" ]; then
+    # x86_64 for testing on desktop
+    wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -O /usr/local/bin/cloudflared
+else
+    echo "❌ Unsupported architecture: $ARCH"
+    exit 1
+fi
 
-app = Flask(__name__)
-CORS(app)  # Enable CORS for Firebase web app access
+chmod +x /usr/local/bin/cloudflared
 
-# Configuration
-VIDEO_STORAGE_DIR = os.path.expanduser('~/gopro_videos')
-os.makedirs(VIDEO_STORAGE_DIR, exist_ok=True)
+# Verify installation
+if ! command -v cloudflared &> /dev/null; then
+    echo "❌ Failed to install cloudflared"
+    exit 1
+fi
 
-# Global state
-recording_processes = {}  # {gopro_id: process}
-recording_lock = threading.Lock()
+echo "✅ cloudflared installed successfully"
+cloudflared --version
+echo ""
 
-def get_connected_gopros():
-    """Discover all connected GoPro cameras"""
-    gopros = []
+# Create cloudflared config directory
+CLOUDFLARED_DIR="$USER_HOME/.cloudflared"
+mkdir -p "$CLOUDFLARED_DIR"
+chown -R $ACTUAL_USER:$ACTUAL_USER "$CLOUDFLARED_DIR"
+
+echo "=========================================="
+echo "🔐 Cloudflare Authentication Required"
+echo "=========================================="
+echo ""
+echo "Next steps:"
+echo "1. Run the following command AS YOUR USER (not root):"
+echo ""
+echo "   cloudflared tunnel login"
+echo ""
+echo "2. This will open a browser to authenticate with Cloudflare"
+echo "3. Login to your Cloudflare account"
+echo "4. Select the domain: uai.tech"
+echo "5. Authorize the tunnel"
+echo ""
+echo "After authentication, run this script again to continue setup"
+echo ""
+echo "Alternatively, if you already have a tunnel token, continue below..."
+echo ""
+
+# Check if already authenticated
+if [ -f "$CLOUDFLARED_DIR/cert.pem" ]; then
+    echo "✅ Found existing Cloudflare certificate"
+    AUTHENTICATED=true
+else
+    echo "⚠️  No Cloudflare certificate found"
+    AUTHENTICATED=false
+fi
+
+echo ""
+read -p "Do you want to authenticate now? (y/n): " AUTH_NOW
+
+if [ "$AUTH_NOW" = "y" ]; then
+    echo ""
+    echo "Switching to user $ACTUAL_USER to authenticate..."
+    echo "A browser window will open. Please login to Cloudflare."
+    echo ""
+    sleep 2
     
-    try:
-        result = subprocess.run(['ip', 'addr', 'show'], 
-                              capture_output=True, text=True, timeout=5)
-        
-        lines = result.stdout.split('\n')
-        current_interface = None
-        current_ip = None
-        
-        for line in lines:
-            if 'enx' in line and ':' in line:
-                current_interface = line.split(':')[1].strip().split('@')[0].strip()
-            elif 'inet 172.' in line and current_interface:
-                current_ip = line.strip().split()[1].split('/')[0]
-                
-                gopro_info = {
-                    'id': current_interface,
-                    'name': f'GoPro-{current_interface[-4:]}',
-                    'interface': current_interface,
-                    'ip': current_ip,
-                    'status': 'connected',
-                    'is_recording': current_interface in recording_processes
-                }
-                gopros.append(gopro_info)
-                current_interface = None
-                current_ip = None
-                
-    except Exception as e:
-        print(f"Error discovering GoPros: {e}")
+    # Run as user
+    su - $ACTUAL_USER -c "cloudflared tunnel login"
     
-    return gopros
+    if [ $? -eq 0 ]; then
+        echo "✅ Authentication successful"
+        AUTHENTICATED=true
+    else
+        echo "❌ Authentication failed"
+        exit 1
+    fi
+fi
 
-def get_video_list():
-    """Get list of all recorded videos"""
-    videos = []
-    try:
-        video_path = Path(VIDEO_STORAGE_DIR)
-        for video_file in video_path.glob('*.mp4'):
-            stat = video_file.stat()
-            videos.append({
-                'filename': video_file.name,
-                'path': str(video_file),
-                'size_mb': round(stat.st_size / (1024 * 1024), 2),
-                'created': datetime.fromtimestamp(stat.st_ctime).isoformat(),
-                'modified': datetime.fromtimestamp(stat.st_mtime).isoformat()
-            })
-        videos.sort(key=lambda x: x['created'], reverse=True)
-    except Exception as e:
-        print(f"Error listing videos: {e}")
-    
-    return videos
+if [ "$AUTHENTICATED" = false ]; then
+    echo ""
+    echo "⚠️  Setup incomplete. Please authenticate first:"
+    echo "   su - $ACTUAL_USER"
+    echo "   cloudflared tunnel login"
+    echo ""
+    echo "Then run this script again."
+    exit 0
+fi
 
-@app.route('/health', methods=['GET'])
-def health():
-    """Health check endpoint"""
-    return jsonify({
-        'status': 'healthy',
-        'service': 'gopro-controller',
-        'timestamp': datetime.now().isoformat(),
-        'storage_path': VIDEO_STORAGE_DIR
-    })
+echo ""
+echo "=========================================="
+echo "🚇 Creating Cloudflare Tunnel"
+echo "=========================================="
+echo ""
 
-@app.route('/api/gopros', methods=['GET'])
-def list_gopros():
-    """List all connected GoPro cameras"""
-    gopros = get_connected_gopros()
-    return jsonify({
-        'success': True,
-        'count': len(gopros),
-        'gopros': gopros
-    })
+# Create tunnel (as user)
+echo "Creating tunnel: $JETSON_NAME"
+su - $ACTUAL_USER -c "cloudflared tunnel create $JETSON_NAME" || {
+    echo "⚠️  Tunnel might already exist. Continuing..."
+}
 
-@app.route('/api/gopros/<gopro_id>/status', methods=['GET'])
-def gopro_status(gopro_id):
-    """Get status of a specific GoPro"""
-    gopros = get_connected_gopros()
-    gopro = next((g for g in gopros if g['id'] == gopro_id), None)
-    
-    if not gopro:
-        return jsonify({
-            'success': False,
-            'error': 'GoPro not found'
-        }), 404
-    
-    return jsonify({
-        'success': True,
-        'gopro': gopro
-    })
+# Get tunnel ID
+TUNNEL_ID=$(su - $ACTUAL_USER -c "cloudflared tunnel list" | grep "$JETSON_NAME" | awk '{print $1}')
 
-@app.route('/api/gopros/<gopro_id>/record/start', methods=['POST'])
-def start_recording(gopro_id):
-    """Start recording on a specific GoPro"""
-    global recording_processes
-    
-    gopros = get_connected_gopros()
-    gopro = next((g for g in gopros if g['id'] == gopro_id), None)
-    
-    if not gopro:
-        return jsonify({
-            'success': False,
-            'error': 'GoPro not found'
-        }), 404
-    
-    with recording_lock:
-        if gopro_id in recording_processes:
-            return jsonify({
-                'success': False,
-                'error': 'Already recording on this GoPro'
-            }), 400
-        
-        try:
-            data = request.get_json() or {}
-            duration = data.get('duration', 30)
-            
-            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-            video_filename = f'gopro_{gopro["name"]}_{timestamp}.mp4'
-            video_path = os.path.join(VIDEO_STORAGE_DIR, video_filename)
-            
-            cmd = [
-                'gopro-video', 
-                '--wired', 
-                '--wifi_interface', gopro['interface'],
-                '-o', video_path, 
-                str(duration)
-            ]
-            
-            process = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                preexec_fn=os.setsid
-            )
-            
-            recording_processes[gopro_id] = {
-                'process': process,
-                'video_path': video_path,
-                'video_filename': video_filename,
-                'start_time': datetime.now().isoformat(),
-                'duration': duration
-            }
-            
-            threading.Thread(
-                target=monitor_recording, 
-                args=(gopro_id,), 
-                daemon=True
-            ).start()
-            
-            return jsonify({
-                'success': True,
-                'message': f'Recording started for {duration}s',
-                'video_filename': video_filename,
-                'gopro_id': gopro_id
-            })
-            
-        except Exception as e:
-            if gopro_id in recording_processes:
-                del recording_processes[gopro_id]
-            return jsonify({
-                'success': False,
-                'error': str(e)
-            }), 500
+if [ -z "$TUNNEL_ID" ]; then
+    echo "❌ Failed to create or find tunnel"
+    exit 1
+fi
 
-@app.route('/api/gopros/<gopro_id>/record/stop', methods=['POST'])
-def stop_recording(gopro_id):
-    """Stop recording on a specific GoPro"""
-    global recording_processes
-    
-    with recording_lock:
-        if gopro_id not in recording_processes:
-            return jsonify({
-                'success': False,
-                'error': 'Not currently recording on this GoPro'
-            }), 400
-        
-        try:
-            recording_info = recording_processes[gopro_id]
-            process = recording_info['process']
-            
-            os.killpg(os.getpgid(process.pid), signal.SIGINT)
-            
-            try:
-                process.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                os.killpg(os.getpgid(process.pid), signal.SIGKILL)
-            
-            video_filename = recording_info['video_filename']
-            del recording_processes[gopro_id]
-            
-            return jsonify({
-                'success': True,
-                'message': 'Recording stopped',
-                'video_filename': video_filename
-            })
-            
-        except Exception as e:
-            return jsonify({
-                'success': False,
-                'error': str(e)
-            }), 500
+echo "✅ Tunnel created with ID: $TUNNEL_ID"
+echo ""
 
-@app.route('/api/videos', methods=['GET'])
-def list_videos():
-    """List all recorded videos"""
-    videos = get_video_list()
-    return jsonify({
-        'success': True,
-        'count': len(videos),
-        'videos': videos
-    })
+# Create tunnel configuration
+echo "📝 Creating tunnel configuration..."
 
-@app.route('/api/videos/<filename>', methods=['DELETE'])
-def delete_video(filename):
-    """Delete a specific video"""
-    try:
-        video_path = os.path.join(VIDEO_STORAGE_DIR, filename)
-        if os.path.exists(video_path) and video_path.startswith(VIDEO_STORAGE_DIR):
-            os.remove(video_path)
-            return jsonify({
-                'success': True,
-                'message': f'Video {filename} deleted'
-            })
-        else:
-            return jsonify({
-                'success': False,
-                'error': 'Video not found'
-            }), 404
-    except Exception as e:
-        return jsonify({
-            'success': False,
-            'error': str(e)
-        }), 500
+cat > "$CLOUDFLARED_DIR/config.yml" << EOF
+tunnel: $TUNNEL_ID
+credentials-file: $CLOUDFLARED_DIR/$TUNNEL_ID.json
 
-@app.route('/api/system/info', methods=['GET'])
-def system_info():
-    """Get system information"""
-    try:
-        stat = os.statvfs(VIDEO_STORAGE_DIR)
-        free_space_gb = (stat.f_bavail * stat.f_frsize) / (1024**3)
-        total_space_gb = (stat.f_blocks * stat.f_frsize) / (1024**3)
-        
-        videos = get_video_list()
-        total_video_size_mb = sum(v['size_mb'] for v in videos)
-        
-        return jsonify({
-            'success': True,
-            'system': {
-                'hostname': os.uname().nodename,
-                'storage_path': VIDEO_STORAGE_DIR,
-                'disk_free_gb': round(free_space_gb, 2),
-                'disk_total_gb': round(total_space_gb, 2),
-                'video_count': len(videos),
-                'total_video_size_mb': round(total_video_size_mb, 2)
-            }
-        })
-    except Exception as e:
-        return jsonify({
-            'success': False,
-            'error': str(e)
-        }), 500
+ingress:
+  # Route for this specific Jetson
+  - hostname: $JETSON_NAME.uai.tech
+    service: http://localhost:5000
+    originRequest:
+      noTLSVerify: true
+  
+  # Catch-all rule (required)
+  - service: http_status:404
+EOF
 
-def monitor_recording(gopro_id):
-    """Monitor recording process and clean up when finished"""
-    global recording_processes
-    
-    if gopro_id in recording_processes:
-        process = recording_processes[gopro_id]['process']
-        process.wait()
-        
-        with recording_lock:
-            if gopro_id in recording_processes:
-                del recording_processes[gopro_id]
-        
-        print(f"Recording finished for {gopro_id}")
+chown $ACTUAL_USER:$ACTUAL_USER "$CLOUDFLARED_DIR/config.yml"
 
-if __name__ == '__main__':
-    print("=" * 60)
-    print("🎥 GoPro Controller API Service Starting...")
-    print("=" * 60)
-    print(f"📁 Video storage: {VIDEO_STORAGE_DIR}")
-    print(f"🌐 API endpoint: http://0.0.0.0:5000")
-    print(f"💡 Make sure GoPros are connected via USB")
-    print("=" * 60)
-    
-    app.run(host='0.0.0.0', port=5000, debug=False, threaded=True)
-PYTHON_SCRIPT_EOF
+echo "✅ Configuration created at: $CLOUDFLARED_DIR/config.yml"
+echo ""
 
-chmod +x "$SERVICE_DIR/gopro_controller.py"
-chown -R $ACTUAL_USER:$ACTUAL_USER "$SERVICE_DIR"
+# Create DNS route
+echo "🌐 Creating DNS route..."
+su - $ACTUAL_USER -c "cloudflared tunnel route dns $JETSON_NAME $JETSON_NAME.uai.tech" || {
+    echo "⚠️  DNS route might already exist. Continuing..."
+}
+echo ""
 
-# Create systemd service file
-echo "⚙️  Creating systemd service..."
-cat > /etc/systemd/system/gopro-controller.service << SERVICE_EOF
+# Install as a service
+echo "⚙️  Installing cloudflared as a system service..."
+
+cloudflared service install
+
+# Create systemd service file with proper user
+cat > /etc/systemd/system/cloudflared.service << EOF
 [Unit]
-Description=GoPro Controller API Service
+Description=Cloudflare Tunnel
 After=network.target
-Wants=network-online.target
 
 [Service]
 Type=simple
 User=$ACTUAL_USER
-WorkingDirectory=$SERVICE_DIR
-Environment="PATH=/usr/local/bin:/usr/bin:/bin"
-ExecStart=/usr/bin/python3 $SERVICE_DIR/gopro_controller.py
+ExecStart=/usr/local/bin/cloudflared tunnel --config $CLOUDFLARED_DIR/config.yml run
 Restart=always
 RestartSec=10
 StandardOutput=journal
@@ -377,49 +210,59 @@ StandardError=journal
 
 [Install]
 WantedBy=multi-user.target
-SERVICE_EOF
-
-# Create video storage directory
-VIDEO_DIR="$USER_HOME/gopro_videos"
-echo "📁 Creating video storage directory: $VIDEO_DIR"
-mkdir -p "$VIDEO_DIR"
-chown -R $ACTUAL_USER:$ACTUAL_USER "$VIDEO_DIR"
+EOF
 
 # Reload systemd
-echo "🔄 Reloading systemd..."
 systemctl daemon-reload
 
-# Enable service
-echo "✅ Enabling service to start on boot..."
-systemctl enable gopro-controller.service
+# Enable and start service
+echo "🚀 Starting cloudflared service..."
+systemctl enable cloudflared
+systemctl restart cloudflared
 
-# Start service
-echo "▶️  Starting service..."
-systemctl start gopro-controller.service
-
-# Wait a moment for service to start
-sleep 2
+# Wait for service to start
+sleep 3
 
 # Check status
 echo ""
-echo "========================================"
-echo "✅ Installation Complete!"
-echo "========================================"
+echo "=========================================="
+echo "📊 Service Status"
+echo "=========================================="
+systemctl status cloudflared --no-pager -l || true
 echo ""
-echo "📊 Service Status:"
-systemctl status gopro-controller.service --no-pager -l
+
+# Display tunnel info
+echo "=========================================="
+echo "✅ Setup Complete!"
+echo "=========================================="
+echo ""
+echo "🎉 Your Jetson Nano is now accessible at:"
+echo "   https://$JETSON_NAME.uai.tech"
+echo ""
+echo "📍 Tunnel Details:"
+echo "   Tunnel Name: $JETSON_NAME"
+echo "   Tunnel ID: $TUNNEL_ID"
+echo "   Local Service: http://localhost:5000"
+echo "   Public URL: https://$JETSON_NAME.uai.tech"
 echo ""
 echo "🔧 Useful Commands:"
-echo "   Check status:    sudo systemctl status gopro-controller"
-echo "   Stop service:    sudo systemctl stop gopro-controller"
-echo "   Start service:   sudo systemctl start gopro-controller"
-echo "   Restart service: sudo systemctl restart gopro-controller"
-echo "   View logs:       sudo journalctl -u gopro-controller -f"
-echo "   Disable service: sudo systemctl disable gopro-controller"
+echo "   Check status:     sudo systemctl status cloudflared"
+echo "   View logs:        sudo journalctl -u cloudflared -f"
+echo "   Restart:          sudo systemctl restart cloudflared"
+echo "   Stop:             sudo systemctl stop cloudflared"
+echo "   Tunnel info:      cloudflared tunnel info $JETSON_NAME"
+echo "   List tunnels:     cloudflared tunnel list"
 echo ""
-echo "🌐 API is now running on:"
-echo "   http://$(hostname -I | awk '{print $1}'):5000"
+echo "🧪 Test your endpoint:"
+echo "   curl https://$JETSON_NAME.uai.tech/health"
 echo ""
-echo "📁 Videos will be stored in:"
-echo "   $VIDEO_DIR"
+echo "⏭️  Next Steps:"
+echo "1. Test the URL in your browser"
+echo "2. Update your Firebase web app to use this URL"
+echo "3. Repeat this setup on other Jetson Nanos (jetson-2, jetson-3, jetson-4)"
+echo ""
+echo "📝 GoDaddy DNS Configuration:"
+echo "   You don't need to configure anything in GoDaddy!"
+echo "   Cloudflare automatically manages the DNS records."
+echo "   Just make sure uai.tech nameservers point to Cloudflare."
 echo ""
