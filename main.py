@@ -144,10 +144,17 @@ def start_recording(gopro_id):
         
         try:
             data = request.get_json() or {}
-            duration = data.get('duration', 1800)
+            duration = data.get('duration', 18000)
             timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
             video_filename = f'gopro_{gopro["name"]}_{timestamp}.mp4'
             video_path = os.path.expanduser(os.path.join(VIDEO_STORAGE_DIR, video_filename))
+
+            print(f"=== Recording Start ===")
+            print(f"VIDEO_STORAGE_DIR: {VIDEO_STORAGE_DIR}")
+            print(f"video_filename: {video_filename}")
+            print(f"Full video_path: {video_path}")
+            print(f"Path exists: {os.path.exists(os.path.dirname(video_path))}")
+            print(f"Path is absolute: {os.path.isabs(video_path)}")
             
             cmd = [
                 'gopro-video',
