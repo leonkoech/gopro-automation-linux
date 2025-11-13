@@ -154,13 +154,13 @@ def start_recording(gopro_id):
             video_filename = f'gopro_{gopro["name"]}_{timestamp}.mp4'
             video_path = os.path.join(VIDEO_STORAGE_DIR, video_filename)
             
-            # Start recording process
+            # Start recording process 
             cmd = [
                 'gopro-video', 
                 '--wired', 
                 '--wifi_interface', gopro['interface'],
                 '-o', video_path, 
-                str(duration)
+                # str(duration)
             ]
             
             process = subprocess.Popen(
