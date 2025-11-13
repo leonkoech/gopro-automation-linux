@@ -152,7 +152,8 @@ def start_recording(gopro_id):
             # Generate unique filename
             timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
             video_filename = f'gopro_{gopro["name"]}_{timestamp}.mp4'
-            video_path = os.path.join(VIDEO_STORAGE_DIR, video_filename)
+            video_path = os.path.expanduser(os.path.join(VIDEO_STORAGE_DIR, video_filename))
+
             
             # Start recording process 
             cmd = [
