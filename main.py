@@ -145,7 +145,7 @@ def start_recording(gopro_id):
             video_filename = f'gopro_{gopro["name"]}_{timestamp}.mp4'
             video_path = os.path.expanduser(os.path.join(VIDEO_STORAGE_DIR, video_filename))
             
-            # Start GoPro recording process WITHOUT duration
+            # Start GoPro recording process attached to terminal
             cmd = [
                 'gopro-video',
                 '--wired',
@@ -155,9 +155,7 @@ def start_recording(gopro_id):
             
             process = subprocess.Popen(
                 cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                preexec_fn=os.setsid
+                preexec_fn=os.setsid  # allows stopping with SIGINT
             )
             
             # Save process info
@@ -182,7 +180,7 @@ def start_recording(gopro_id):
             if gopro_id in recording_processes:
                 del recording_processes[gopro_id]
             return jsonify({'success': False, 'error': str(e)}), 500
-        
+
 @app.route('/api/gopros/<gopro_id>/record/stop', methods=['POST'])
 def stop_recording(gopro_id):
     """Stop recording on a specific GoPro"""
