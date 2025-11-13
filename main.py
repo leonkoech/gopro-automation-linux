@@ -123,28 +123,29 @@ def gopro_status(gopro_id):
         'gopro': gopro
     })
 
+import pty
+import select
+
 @app.route('/api/gopros/<gopro_id>/record/start', methods=['POST'])
 def start_recording(gopro_id):
     """Start recording on a specific GoPro"""
     global recording_processes
-
     gopros = get_connected_gopros()
     gopro = next((g for g in gopros if g['id'] == gopro_id), None)
     if not gopro:
         return jsonify({'success': False, 'error': 'GoPro not found'}), 404
-
+    
     with recording_lock:
         if gopro_id in recording_processes:
             return jsonify({'success': False, 'error': 'Already recording'}), 400
-
+        
         try:
             data = request.get_json() or {}
-            duration = data.get('duration', 1800)  # default: 30 min
-
+            duration = data.get('duration', 1800)
             timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
             video_filename = f'gopro_{gopro["name"]}_{timestamp}.mp4'
             video_path = os.path.expanduser(os.path.join(VIDEO_STORAGE_DIR, video_filename))
-
+            
             cmd = [
                 'gopro-video',
                 '--wired',
@@ -152,82 +153,125 @@ def start_recording(gopro_id):
                 '-o', video_path,
                 '--record_time', str(duration)
             ]
-
-            # Start the recording subprocess
+            
+            # Use a PTY to give the process a proper terminal
+            master, slave = pty.openpty()
+            
             process = subprocess.Popen(
                 cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                preexec_fn=os.setsid
+                stdin=slave,
+                stdout=slave,
+                stderr=slave,
+                preexec_fn=os.setsid,
+                close_fds=True
             )
-
-            # Save process for stopping later
+            
+            os.close(slave)  # Parent doesn't need the slave
+            
             recording_processes[gopro_id] = {
                 'process': process,
+                'master_fd': master,
                 'video_path': video_path,
                 'video_filename': video_filename,
                 'start_time': datetime.now().isoformat(),
                 'duration': duration
             }
-
-            # Optional: monitor thread to clean up automatically when done
+            
             def monitor():
-                process.wait()
+                output = []
+                while True:
+                    try:
+                        # Read from PTY
+                        ready, _, _ = select.select([master], [], [], 1.0)
+                        if ready:
+                            data = os.read(master, 1024)
+                            if data:
+                                output.append(data.decode('utf-8', errors='ignore'))
+                                print(f"GoPro output: {data.decode('utf-8', errors='ignore')}")
+                        
+                        # Check if process is done
+                        if process.poll() is not None:
+                            break
+                    except OSError:
+                        break
+                
+                os.close(master)
                 with recording_lock:
                     if gopro_id in recording_processes:
                         del recording_processes[gopro_id]
                 print(f"Recording finished for {gopro_id}")
-
+                print(f"Full output: {''.join(output)}")
+            
             threading.Thread(target=monitor, daemon=True).start()
-
+            
             return jsonify({
                 'success': True,
                 'message': f'Recording started for {duration}s',
                 'video_filename': video_filename,
                 'gopro_id': gopro_id
             })
-
+            
         except Exception as e:
             if gopro_id in recording_processes:
                 del recording_processes[gopro_id]
             return jsonify({'success': False, 'error': str(e)}), 500
-
-
 @app.route('/api/gopros/<gopro_id>/record/stop', methods=['POST'])
 def stop_recording(gopro_id):
     """Stop recording on a specific GoPro"""
     global recording_processes
-
+    
     with recording_lock:
         if gopro_id not in recording_processes:
             return jsonify({'success': False, 'error': 'Not currently recording'}), 400
-
+        
         try:
             recording_info = recording_processes[gopro_id]
             process = recording_info['process']
-
+            master_fd = recording_info.get('master_fd')
+            
+            # Close the PTY master to signal the process
+            if master_fd:
+                try:
+                    os.close(master_fd)
+                except OSError:
+                    pass  # Already closed
+            
             # Send SIGINT to stop gracefully (GoPro beeps!)
-            os.killpg(os.getpgid(process.pid), signal.SIGINT)
-
+            try:
+                os.killpg(os.getpgid(process.pid), signal.SIGINT)
+            except ProcessLookupError:
+                pass  # Process already gone
+            
             # Wait for process to finish
             try:
                 process.wait(timeout=10)
             except subprocess.TimeoutExpired:
-                os.killpg(os.getpgid(process.pid), signal.SIGKILL)
-
+                # Force kill if it doesn't stop gracefully
+                try:
+                    os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            
             video_filename = recording_info['video_filename']
+            video_path = recording_info['video_path']
+            
+            # Clean up
             del recording_processes[gopro_id]
-
+            
+            # Check if video file was actually created
+            video_exists = os.path.exists(video_path)
+            file_size = os.path.getsize(video_path) if video_exists else 0
+            
             return jsonify({
                 'success': True,
                 'message': 'Recording stopped',
-                'video_filename': video_filename
+                'video_filename': video_filename,
+                'video_exists': video_exists,
+                'file_size': file_size
             })
-
+            
         except Exception as e:
             return jsonify({'success': False, 'error': str(e)}), 500
-
-
 
 @app.route('/api/videos', methods=['GET'])
 def list_videos():
