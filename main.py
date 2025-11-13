@@ -273,7 +273,6 @@ def stop_recording(gopro_id):
         traceback.print_exc()
         return jsonify({'success': False, 'error': str(e)}), 500
 
-import requests
 
 def get_gopro_wired_ip(gopro_id):
     """Get the actual GoPro IP by checking what gopro-video is using"""
@@ -348,123 +347,6 @@ def get_gopro_wired_ip(gopro_id):
         print(f"Error finding GoPro IP: {e}")
         return None
 
-
-@app.route('/api/gopros/<gopro_id>/record/stop', methods=['POST'])
-def stop_recording(gopro_id):
-    """Stop recording on a specific GoPro"""
-    global recording_processes
-    
-    with recording_lock:
-        if gopro_id not in recording_processes:
-            return jsonify({'success': False, 'error': 'Not currently recording'}), 400
-        
-        recording_info = recording_processes[gopro_id].copy()
-    
-    try:
-        process = recording_info['process']
-        master_fd = recording_info.get('master_fd')
-        video_path = recording_info['video_path']
-        video_filename = recording_info['video_filename']
-        
-        print(f"=== Attempting to stop recording for {gopro_id} ===")
-        
-        # Step 1: Find the GoPro's actual IP
-        gopro_ip = get_gopro_wired_ip(gopro_id)
-        print(f"GoPro IP detected: {gopro_ip}")
-        
-        stop_sent = False
-        if gopro_ip:
-            # Step 2: Send HTTP stop command FIRST (before killing process)
-            try:
-                print(f"Sending stop command to http://{gopro_ip}:8080/gopro/camera/shutter/stop")
-                response = requests.get(
-                    f'http://{gopro_ip}:8080/gopro/camera/shutter/stop',
-                    timeout=5
-                )
-                print(f"HTTP Response: Status={response.status_code}, Body={response.text}")
-                
-                if response.status_code == 200:
-                    stop_sent = True
-                    print("✓ Stop command sent successfully")
-                    # Wait for GoPro to actually stop and save the file
-                    time.sleep(3)
-                else:
-                    print(f"✗ Stop command failed with status {response.status_code}")
-                    
-            except requests.exceptions.RequestException as e:
-                print(f"✗ HTTP request failed: {e}")
-        else:
-            print("✗ Could not detect GoPro IP")
-        
-        if not stop_sent:
-            print("WARNING: Could not send stop command to GoPro - it may continue recording!")
-        
-        # Step 3: Check file size BEFORE killing process
-        file_size_before = os.path.getsize(video_path) if os.path.exists(video_path) else 0
-        print(f"Video file size before process kill: {file_size_before} bytes")
-        
-        # Step 4: Now terminate the gopro-video process gracefully
-        # Use SIGTERM first (not SIGINT) and wait longer
-        try:
-            pgid = os.getpgid(process.pid)
-            print(f"Sending SIGTERM to process group {pgid}")
-            os.killpg(pgid, signal.SIGTERM)
-            
-            # Wait up to 10 seconds for graceful shutdown
-            process.wait(timeout=10)
-            print(f"Process exited with code: {process.returncode}")
-            
-        except subprocess.TimeoutExpired:
-            print("Process didn't exit gracefully, sending SIGKILL")
-            try:
-                os.killpg(os.getpgid(process.pid), signal.SIGKILL)
-                process.wait(timeout=3)
-            except (ProcessLookupError, subprocess.TimeoutExpired):
-                pass
-        except ProcessLookupError:
-            print("Process already terminated")
-        
-        # Close PTY
-        if master_fd:
-            try:
-                os.close(master_fd)
-            except OSError:
-                pass
-        
-        # Wait for file system to sync
-        time.sleep(2)
-        
-        # Clean up from recording_processes
-        with recording_lock:
-            if gopro_id in recording_processes:
-                del recording_processes[gopro_id]
-        
-        # Step 5: Check final video file status
-        video_exists = os.path.exists(video_path)
-        file_size = os.path.getsize(video_path) if video_exists else 0
-        
-        print(f"=== Stop Recording Results ===")
-        print(f"Video exists: {video_exists}")
-        print(f"File size: {file_size} bytes")
-        print(f"HTTP stop sent: {stop_sent}")
-        print(f"GoPro IP used: {gopro_ip}")
-        
-        return jsonify({
-            'success': stop_sent,  # Only claim success if we actually sent the stop command
-            'message': 'Recording stopped' if stop_sent else 'Process killed but stop command may not have reached GoPro',
-            'video_filename': video_filename,
-            'video_exists': video_exists,
-            'file_size': file_size,
-            'gopro_ip': gopro_ip,
-            'http_stop_sent': stop_sent,
-            'warning': None if stop_sent and file_size > 0 else 'Recording may not have stopped properly on GoPro'
-        })
-        
-    except Exception as e:
-        print(f"✗ Error stopping recording: {str(e)}")
-        import traceback
-        traceback.print_exc()
-        return jsonify({'success': False, 'error': str(e)}), 500
 
 @app.route('/api/videos', methods=['GET'])
 def list_videos():
