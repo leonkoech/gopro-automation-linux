@@ -127,7 +127,7 @@ def gopro_status(gopro_id):
 def start_recording(gopro_id):
     """Start recording on a specific GoPro"""
     global recording_processes
-    
+
     gopros = get_connected_gopros()
     gopro = next((g for g in gopros if g['id'] == gopro_id), None)
     if not gopro:
@@ -139,7 +139,7 @@ def start_recording(gopro_id):
 
         try:
             data = request.get_json() or {}
-            duration = data.get('duration', 1800)  # safer default: 30 min
+            duration = data.get('duration', 1800)  # default: 30 min
 
             timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
             video_filename = f'gopro_{gopro["name"]}_{timestamp}.mp4'
@@ -153,20 +153,32 @@ def start_recording(gopro_id):
                 '--record_time', str(duration)
             ]
 
-            # Run in a separate thread so Flask isn't blocked
-            def run_record():
-                subprocess.run(cmd, check=True)
+            # Start the recording subprocess
+            process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                preexec_fn=os.setsid
+            )
 
-            thread = threading.Thread(target=run_record, daemon=True)
-            thread.start()
-
+            # Save process for stopping later
             recording_processes[gopro_id] = {
-                'thread': thread,
+                'process': process,
                 'video_path': video_path,
                 'video_filename': video_filename,
                 'start_time': datetime.now().isoformat(),
                 'duration': duration
             }
+
+            # Optional: monitor thread to clean up automatically when done
+            def monitor():
+                process.wait()
+                with recording_lock:
+                    if gopro_id in recording_processes:
+                        del recording_processes[gopro_id]
+                print(f"Recording finished for {gopro_id}")
+
+            threading.Thread(target=monitor, daemon=True).start()
 
             return jsonify({
                 'success': True,
@@ -185,41 +197,37 @@ def start_recording(gopro_id):
 def stop_recording(gopro_id):
     """Stop recording on a specific GoPro"""
     global recording_processes
-    
+
     with recording_lock:
         if gopro_id not in recording_processes:
-            return jsonify({
-                'success': False,
-                'error': 'Not currently recording on this GoPro'
-            }), 400
-        
+            return jsonify({'success': False, 'error': 'Not currently recording'}), 400
+
         try:
             recording_info = recording_processes[gopro_id]
             process = recording_info['process']
-            
-            # Send SIGINT to stop gracefully
+
+            # Send SIGINT to stop gracefully (GoPro beeps!)
             os.killpg(os.getpgid(process.pid), signal.SIGINT)
-            
+
             # Wait for process to finish
             try:
                 process.wait(timeout=10)
             except subprocess.TimeoutExpired:
                 os.killpg(os.getpgid(process.pid), signal.SIGKILL)
-            
+
             video_filename = recording_info['video_filename']
             del recording_processes[gopro_id]
-            
+
             return jsonify({
                 'success': True,
                 'message': 'Recording stopped',
                 'video_filename': video_filename
             })
-            
+
         except Exception as e:
-            return jsonify({
-                'success': False,
-                'error': str(e)
-            }), 500
+            return jsonify({'success': False, 'error': str(e)}), 500
+
+
 
 @app.route('/api/videos', methods=['GET'])
 def list_videos():
