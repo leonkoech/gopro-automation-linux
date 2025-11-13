@@ -14,6 +14,10 @@ import time
 import json
 from datetime import datetime
 from pathlib import Path
+import pty
+import select
+import signal
+import threading
 
 app = Flask(__name__)
 CORS(app)  # Enable CORS for Firebase web app access
@@ -123,9 +127,6 @@ def gopro_status(gopro_id):
         'gopro': gopro
     })
 
-import pty
-import select
-
 @app.route('/api/gopros/<gopro_id>/record/start', methods=['POST'])
 def start_recording(gopro_id):
     """Start recording on a specific GoPro"""
@@ -195,7 +196,12 @@ def start_recording(gopro_id):
                     except OSError:
                         break
                 
-                os.close(master)
+                # Close master FD in monitor thread
+                try:
+                    os.close(master)
+                except OSError:
+                    pass
+                    
                 with recording_lock:
                     if gopro_id in recording_processes:
                         del recording_processes[gopro_id]
@@ -215,6 +221,8 @@ def start_recording(gopro_id):
             if gopro_id in recording_processes:
                 del recording_processes[gopro_id]
             return jsonify({'success': False, 'error': str(e)}), 500
+
+
 @app.route('/api/gopros/<gopro_id>/record/stop', methods=['POST'])
 def stop_recording(gopro_id):
     """Stop recording on a specific GoPro"""
@@ -272,7 +280,7 @@ def stop_recording(gopro_id):
             
         except Exception as e:
             return jsonify({'success': False, 'error': str(e)}), 500
-
+        
 @app.route('/api/videos', methods=['GET'])
 def list_videos():
     """List all recorded videos"""
