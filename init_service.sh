@@ -1,12 +1,12 @@
 #!/bin/bash
-# Cloudflare Tunnel Setup Script for Jetson Nano
-# This script installs and configures Cloudflare Tunnel (cloudflared)
-# to expose your GoPro API service securely to the internet
+# Complete Jetson Nano Setup Script
+# Sets up existing Flask app as service + Cloudflare Tunnel
 
 set -e
 
 echo "=========================================="
-echo "Cloudflare Tunnel Setup for Jetson Nano"
+echo "Complete Jetson Nano Setup"
+echo "Flask Service + Cloudflare Tunnel"
 echo "=========================================="
 echo ""
 
@@ -25,15 +25,69 @@ echo "   User: $ACTUAL_USER"
 echo "   Home: $USER_HOME"
 echo ""
 
+# Prompt for Flask app directory
+read -p "Enter path to your Flask app directory (e.g., $USER_HOME/gopro-controller): " APP_DIR
+if [ -z "$APP_DIR" ]; then
+    echo "❌ Flask app directory cannot be empty"
+    exit 1
+fi
+
+# Expand home directory if needed
+APP_DIR="${APP_DIR/#\~/$USER_HOME}"
+
+# Check if directory exists
+if [ ! -d "$APP_DIR" ]; then
+    echo "❌ Directory does not exist: $APP_DIR"
+    exit 1
+fi
+
+# Prompt for Flask app file name
+read -p "Enter Flask app filename (default: app.py): " FLASK_FILE
+FLASK_FILE=${FLASK_FILE:-app.py}
+
+# Check if Flask app exists
+if [ ! -f "$APP_DIR/$FLASK_FILE" ]; then
+    echo "❌ Flask app not found: $APP_DIR/$FLASK_FILE"
+    exit 1
+fi
+
+echo "✅ Found Flask app: $APP_DIR/$FLASK_FILE"
+
+# Check for virtual environment
+if [ -d "$APP_DIR/venv" ]; then
+    echo "✅ Found virtual environment: $APP_DIR/venv"
+    USE_VENV=true
+else
+    echo "⚠️  No virtual environment found at $APP_DIR/venv"
+    USE_VENV=false
+fi
+
+# Check for requirements.txt
+if [ -f "$APP_DIR/requirements.txt" ]; then
+    echo "✅ Found requirements.txt"
+else
+    echo "⚠️  No requirements.txt found"
+fi
+
+echo ""
+
 # Prompt for Jetson name
-read -p "Enter Jetson name (e.g., jetson-1, jetson-2, etc.): " JETSON_NAME
+read -p "Enter Jetson name (e.g., jetson-1): " JETSON_NAME
 if [ -z "$JETSON_NAME" ]; then
     echo "❌ Jetson name cannot be empty"
     exit 1
 fi
 
+# Prompt for port
+read -p "Enter Flask port (default: 5000): " FLASK_PORT
+FLASK_PORT=${FLASK_PORT:-5000}
+
 echo ""
-echo "This will create tunnel: $JETSON_NAME.uai.tech"
+echo "Configuration Summary:"
+echo "   Flask app:     $APP_DIR/$FLASK_FILE"
+echo "   Port:          $FLASK_PORT"
+echo "   Jetson name:   $JETSON_NAME"
+echo "   Public URL:    https://$JETSON_NAME.uai.tech"
 echo ""
 read -p "Continue? (y/n): " CONTINUE
 if [ "$CONTINUE" != "y" ]; then
@@ -41,33 +95,145 @@ if [ "$CONTINUE" != "y" ]; then
     exit 0
 fi
 
+echo ""
+echo "=========================================="
+echo "Part 1: Setting up Flask Service"
+echo "=========================================="
+echo ""
+
+# Install dependencies if needed
+echo "📦 Installing Python dependencies..."
+if [ -d "$VENV_PATH" ]; then
+    echo "✅ Using virtual environment: $VENV_PATH"
+    
+    # Check for requirements.txt
+    if [ -f "$APP_DIR/requirements.txt" ]; then
+        echo "📄 Found requirements.txt, installing dependencies..."
+        $VENV_PATH/bin/pip install -r "$APP_DIR/requirements.txt" || {
+            echo "⚠️  Some dependencies failed to install, continuing..."
+        }
+    else
+        echo "⚠️  No requirements.txt found, installing basic dependencies..."
+        $VENV_PATH/bin/pip install -q flask flask-cors 2>/dev/null || echo "Dependencies already installed"
+    fi
+else
+    echo "⚠️  No venv found, using system Python"
+    
+    if [ -f "$APP_DIR/requirements.txt" ]; then
+        echo "📄 Found requirements.txt, installing dependencies..."
+        pip3 install -r "$APP_DIR/requirements.txt" || {
+            echo "⚠️  Some dependencies failed to install, continuing..."
+        }
+    else
+        pip3 install -q flask flask-cors || echo "Dependencies already installed"
+    fi
+fi
+
+# Create .env file if it doesn't exist
+if [ ! -f "$APP_DIR/.env" ]; then
+    echo "📄 Creating .env file..."
+    cat > "$APP_DIR/.env" << EOF
+FLASK_APP=$FLASK_FILE
+FLASK_ENV=production
+EOF
+    chown $ACTUAL_USER:$ACTUAL_USER "$APP_DIR/.env"
+fi
+
+# Check for virtual environment
+VENV_PATH="$APP_DIR/venv"
+if [ -d "$VENV_PATH" ]; then
+    echo "✅ Found virtual environment: $VENV_PATH"
+    PYTHON_EXEC="$VENV_PATH/bin/python3"
+    FLASK_EXEC="$VENV_PATH/bin/flask"
+else
+    echo "⚠️  No virtual environment found, using system Python"
+    PYTHON_EXEC="/usr/bin/python3"
+    FLASK_EXEC="python3 -m flask"
+fi
+
+# Create or update systemd service
+echo "⚙️  Creating systemd service..."
+cat > /etc/systemd/system/gopro-controller.service << EOF
+[Unit]
+Description=GoPro Controller Flask API Service
+After=network.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=$ACTUAL_USER
+WorkingDirectory=$APP_DIR
+Environment="FLASK_APP=$FLASK_FILE"
+Environment="FLASK_ENV=production"
+Environment="PATH=$VENV_PATH/bin:/usr/local/bin:/usr/bin:/bin"
+ExecStart=$FLASK_EXEC run --host=0.0.0.0 --port=$FLASK_PORT
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# Reload systemd
+echo "🔄 Reloading systemd..."
+systemctl daemon-reload
+
+# Enable service
+echo "✅ Enabling service to start on boot..."
+systemctl enable gopro-controller.service
+
+# Restart service
+echo "▶️  Starting/restarting service..."
+systemctl restart gopro-controller.service
+
+# Wait for service to start
+sleep 3
+
+# Check if service is running
+if systemctl is-active --quiet gopro-controller; then
+    echo "✅ Flask service is running"
+else
+    echo "⚠️  Flask service may have issues. Check logs:"
+    echo "   sudo journalctl -u gopro-controller -n 50"
+    read -p "Continue with Cloudflare setup anyway? (y/n): " CONTINUE_CF
+    if [ "$CONTINUE_CF" != "y" ]; then
+        exit 1
+    fi
+fi
+
+echo ""
+echo "=========================================="
+echo "Part 2: Installing Cloudflare Tunnel"
+echo "=========================================="
+echo ""
+
 # Detect architecture
 ARCH=$(uname -m)
 echo "📊 Detected architecture: $ARCH"
 
-# Download cloudflared based on architecture
-echo "📦 Downloading cloudflared..."
-if [ "$ARCH" = "aarch64" ] || [ "$ARCH" = "arm64" ]; then
-    # ARM64 for Jetson Nano
-    wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-arm64 -O /usr/local/bin/cloudflared
-elif [ "$ARCH" = "x86_64" ]; then
-    # x86_64 for testing on desktop
-    wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -O /usr/local/bin/cloudflared
+# Check if cloudflared is already installed
+if command -v cloudflared &> /dev/null; then
+    echo "✅ cloudflared already installed"
+    cloudflared --version
 else
-    echo "❌ Unsupported architecture: $ARCH"
-    exit 1
+    # Download cloudflared
+    echo "📦 Downloading cloudflared..."
+    if [ "$ARCH" = "aarch64" ] || [ "$ARCH" = "arm64" ]; then
+        wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-arm64 -O /usr/local/bin/cloudflared
+    elif [ "$ARCH" = "x86_64" ]; then
+        wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -O /usr/local/bin/cloudflared
+    else
+        echo "❌ Unsupported architecture: $ARCH"
+        exit 1
+    fi
+    
+    chmod +x /usr/local/bin/cloudflared
+    echo "✅ cloudflared installed"
+    cloudflared --version
 fi
 
-chmod +x /usr/local/bin/cloudflared
-
-# Verify installation
-if ! command -v cloudflared &> /dev/null; then
-    echo "❌ Failed to install cloudflared"
-    exit 1
-fi
-
-echo "✅ cloudflared installed successfully"
-cloudflared --version
 echo ""
 
 # Create cloudflared config directory
@@ -75,129 +241,120 @@ CLOUDFLARED_DIR="$USER_HOME/.cloudflared"
 mkdir -p "$CLOUDFLARED_DIR"
 chown -R $ACTUAL_USER:$ACTUAL_USER "$CLOUDFLARED_DIR"
 
+# Check authentication
 echo "=========================================="
-echo "🔐 Cloudflare Authentication Required"
+echo "🔐 Cloudflare Authentication"
 echo "=========================================="
-echo ""
-echo "Next steps:"
-echo "1. Run the following command AS YOUR USER (not root):"
-echo ""
-echo "   cloudflared tunnel login"
-echo ""
-echo "2. This will open a browser to authenticate with Cloudflare"
-echo "3. Login to your Cloudflare account"
-echo "4. Select the domain: uai.tech"
-echo "5. Authorize the tunnel"
-echo ""
-echo "After authentication, run this script again to continue setup"
-echo ""
-echo "Alternatively, if you already have a tunnel token, continue below..."
 echo ""
 
-# Check if already authenticated
 if [ -f "$CLOUDFLARED_DIR/cert.pem" ]; then
     echo "✅ Found existing Cloudflare certificate"
     AUTHENTICATED=true
 else
     echo "⚠️  No Cloudflare certificate found"
-    AUTHENTICATED=false
-fi
-
-echo ""
-read -p "Do you want to authenticate now? (y/n): " AUTH_NOW
-
-if [ "$AUTH_NOW" = "y" ]; then
     echo ""
-    echo "Switching to user $ACTUAL_USER to authenticate..."
-    echo "A browser window will open. Please login to Cloudflare."
+    echo "You need to authenticate with Cloudflare."
+    echo "This will open a browser window where you'll:"
+    echo "  1. Login to Cloudflare"
+    echo "  2. Select domain: uai.tech"
+    echo "  3. Authorize the tunnel"
     echo ""
-    sleep 2
+    read -p "Authenticate now? (y/n): " AUTH_NOW
     
-    # Run as user
-    su - $ACTUAL_USER -c "cloudflared tunnel login"
-    
-    if [ $? -eq 0 ]; then
-        echo "✅ Authentication successful"
-        AUTHENTICATED=true
+    if [ "$AUTH_NOW" = "y" ]; then
+        echo ""
+        echo "Switching to user $ACTUAL_USER..."
+        echo "A browser window will open..."
+        sleep 2
+        su - $ACTUAL_USER -c "cloudflared tunnel login"
+        
+        if [ $? -eq 0 ]; then
+            echo "✅ Authentication successful"
+            AUTHENTICATED=true
+        else
+            echo "❌ Authentication failed"
+            AUTHENTICATED=false
+        fi
     else
-        echo "❌ Authentication failed"
-        exit 1
+        AUTHENTICATED=false
     fi
 fi
 
 if [ "$AUTHENTICATED" = false ]; then
     echo ""
-    echo "⚠️  Setup incomplete. Please authenticate first:"
-    echo "   su - $ACTUAL_USER"
-    echo "   cloudflared tunnel login"
+    echo "=========================================="
+    echo "⚠️  Setup Incomplete"
+    echo "=========================================="
     echo ""
-    echo "Then run this script again."
+    echo "Flask service is running, but Cloudflare Tunnel is not configured."
+    echo ""
+    echo "To complete setup later:"
+    echo "  1. Authenticate:"
+    echo "     su - $ACTUAL_USER -c 'cloudflared tunnel login'"
+    echo ""
+    echo "  2. Run this command to finish setup:"
+    echo "     sudo $0"
+    echo ""
+    echo "Flask service info:"
+    echo "   Status: sudo systemctl status gopro-controller"
+    echo "   Logs:   sudo journalctl -u gopro-controller -f"
+    echo "   Local:  curl http://localhost:$FLASK_PORT/health"
+    echo ""
     exit 0
 fi
 
 echo ""
-echo "=========================================="
-echo "🚇 Creating Cloudflare Tunnel"
-echo "=========================================="
-echo ""
+echo "🚇 Creating tunnel: $JETSON_NAME"
 
-# Create tunnel (as user)
-echo "Creating tunnel: $JETSON_NAME"
-su - $ACTUAL_USER -c "cloudflared tunnel create $JETSON_NAME" || {
-    echo "⚠️  Tunnel might already exist. Continuing..."
+# Create tunnel
+su - $ACTUAL_USER -c "cloudflared tunnel create $JETSON_NAME" 2>/dev/null || {
+    echo "⚠️  Tunnel may already exist. Checking..."
 }
 
 # Get tunnel ID
 TUNNEL_ID=$(su - $ACTUAL_USER -c "cloudflared tunnel list" | grep "$JETSON_NAME" | awk '{print $1}')
 
 if [ -z "$TUNNEL_ID" ]; then
-    echo "❌ Failed to create or find tunnel"
+    echo "❌ Failed to create or find tunnel: $JETSON_NAME"
+    echo ""
+    echo "Existing tunnels:"
+    su - $ACTUAL_USER -c "cloudflared tunnel list"
     exit 1
 fi
 
-echo "✅ Tunnel created with ID: $TUNNEL_ID"
-echo ""
+echo "✅ Tunnel ID: $TUNNEL_ID"
 
-# Create tunnel configuration
+# Create or update config
 echo "📝 Creating tunnel configuration..."
-
 cat > "$CLOUDFLARED_DIR/config.yml" << EOF
 tunnel: $TUNNEL_ID
 credentials-file: $CLOUDFLARED_DIR/$TUNNEL_ID.json
 
 ingress:
-  # Route for this specific Jetson
   - hostname: $JETSON_NAME.uai.tech
-    service: http://localhost:5000
+    service: http://localhost:$FLASK_PORT
     originRequest:
       noTLSVerify: true
-  
-  # Catch-all rule (required)
   - service: http_status:404
 EOF
 
 chown $ACTUAL_USER:$ACTUAL_USER "$CLOUDFLARED_DIR/config.yml"
 
-echo "✅ Configuration created at: $CLOUDFLARED_DIR/config.yml"
-echo ""
-
 # Create DNS route
 echo "🌐 Creating DNS route..."
-su - $ACTUAL_USER -c "cloudflared tunnel route dns $JETSON_NAME $JETSON_NAME.uai.tech" || {
-    echo "⚠️  DNS route might already exist. Continuing..."
+su - $ACTUAL_USER -c "cloudflared tunnel route dns $JETSON_NAME $JETSON_NAME.uai.tech" 2>/dev/null || {
+    echo "⚠️  DNS route may already exist"
 }
-echo ""
 
-# Install as a service
-echo "⚙️  Installing cloudflared as a system service..."
+# Install or update cloudflared service
+echo "⚙️  Installing cloudflared service..."
 
-cloudflared service install
-
-# Create systemd service file with proper user
+# Create systemd service
 cat > /etc/systemd/system/cloudflared.service << EOF
 [Unit]
-Description=Cloudflare Tunnel
+Description=Cloudflare Tunnel - $JETSON_NAME
 After=network.target
+Wants=network-online.target
 
 [Service]
 Type=simple
@@ -216,53 +373,79 @@ EOF
 systemctl daemon-reload
 
 # Enable and start service
-echo "🚀 Starting cloudflared service..."
+echo "▶️  Starting cloudflared service..."
 systemctl enable cloudflared
 systemctl restart cloudflared
 
-# Wait for service to start
-sleep 3
+# Wait for tunnel to connect
+sleep 5
 
-# Check status
 echo ""
-echo "=========================================="
-echo "📊 Service Status"
-echo "=========================================="
-systemctl status cloudflared --no-pager -l || true
-echo ""
-
-# Display tunnel info
 echo "=========================================="
 echo "✅ Setup Complete!"
 echo "=========================================="
 echo ""
-echo "🎉 Your Jetson Nano is now accessible at:"
+echo "🎉 Your Jetson is now accessible at:"
 echo "   https://$JETSON_NAME.uai.tech"
 echo ""
-echo "📍 Tunnel Details:"
-echo "   Tunnel Name: $JETSON_NAME"
-echo "   Tunnel ID: $TUNNEL_ID"
-echo "   Local Service: http://localhost:5000"
-echo "   Public URL: https://$JETSON_NAME.uai.tech"
+echo "📂 Configuration:"
+echo "   Flask app:         $APP_DIR/$FLASK_FILE"
+echo "   Flask port:        $FLASK_PORT"
+echo "   Tunnel config:     $CLOUDFLARED_DIR/config.yml"
 echo ""
-echo "🔧 Useful Commands:"
-echo "   Check status:     sudo systemctl status cloudflared"
-echo "   View logs:        sudo journalctl -u cloudflared -f"
-echo "   Restart:          sudo systemctl restart cloudflared"
-echo "   Stop:             sudo systemctl stop cloudflared"
-echo "   Tunnel info:      cloudflared tunnel info $JETSON_NAME"
-echo "   List tunnels:     cloudflared tunnel list"
+echo "📊 Services Status:"
 echo ""
-echo "🧪 Test your endpoint:"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "Flask Service (gopro-controller):"
+systemctl status gopro-controller --no-pager -l | head -5
+echo ""
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "Cloudflare Tunnel:"
+systemctl status cloudflared --no-pager -l | head -5
+echo ""
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo ""
+echo "🧪 Test Commands:"
+echo "   # Local test:"
+echo "   curl http://localhost:$FLASK_PORT/health"
+echo ""
+echo "   # Public test (wait 30 seconds for DNS):"
 echo "   curl https://$JETSON_NAME.uai.tech/health"
 echo ""
-echo "⏭️  Next Steps:"
-echo "1. Test the URL in your browser"
-echo "2. Update your Firebase web app to use this URL"
-echo "3. Repeat this setup on other Jetson Nanos (jetson-2, jetson-3, jetson-4)"
+echo "📝 Useful Commands:"
 echo ""
-echo "📝 GoDaddy DNS Configuration:"
-echo "   You don't need to configure anything in GoDaddy!"
-echo "   Cloudflare automatically manages the DNS records."
-echo "   Just make sure uai.tech nameservers point to Cloudflare."
+echo "   # Edit your Flask app:"
+echo "   nano $APP_DIR/$FLASK_FILE"
+echo ""
+echo "   # Restart Flask after changes:"
+echo "   sudo systemctl restart gopro-controller"
+echo ""
+echo "   # Check service status:"
+echo "   sudo systemctl status gopro-controller"
+echo "   sudo systemctl status cloudflared"
+echo ""
+echo "   # View logs:"
+echo "   sudo journalctl -u gopro-controller -f"
+echo "   sudo journalctl -u cloudflared -f"
+echo ""
+echo "   # Stop/Start services:"
+echo "   sudo systemctl stop gopro-controller"
+echo "   sudo systemctl start gopro-controller"
+echo "   sudo systemctl restart cloudflared"
+echo ""
+echo "   # Disable auto-start on boot:"
+echo "   sudo systemctl disable gopro-controller"
+echo "   sudo systemctl disable cloudflared"
+echo ""
+echo "🌐 Cloudflare Tunnel Info:"
+echo "   Tunnel name:       $JETSON_NAME"
+echo "   Tunnel ID:         $TUNNEL_ID"
+echo "   Public URL:        https://$JETSON_NAME.uai.tech"
+echo "   Local service:     http://localhost:$FLASK_PORT"
+echo ""
+echo "   # View all tunnels:"
+echo "   cloudflared tunnel list"
+echo ""
+echo "   # Get tunnel info:"
+echo "   cloudflared tunnel info $JETSON_NAME"
 echo ""
