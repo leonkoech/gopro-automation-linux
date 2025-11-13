@@ -129,6 +129,210 @@ def gopro_status(gopro_id):
     })
 
 
+@app.route('/api/gopros/<gopro_id>/record/start', methods=['POST'])
+def start_recording(gopro_id):
+    """Start recording on a specific GoPro"""
+    global recording_processes
+    gopros = get_connected_gopros()
+    gopro = next((g for g in gopros if g['id'] == gopro_id), None)
+    if not gopro:
+        return jsonify({'success': False, 'error': 'GoPro not found'}), 404
+    
+    with recording_lock:
+        if gopro_id in recording_processes:
+            return jsonify({'success': False, 'error': 'Already recording'}), 400
+        
+        try:
+            data = request.get_json() or {}
+            duration = data.get('duration', 18000)
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            video_filename = f'gopro_{gopro["name"]}_{timestamp}.mp4'
+            video_path = os.path.expanduser(os.path.join(VIDEO_STORAGE_DIR, video_filename))
+
+            print(f"=== Recording Start ===")
+            print(f"VIDEO_STORAGE_DIR: {VIDEO_STORAGE_DIR}")
+            print(f"video_filename: {video_filename}")
+            print(f"Full video_path: {video_path}")
+            print(f"Path exists: {os.path.exists(os.path.dirname(video_path))}")
+            print(f"Path is absolute: {os.path.isabs(video_path)}")
+            
+            cmd = [
+                'gopro-video',
+                '--wired',
+                '--wifi_interface', gopro['interface'],
+                '-o', video_path,
+                '--record_time', str(duration)
+            ]
+            
+            # Use a PTY to give the process a proper terminal
+            master, slave = pty.openpty()
+            
+            process = subprocess.Popen(
+                cmd,
+                stdin=slave,
+                stdout=slave,
+                stderr=slave,
+                preexec_fn=os.setsid,
+                close_fds=True
+            )
+            
+            os.close(slave)  # Parent doesn't need the slave
+            
+            # Wait a bit and check if process started successfully
+            time.sleep(3)
+            if process.poll() is not None:
+                # Process died immediately
+                try:
+                    os.close(master)
+                except:
+                    pass
+                return jsonify({
+                    'success': False, 
+                    'error': 'Recording process failed to start'
+                }), 500
+            
+            recording_processes[gopro_id] = {
+                'process': process,
+                'master_fd': master,
+                'video_path': video_path,
+                'video_filename': video_filename,
+                'start_time': datetime.now().isoformat(),
+                'duration': duration,
+                'recording_started': False  # Track if we've confirmed recording started
+            }
+            
+            def monitor():
+                output = []
+                recording_confirmed = False
+                
+                while True:
+                    try:
+                        # Read from PTY
+                        ready, _, _ = select.select([master], [], [], 1.0)
+                        if ready:
+                            data = os.read(master, 1024)
+                            if data:
+                                text = data.decode('utf-8', errors='ignore')
+                                output.append(text)
+                                print(f"GoPro output: {text}")
+                                
+                                # Look for signs that recording actually started
+                                if not recording_confirmed and ('recording' in text.lower() or 'started' in text.lower()):
+                                    with recording_lock:
+                                        if gopro_id in recording_processes:
+                                            recording_processes[gopro_id]['recording_started'] = True
+                                    recording_confirmed = True
+                                    print(f"Recording confirmed started for {gopro_id}")
+                        
+                        # Check if process is done
+                        if process.poll() is not None:
+                            break
+                    except OSError:
+                        break
+                
+                # Close master FD in monitor thread
+                try:
+                    os.close(master)
+                except OSError:
+                    pass
+                    
+                with recording_lock:
+                    if gopro_id in recording_processes:
+                        del recording_processes[gopro_id]
+                print(f"Recording finished for {gopro_id}")
+                print(f"Full output: {''.join(output)}")
+            
+            threading.Thread(target=monitor, daemon=True).start()
+            
+            return jsonify({
+                'success': True,
+                'message': f'Recording started for {duration}s',
+                'video_filename': video_filename,
+                'gopro_id': gopro_id, 
+                'video_path': video_path
+            })
+            
+        except Exception as e:
+            if gopro_id in recording_processes:
+                del recording_processes[gopro_id]
+            return jsonify({'success': False, 'error': str(e)}), 500
+
+
+import requests
+
+def get_gopro_wired_ip(gopro_id):
+    """Get the actual GoPro IP by checking what gopro-video is using"""
+    try:
+        # When gopro-video connects, the GoPro creates a network interface
+        # We can find the IP by looking at the interface's gateway
+        gopros = get_connected_gopros()
+        gopro = next((g for g in gopros if g['id'] == gopro_id), None)
+        
+        if not gopro:
+            return None
+        
+        interface = gopro['interface']
+        
+        # Use ip route to find the GoPro's IP on this interface
+        result = subprocess.run(
+            ['ip', 'route', 'show', 'dev', interface],
+            capture_output=True,
+            text=True,
+            timeout=2
+        )
+        
+        # Parse output to find the network
+        # Typical output: "172.20.110.0/24 proto kernel scope link src 172.20.110.50"
+        lines = result.stdout.strip().split('\n')
+        for line in lines:
+            if 'proto kernel' in line or 'scope link' in line:
+                # Extract network, GoPro is typically .51
+                parts = line.split()
+                for i, part in enumerate(parts):
+                    if '/' in part and '.' in part:  # CIDR notation
+                        network = part.split('/')[0]
+                        # GoPro is usually .51 in the same subnet
+                        base = '.'.join(network.split('.')[:-1])
+                        gopro_ip = f"{base}.51"
+                        
+                        # Verify this IP responds
+                        try:
+                            test = requests.get(f'http://{gopro_ip}:8080/gopro/camera/state', timeout=1)
+                            if test.status_code == 200:
+                                print(f"Found GoPro at {gopro_ip}")
+                                return gopro_ip
+                        except:
+                            pass
+        
+        # Fallback: try common IPs
+        for last_octet in [51, 1]:
+            try:
+                # Try to get our own IP on this interface
+                result = subprocess.run(
+                    ['ip', 'addr', 'show', interface],
+                    capture_output=True,
+                    text=True,
+                    timeout=2
+                )
+                # Look for inet address
+                import re
+                match = re.search(r'inet (\d+\.\d+\.\d+)\.\d+', result.stdout)
+                if match:
+                    base = match.group(1)
+                    gopro_ip = f"{base}.{last_octet}"
+                    test = requests.get(f'http://{gopro_ip}:8080/gopro/camera/state', timeout=1)
+                    if test.status_code == 200:
+                        print(f"Found GoPro at {gopro_ip}")
+                        return gopro_ip
+            except:
+                pass
+        
+        return None
+        
+    except Exception as e:
+        print(f"Error finding GoPro IP: {e}")
+        return None
+
 @app.route('/api/gopros/<gopro_id>/record/stop', methods=['POST'])
 def stop_recording(gopro_id):
     """Stop recording on a specific GoPro"""
@@ -272,81 +476,6 @@ def stop_recording(gopro_id):
         import traceback
         traceback.print_exc()
         return jsonify({'success': False, 'error': str(e)}), 500
-
-
-def get_gopro_wired_ip(gopro_id):
-    """Get the actual GoPro IP by checking what gopro-video is using"""
-    try:
-        # When gopro-video connects, the GoPro creates a network interface
-        # We can find the IP by looking at the interface's gateway
-        gopros = get_connected_gopros()
-        gopro = next((g for g in gopros if g['id'] == gopro_id), None)
-        
-        if not gopro:
-            return None
-        
-        interface = gopro['interface']
-        
-        # Use ip route to find the GoPro's IP on this interface
-        result = subprocess.run(
-            ['ip', 'route', 'show', 'dev', interface],
-            capture_output=True,
-            text=True,
-            timeout=2
-        )
-        
-        # Parse output to find the network
-        # Typical output: "172.20.110.0/24 proto kernel scope link src 172.20.110.50"
-        lines = result.stdout.strip().split('\n')
-        for line in lines:
-            if 'proto kernel' in line or 'scope link' in line:
-                # Extract network, GoPro is typically .51
-                parts = line.split()
-                for i, part in enumerate(parts):
-                    if '/' in part and '.' in part:  # CIDR notation
-                        network = part.split('/')[0]
-                        # GoPro is usually .51 in the same subnet
-                        base = '.'.join(network.split('.')[:-1])
-                        gopro_ip = f"{base}.51"
-                        
-                        # Verify this IP responds
-                        try:
-                            test = requests.get(f'http://{gopro_ip}:8080/gopro/camera/state', timeout=1)
-                            if test.status_code == 200:
-                                print(f"Found GoPro at {gopro_ip}")
-                                return gopro_ip
-                        except:
-                            pass
-        
-        # Fallback: try common IPs
-        for last_octet in [51, 1]:
-            try:
-                # Try to get our own IP on this interface
-                result = subprocess.run(
-                    ['ip', 'addr', 'show', interface],
-                    capture_output=True,
-                    text=True,
-                    timeout=2
-                )
-                # Look for inet address
-                import re
-                match = re.search(r'inet (\d+\.\d+\.\d+)\.\d+', result.stdout)
-                if match:
-                    base = match.group(1)
-                    gopro_ip = f"{base}.{last_octet}"
-                    test = requests.get(f'http://{gopro_ip}:8080/gopro/camera/state', timeout=1)
-                    if test.status_code == 200:
-                        print(f"Found GoPro at {gopro_ip}")
-                        return gopro_ip
-            except:
-                pass
-        
-        return None
-        
-    except Exception as e:
-        print(f"Error finding GoPro IP: {e}")
-        return None
-
 
 @app.route('/api/videos', methods=['GET'])
 def list_videos():
