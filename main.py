@@ -4,7 +4,7 @@ GoPro Controller API Service
 REST API for remote control of GoPro cameras connected to Jetson Nano
 """
 
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, send_file
 from flask_cors import CORS
 import subprocess
 import threading
@@ -16,9 +16,7 @@ from datetime import datetime
 from pathlib import Path
 import pty
 import select
-import signal
 import requests
-import threading
 
 app = Flask(__name__)
 CORS(app)  # Enable CORS for Firebase web app access
@@ -91,6 +89,117 @@ def get_video_list():
     
     return videos
 
+@app.route('/', methods=['GET'])
+@app.route('/api', methods=['GET'])
+def api_documentation():
+    """API documentation - lists all available endpoints"""
+    endpoints = {
+        'service': 'GoPro Controller API',
+        'version': '1.0',
+        'endpoints': [
+            {
+                'path': '/health',
+                'method': 'GET',
+                'description': 'Health check endpoint',
+                'response': 'Service status and configuration'
+            },
+            {
+                'path': '/api',
+                'method': 'GET',
+                'description': 'API documentation (this page)',
+                'response': 'List of all available endpoints'
+            },
+            {
+                'path': '/api/gopros',
+                'method': 'GET',
+                'description': 'List all connected GoPro cameras',
+                'response': 'Array of connected GoPros with status'
+            },
+            {
+                'path': '/api/gopros/<gopro_id>/status',
+                'method': 'GET',
+                'description': 'Get status of a specific GoPro',
+                'parameters': {'gopro_id': 'GoPro interface ID (e.g., enx0457470807ce)'},
+                'response': 'GoPro connection status and recording info'
+            },
+            {
+                'path': '/api/gopros/<gopro_id>/record/start',
+                'method': 'POST',
+                'description': 'Start recording on a specific GoPro',
+                'parameters': {'gopro_id': 'GoPro interface ID'},
+                'body': {'duration': 'Recording duration in seconds (default: 18000)'},
+                'response': 'Recording started confirmation with video filename'
+            },
+            {
+                'path': '/api/gopros/<gopro_id>/record/stop',
+                'method': 'POST',
+                'description': 'Stop recording on a specific GoPro',
+                'parameters': {'gopro_id': 'GoPro interface ID'},
+                'response': 'Recording stopped confirmation with video details'
+            },
+            {
+                'path': '/api/videos',
+                'method': 'GET',
+                'description': 'List all recorded videos',
+                'response': 'Array of videos with metadata (filename, size, date)'
+            },
+            {
+                'path': '/api/videos/<filename>/download',
+                'method': 'GET',
+                'description': 'Download a specific video file',
+                'parameters': {'filename': 'Video filename (e.g., gopro_GoPro-07ce_20241122_143022.mp4)'},
+                'response': 'Video file download'
+            },
+            {
+                'path': '/api/videos/<filename>/stream',
+                'method': 'GET',
+                'description': 'Stream a video file for in-browser playback',
+                'parameters': {'filename': 'Video filename'},
+                'response': 'Video stream (use in <video> tag)'
+            },
+            {
+                'path': '/api/videos/<filename>',
+                'method': 'DELETE',
+                'description': 'Delete a specific video file',
+                'parameters': {'filename': 'Video filename'},
+                'response': 'Deletion confirmation'
+            },
+            {
+                'path': '/api/system/info',
+                'method': 'GET',
+                'description': 'Get system information and storage stats',
+                'response': 'System info including disk usage, video count, active recordings'
+            }
+        ],
+        'examples': {
+            'start_recording': {
+                'url': 'POST /api/gopros/enx0457470807ce/record/start',
+                'body': {'duration': 300},
+                'description': 'Start 5-minute recording'
+            },
+            'stop_recording': {
+                'url': 'POST /api/gopros/enx0457470807ce/record/stop',
+                'description': 'Stop active recording'
+            },
+            'list_videos': {
+                'url': 'GET /api/videos',
+                'description': 'Get all recorded videos'
+            },
+            'download_video': {
+                'url': 'GET /api/videos/gopro_GoPro-07ce_20241122_143022.mp4/download',
+                'description': 'Download specific video'
+            },
+            'stream_video': {
+                'url': 'GET /api/videos/gopro_GoPro-07ce_20241122_143022.mp4/stream',
+                'description': 'Stream video in browser'
+            }
+        },
+        'base_url': 'http://YOUR_JETSON_IP:5000',
+        'storage_directory': VIDEO_STORAGE_DIR
+    }
+    
+    return jsonify(endpoints)
+
 @app.route('/health', methods=['GET'])
 def health():
     """Health check endpoint"""
@@ -123,6 +232,17 @@ def gopro_status(gopro_id):
             'error': 'GoPro not found'
         }), 404
     
+    # Add recording info if currently recording
+    with recording_lock:
+        if gopro_id in recording_processes:
+            recording_info = recording_processes[gopro_id]
+            gopro['is_recording'] = True
+            gopro['recording_info'] = {
+                'start_time': recording_info['start_time'],
+                'duration': recording_info['duration'],
+                'video_filename': recording_info['video_filename']
+            }
+    
     return jsonify({
         'success': True,
         'gopro': gopro
@@ -147,7 +267,7 @@ def start_recording(gopro_id):
             duration = data.get('duration', 18000)
             timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
             video_filename = f'gopro_{gopro["name"]}_{timestamp}.mp4'
-            video_path = os.path.expanduser(os.path.join(VIDEO_STORAGE_DIR, video_filename))
+            video_path = os.path.join(VIDEO_STORAGE_DIR, video_filename)
 
             print(f"=== Recording Start ===")
             print(f"VIDEO_STORAGE_DIR: {VIDEO_STORAGE_DIR}")
@@ -198,7 +318,7 @@ def start_recording(gopro_id):
                 'video_filename': video_filename,
                 'start_time': datetime.now().isoformat(),
                 'duration': duration,
-                'recording_started': False  # Track if we've confirmed recording started
+                'recording_started': False
             }
             
             def monitor():
@@ -266,182 +386,74 @@ def stop_recording(gopro_id):
         if gopro_id not in recording_processes:
             return jsonify({'success': False, 'error': 'Not currently recording'}), 400
         
-        recording_info = recording_processes[gopro_id].copy()
-    
-    try:
-        video_path = recording_info['video_path']
+        recording_info = recording_processes[gopro_id]
+        process = recording_info['process']
+        master_fd = recording_info.get('master_fd')
         video_filename = recording_info['video_filename']
-        
-        # Find GoPro IP
-        gopro_ip = get_gopro_wired_ip(gopro_id)
-        if not gopro_ip:
-            return jsonify({'success': False, 'error': 'Could not detect GoPro IP'}), 500
-        
-        # Stop recording
-        response = requests.get(
-            f'http://{gopro_ip}:8080/gopro/camera/shutter/stop',
-            timeout=5
-        )
-        
-        if response.status_code != 200:
-            return jsonify({'success': False, 'error': f'Stop command failed'}), 500
-        
-        # Mark as downloading
-        with recording_lock:
-            if gopro_id in recording_processes:
-                recording_processes[gopro_id]['downloading'] = True
-                recording_processes[gopro_id]['download_progress'] = 0
-        
-        # Start download in background thread
-        def download_video():
-            try:
-                time.sleep(3)  # Wait for GoPro to finalize
-                
-                # Get media list
-                media_response = requests.get(
-                    f'http://{gopro_ip}:8080/gopro/media/list',
-                    timeout=10
-                )
-                media_list = media_response.json()
-                
-                last_dir = media_list['media'][-1]
-                last_file = last_dir['fs'][-1]
-                gopro_filename = last_file['n']
-                
-                download_url = f'http://{gopro_ip}:8080/videos/DCIM/{last_dir["d"]}/{gopro_filename}'
-                
-                print(f"Downloading from: {download_url}")
-                
-                download_response = requests.get(download_url, stream=True, timeout=300)
-                total_size = int(download_response.headers.get('content-length', 0))
-                downloaded = 0
-                
-                with open(video_path, 'wb') as f:
-                    for chunk in download_response.iter_content(chunk_size=8192):
-                        if chunk:
-                            f.write(chunk)
-                            downloaded += len(chunk)
-                            
-                            # Update progress
-                            if total_size > 0:
-                                progress = int((downloaded / total_size) * 100)
-                                with recording_lock:
-                                    if gopro_id in recording_processes:
-                                        recording_processes[gopro_id]['download_progress'] = progress
-                
-                print(f"✓ Download complete: {video_path}")
-                
-                # Clean up
-                process = recording_info['process']
-                if process.poll() is None:
-                    try:
-                        os.killpg(os.getpgid(process.pid), signal.SIGTERM)
-                        process.wait(timeout=5)
-                    except:
-                        pass
-                
-                master_fd = recording_info.get('master_fd')
-                if master_fd:
-                    try:
-                        os.close(master_fd)
-                    except:
-                        pass
-                
-                with recording_lock:
-                    if gopro_id in recording_processes:
-                        del recording_processes[gopro_id]
-                
-            except Exception as e:
-                print(f"Download error: {e}")
-                with recording_lock:
-                    if gopro_id in recording_processes:
-                        recording_processes[gopro_id]['download_error'] = str(e)
-        
-        threading.Thread(target=download_video, daemon=True).start()
-        
-        return jsonify({
-            'success': True,
-            'message': 'Recording stopped, downloading video...',
-            'video_filename': video_filename,
-            'note': 'Check status endpoint for download progress'
-        })
-        
-    except Exception as e:
-        print(f"Error: {str(e)}")
-        return jsonify({'success': False, 'error': str(e)}), 500
+        video_path = recording_info['video_path']
     
-def get_gopro_wired_ip(gopro_id):
-    """Get the actual GoPro IP by checking what gopro-video is using"""
     try:
-        # When gopro-video connects, the GoPro creates a network interface
-        # We can find the IP by looking at the interface's gateway
-        gopros = get_connected_gopros()
-        gopro = next((g for g in gopros if g['id'] == gopro_id), None)
+        print(f"=== Stopping Recording for {gopro_id} ===")
         
-        if not gopro:
-            return None
-        
-        interface = gopro['interface']
-        
-        # Use ip route to find the GoPro's IP on this interface
-        result = subprocess.run(
-            ['ip', 'route', 'show', 'dev', interface],
-            capture_output=True,
-            text=True,
-            timeout=2
-        )
-        
-        # Parse output to find the network
-        # Typical output: "172.20.110.0/24 proto kernel scope link src 172.20.110.50"
-        lines = result.stdout.strip().split('\n')
-        for line in lines:
-            if 'proto kernel' in line or 'scope link' in line:
-                # Extract network, GoPro is typically .51
-                parts = line.split()
-                for i, part in enumerate(parts):
-                    if '/' in part and '.' in part:  # CIDR notation
-                        network = part.split('/')[0]
-                        # GoPro is usually .51 in the same subnet
-                        base = '.'.join(network.split('.')[:-1])
-                        gopro_ip = f"{base}.51"
-                        
-                        # Verify this IP responds
-                        try:
-                            test = requests.get(f'http://{gopro_ip}:8080/gopro/camera/state', timeout=1)
-                            if test.status_code == 200:
-                                print(f"Found GoPro at {gopro_ip}")
-                                return gopro_ip
-                        except:
-                            pass
-        
-        # Fallback: try common IPs
-        for last_octet in [51, 1]:
+        # Send Ctrl+C (SIGINT) to the process group
+        # gopro-video handles this gracefully and stops recording properly
+        if process.poll() is None:
             try:
-                # Try to get our own IP on this interface
-                result = subprocess.run(
-                    ['ip', 'addr', 'show', interface],
-                    capture_output=True,
-                    text=True,
-                    timeout=2
-                )
-                # Look for inet address
-                import re
-                match = re.search(r'inet (\d+\.\d+\.\d+)\.\d+', result.stdout)
-                if match:
-                    base = match.group(1)
-                    gopro_ip = f"{base}.{last_octet}"
-                    test = requests.get(f'http://{gopro_ip}:8080/gopro/camera/state', timeout=1)
-                    if test.status_code == 200:
-                        print(f"Found GoPro at {gopro_ip}")
-                        return gopro_ip
+                # Send SIGINT to the process group
+                os.killpg(os.getpgid(process.pid), signal.SIGINT)
+                print(f"Sent SIGINT to process {process.pid}")
+                
+                # Wait for process to finish (with timeout)
+                try:
+                    process.wait(timeout=30)
+                    print(f"Process ended gracefully")
+                except subprocess.TimeoutExpired:
+                    print(f"Process didn't stop gracefully, sending SIGTERM")
+                    os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+                    process.wait(timeout=10)
+                    
+            except Exception as e:
+                print(f"Error stopping process: {e}")
+                # Force kill as last resort
+                try:
+                    os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+                except:
+                    pass
+        
+        # Close the PTY master fd
+        if master_fd:
+            try:
+                os.close(master_fd)
             except:
                 pass
         
-        return None
+        # Clean up from recording_processes
+        with recording_lock:
+            if gopro_id in recording_processes:
+                del recording_processes[gopro_id]
+        
+        # Check if video file was created
+        if os.path.exists(video_path):
+            file_size_mb = os.path.getsize(video_path) / (1024 * 1024)
+            print(f"✓ Video saved: {video_path} ({file_size_mb:.2f} MB)")
+            
+            return jsonify({
+                'success': True,
+                'message': 'Recording stopped successfully',
+                'video_filename': video_filename,
+                'video_path': video_path,
+                'file_size_mb': round(file_size_mb, 2)
+            })
+        else:
+            return jsonify({
+                'success': False,
+                'error': 'Recording stopped but video file not found',
+                'video_path': video_path
+            }), 500
         
     except Exception as e:
-        print(f"Error finding GoPro IP: {e}")
-        return None
+        print(f"Error stopping recording: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
 
 
 @app.route('/api/videos', methods=['GET'])
@@ -454,12 +466,90 @@ def list_videos():
         'videos': videos
     })
 
+@app.route('/api/videos/<filename>/download', methods=['GET'])
+def download_video(filename):
+    """Download a specific video file"""
+    try:
+        video_path = os.path.join(VIDEO_STORAGE_DIR, filename)
+        
+        # Security check: ensure path is within VIDEO_STORAGE_DIR and exists
+        real_video_path = os.path.realpath(video_path)
+        real_storage_dir = os.path.realpath(VIDEO_STORAGE_DIR)
+        
+        if not real_video_path.startswith(real_storage_dir):
+            return jsonify({
+                'success': False,
+                'error': 'Invalid file path'
+            }), 403
+        
+        if not os.path.exists(video_path):
+            return jsonify({
+                'success': False,
+                'error': 'Video not found'
+            }), 404
+        
+        return send_file(
+            video_path,
+            mimetype='video/mp4',
+            as_attachment=True,
+            download_name=filename
+        )
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+@app.route('/api/videos/<filename>/stream', methods=['GET'])
+def stream_video(filename):
+    """Stream a video file for in-browser playback"""
+    try:
+        video_path = os.path.join(VIDEO_STORAGE_DIR, filename)
+        
+        # Security check: ensure path is within VIDEO_STORAGE_DIR and exists
+        real_video_path = os.path.realpath(video_path)
+        real_storage_dir = os.path.realpath(VIDEO_STORAGE_DIR)
+        
+        if not real_video_path.startswith(real_storage_dir):
+            return jsonify({
+                'success': False,
+                'error': 'Invalid file path'
+            }), 403
+        
+        if not os.path.exists(video_path):
+            return jsonify({
+                'success': False,
+                'error': 'Video not found'
+            }), 404
+        
+        return send_file(
+            video_path,
+            mimetype='video/mp4',
+            as_attachment=False
+        )
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
 @app.route('/api/videos/<filename>', methods=['DELETE'])
 def delete_video(filename):
     """Delete a specific video"""
     try:
         video_path = os.path.join(VIDEO_STORAGE_DIR, filename)
-        if os.path.exists(video_path) and video_path.startswith(VIDEO_STORAGE_DIR):
+        
+        # Security check
+        real_video_path = os.path.realpath(video_path)
+        real_storage_dir = os.path.realpath(VIDEO_STORAGE_DIR)
+        
+        if not real_video_path.startswith(real_storage_dir):
+            return jsonify({
+                'success': False,
+                'error': 'Invalid file path'
+            }), 403
+        
+        if os.path.exists(video_path):
             os.remove(video_path)
             return jsonify({
                 'success': True,
@@ -489,6 +579,10 @@ def system_info():
         videos = get_video_list()
         total_video_size_mb = sum(v['size_mb'] for v in videos)
         
+        # Get currently recording GoPros
+        with recording_lock:
+            active_recordings = len(recording_processes)
+        
         return jsonify({
             'success': True,
             'system': {
@@ -496,8 +590,10 @@ def system_info():
                 'storage_path': VIDEO_STORAGE_DIR,
                 'disk_free_gb': round(free_space_gb, 2),
                 'disk_total_gb': round(total_space_gb, 2),
+                'disk_used_percent': round((1 - free_space_gb/total_space_gb) * 100, 2),
                 'video_count': len(videos),
-                'total_video_size_mb': round(total_video_size_mb, 2)
+                'total_video_size_mb': round(total_video_size_mb, 2),
+                'active_recordings': active_recordings
             }
         })
     except Exception as e:
@@ -505,20 +601,6 @@ def system_info():
             'success': False,
             'error': str(e)
         }), 500
-
-def monitor_recording(gopro_id):
-    """Monitor recording process and clean up when finished"""
-    global recording_processes
-    
-    if gopro_id in recording_processes:
-        process = recording_processes[gopro_id]['process']
-        process.wait()
-        
-        with recording_lock:
-            if gopro_id in recording_processes:
-                del recording_processes[gopro_id]
-        
-        print(f"Recording finished for {gopro_id}")
 
 if __name__ == '__main__':
     print("=" * 60)
@@ -528,5 +610,17 @@ if __name__ == '__main__':
     print(f"🌐 API endpoint: http://0.0.0.0:5000")
     print(f"💡 Make sure GoPros are connected via USB")
     print("=" * 60)
+    print("\n📹 Available endpoints:")
+    print("  GET  /health")
+    print("  GET  /api/gopros")
+    print("  GET  /api/gopros/<id>/status")
+    print("  POST /api/gopros/<id>/record/start")
+    print("  POST /api/gopros/<id>/record/stop")
+    print("  GET  /api/videos")
+    print("  GET  /api/videos/<filename>/download")
+    print("  GET  /api/videos/<filename>/stream")
+    print("  DELETE /api/videos/<filename>")
+    print("  GET  /api/system/info")
+    print("=" * 60 + "\n")
     
     app.run(host='0.0.0.0', port=5000, debug=False, threaded=True)
