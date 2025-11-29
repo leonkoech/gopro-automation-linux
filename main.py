@@ -6,7 +6,7 @@ REST API for remote control of GoPro cameras connected to Jetson Nano
 
 from flask import Flask, jsonify, request, send_file
 from flask_cors import CORS
-import subprocess
+import asyncio
 import threading
 import signal
 import os
@@ -14,9 +14,8 @@ import time
 import json
 from datetime import datetime
 from pathlib import Path
-import pty
-import select
 import requests
+from open_gopro import WiredGoPro
 
 app = Flask(__name__)
 CORS(app)  # Enable CORS for Firebase web app access
@@ -28,6 +27,48 @@ os.makedirs(VIDEO_STORAGE_DIR, exist_ok=True)
 # Global state
 recording_processes = {}  # {gopro_id: process}
 recording_lock = threading.Lock()
+
+def shutdown_all_recordings():
+    """Stop all active GoPro recordings gracefully"""
+    print("\n🛑 Shutting down all active recordings...")
+    with recording_lock:
+        gopro_ids = list(recording_processes.keys())
+
+    for gopro_id in gopro_ids:
+        try:
+            with recording_lock:
+                if gopro_id not in recording_processes:
+                    continue
+                recording_info = recording_processes[gopro_id]
+                status = recording_info.get('status')
+
+            print(f"GoPro {gopro_id} - Status: {status}")
+
+            # Recording threads will exit naturally on their own
+            # Just log the current state
+            if status == 'completed':
+                result = recording_info.get('result', {})
+                print(f"  ✓ Completed: {result.get('videos_downloaded', 0)} videos downloaded")
+            elif status == 'failed':
+                print(f"  ✗ Failed: {recording_info.get('error', 'Unknown error')}")
+            else:
+                print(f"  ⏳ In progress: {status}")
+
+        except Exception as e:
+            print(f"Error checking {gopro_id}: {e}")
+
+    print("✓ Shutdown complete")
+
+def signal_handler(signum, frame):
+    """Handle shutdown signals"""
+    print(f"\nReceived signal {signum}")
+    shutdown_all_recordings()
+    import sys
+    sys.exit(0)
+
+def create_app():
+    """Create and configure Flask app with cleanup handlers"""
+    return app
 
 def get_connected_gopros():
     """Discover all connected GoPro cameras"""
@@ -133,9 +174,16 @@ def api_documentation():
             {
                 'path': '/api/gopros/<gopro_id>/record/stop',
                 'method': 'POST',
-                'description': 'Stop recording on a specific GoPro',
+                'description': 'Get status of a recording session',
                 'parameters': {'gopro_id': 'GoPro interface ID'},
-                'response': 'Recording stopped confirmation with video details'
+                'response': 'Recording completion status with downloaded files'
+            },
+            {
+                'path': '/api/gopros/<gopro_id>/record/status',
+                'method': 'GET',
+                'description': 'Get detailed progress of an active recording session',
+                'parameters': {'gopro_id': 'GoPro interface ID'},
+                'response': 'Recording progress (elapsed time, percentage, video count)'
             },
             {
                 'path': '/api/videos',
@@ -225,234 +273,295 @@ def gopro_status(gopro_id):
     """Get status of a specific GoPro"""
     gopros = get_connected_gopros()
     gopro = next((g for g in gopros if g['id'] == gopro_id), None)
-    
+
     if not gopro:
         return jsonify({
             'success': False,
             'error': 'GoPro not found'
         }), 404
-    
+
     # Add recording info if currently recording
     with recording_lock:
         if gopro_id in recording_processes:
             recording_info = recording_processes[gopro_id]
-            gopro['is_recording'] = True
+            gopro['is_recording'] = recording_info.get('status') in ['starting', 'recording']
             gopro['recording_info'] = {
-                'start_time': recording_info['start_time'],
-                'duration': recording_info['duration'],
-                'video_filename': recording_info['video_filename']
+                'start_time': recording_info.get('start_time'),
+                'duration': recording_info.get('duration'),
+                'session_name': recording_info.get('session_name'),
+                'status': recording_info.get('status'),
+                'videos_downloaded': recording_info.get('result', {}).get('videos_downloaded', 0) if recording_info.get('status') == 'completed' else None
             }
-    
+
     return jsonify({
         'success': True,
         'gopro': gopro
     })
 
+@app.route('/api/gopros/<gopro_id>/record/status', methods=['GET'])
+def recording_status(gopro_id):
+    """Get detailed status of a recording session"""
+    with recording_lock:
+        if gopro_id not in recording_processes:
+            return jsonify({
+                'success': False,
+                'error': 'No active recording session'
+            }), 404
+
+        recording_info = recording_processes[gopro_id].copy()
+
+    start_time = datetime.fromisoformat(recording_info.get('start_time', datetime.now().isoformat()))
+    elapsed = (datetime.now() - start_time).total_seconds()
+    duration = recording_info.get('duration', 0)
+    progress_percent = min(100, int((elapsed / duration * 100))) if duration > 0 else 0
+
+    return jsonify({
+        'success': True,
+        'session_name': recording_info.get('session_name'),
+        'status': recording_info.get('status'),
+        'elapsed_seconds': round(elapsed, 1),
+        'total_seconds': duration,
+        'progress_percent': progress_percent,
+        'videos_downloaded': recording_info.get('result', {}).get('videos_downloaded', 0) if recording_info.get('status') == 'completed' else None,
+        'result': recording_info.get('result') if recording_info.get('status') == 'completed' else None
+    })
+
+
+async def record_and_download_gopro(gopro_id, duration, session_name):
+    """Record on GoPro and download all video files"""
+    try:
+        print(f"\n=== Starting Recording Session: {session_name} ===")
+        print(f"Duration: {duration}s ({duration/60:.1f} minutes)")
+
+        async with WiredGoPro(serial=gopro_id[-3:]) as gopro:
+            # Get media list before recording
+            print("Getting initial media list...")
+            media_before_response = await gopro.http_command.get_media_list()
+            if not media_before_response.ok:
+                raise Exception("Failed to get initial media list from GoPro")
+
+            media_before = set(media_before_response.data.files) if media_before_response.data.files else set()
+            print(f"Found {len(media_before)} files before recording")
+
+            # Start recording
+            print("Starting recording...")
+            await gopro.http_command.set_shutter(shutter=1)  # 1 = enable/start
+
+            with recording_lock:
+                if gopro_id in recording_processes:
+                    recording_processes[gopro_id]['recording_started'] = True
+
+            # Record for specified duration
+            print(f"Recording in progress...")
+            await asyncio.sleep(duration)
+
+            # Stop recording
+            print("Stopping recording...")
+            await gopro.http_command.set_shutter(shutter=0)  # 0 = disable/stop
+
+            # Wait a bit for the last chunk to be written
+            await asyncio.sleep(2)
+
+            # Get media list after recording
+            print("Getting updated media list...")
+            media_after_response = await gopro.http_command.get_media_list()
+            if not media_after_response.ok:
+                raise Exception("Failed to get media list after recording")
+
+            media_after = set(media_after_response.data.files) if media_after_response.data.files else set()
+
+            # Find new video files
+            new_videos = media_after.difference(media_before)
+            print(f"Found {len(new_videos)} new video file(s)")
+
+            if not new_videos:
+                print("No new videos found!")
+                return {
+                    'success': False,
+                    'error': 'No new video files created during recording',
+                    'videos_downloaded': []
+                }
+
+            # Download all new videos
+            downloaded_files = []
+            total_size_mb = 0
+
+            for idx, video_file in enumerate(sorted(new_videos, key=lambda x: x.filename), 1):
+                try:
+                    camera_filename = video_file.filename
+                    local_filename = f"{session_name}_{idx:02d}_{camera_filename.split('/')[-1]}"
+                    local_path = Path(VIDEO_STORAGE_DIR) / local_filename
+
+                    print(f"\nDownloading [{idx}/{len(new_videos)}]: {camera_filename}")
+                    print(f"  Destination: {local_path}")
+
+                    # Download the file
+                    download_response = await gopro.http_command.download_file(
+                        camera_file=camera_filename,
+                        local_file=local_path
+                    )
+
+                    if download_response.ok:
+                        file_size_mb = local_path.stat().st_size / (1024 * 1024)
+                        total_size_mb += file_size_mb
+                        print(f"  ✓ Downloaded successfully ({file_size_mb:.2f} MB)")
+
+                        downloaded_files.append({
+                            'filename': local_filename,
+                            'path': str(local_path),
+                            'size_mb': round(file_size_mb, 2)
+                        })
+                    else:
+                        print(f"  ✗ Download failed: {download_response.status}")
+
+                except Exception as e:
+                    print(f"  ✗ Error downloading {camera_filename}: {e}")
+
+            result = {
+                'success': len(downloaded_files) > 0,
+                'videos_downloaded': len(downloaded_files),
+                'total_size_mb': round(total_size_mb, 2),
+                'files': downloaded_files
+            }
+
+            print(f"\n=== Recording Session Complete ===")
+            print(f"Downloaded {len(downloaded_files)} video file(s), {total_size_mb:.2f} MB total")
+
+            return result
+
+    except Exception as e:
+        print(f"Error during recording: {e}")
+        return {
+            'success': False,
+            'error': str(e),
+            'videos_downloaded': 0
+        }
 
 @app.route('/api/gopros/<gopro_id>/record/start', methods=['POST'])
 def start_recording(gopro_id):
     """Start recording on a specific GoPro"""
-    global recording_processes
     gopros = get_connected_gopros()
     gopro = next((g for g in gopros if g['id'] == gopro_id), None)
     if not gopro:
         return jsonify({'success': False, 'error': 'GoPro not found'}), 404
-    
+
     with recording_lock:
         if gopro_id in recording_processes:
             return jsonify({'success': False, 'error': 'Already recording'}), 400
-        
+
         try:
             data = request.get_json() or {}
             duration = data.get('duration', 18000)
             timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-            video_filename = f'gopro_{gopro["name"]}_{timestamp}.mp4'
-            video_path = os.path.join(VIDEO_STORAGE_DIR, video_filename)
+            session_name = f'gopro_{gopro["name"]}_{timestamp}'
 
-            print(f"=== Recording Start ===")
-            print(f"VIDEO_STORAGE_DIR: {VIDEO_STORAGE_DIR}")
-            print(f"video_filename: {video_filename}")
-            print(f"Full video_path: {video_path}")
-            print(f"Path exists: {os.path.exists(os.path.dirname(video_path))}")
-            print(f"Path is absolute: {os.path.isabs(video_path)}")
-            
-            cmd = [
-                'gopro-video',
-                '--wired',
-                '--wifi_interface', gopro['interface'],
-                '-o', video_path,
-                '--record_time', str(duration)
-            ]
-            
-            # Use a PTY to give the process a proper terminal
-            master, slave = pty.openpty()
-            
-            process = subprocess.Popen(
-                cmd,
-                stdin=slave,
-                stdout=slave,
-                stderr=slave,
-                preexec_fn=os.setsid,
-                close_fds=True
-            )
-            
-            os.close(slave)  # Parent doesn't need the slave
-            
-            # Wait a bit and check if process started successfully
-            time.sleep(3)
-            if process.poll() is not None:
-                # Process died immediately
-                try:
-                    os.close(master)
-                except:
-                    pass
-                return jsonify({
-                    'success': False, 
-                    'error': 'Recording process failed to start'
-                }), 500
-            
+            print(f"=== Recording Start Request ===")
+            print(f"GoPro ID: {gopro_id}")
+            print(f"Duration: {duration}s ({duration/60:.1f} minutes)")
+            print(f"Session: {session_name}")
+
+            # Store recording info
             recording_processes[gopro_id] = {
-                'process': process,
-                'master_fd': master,
-                'video_path': video_path,
-                'video_filename': video_filename,
                 'start_time': datetime.now().isoformat(),
                 'duration': duration,
-                'recording_started': False
+                'session_name': session_name,
+                'recording_started': False,
+                'status': 'starting'
             }
-            
-            def monitor():
-                output = []
-                recording_confirmed = False
-                
-                while True:
-                    try:
-                        # Read from PTY
-                        ready, _, _ = select.select([master], [], [], 1.0)
-                        if ready:
-                            data = os.read(master, 1024)
-                            if data:
-                                text = data.decode('utf-8', errors='ignore')
-                                output.append(text)
-                                print(f"GoPro output: {text}")
-                                
-                                # Look for signs that recording actually started
-                                if not recording_confirmed and ('recording' in text.lower() or 'started' in text.lower()):
-                                    with recording_lock:
-                                        if gopro_id in recording_processes:
-                                            recording_processes[gopro_id]['recording_started'] = True
-                                    recording_confirmed = True
-                                    print(f"Recording confirmed started for {gopro_id}")
-                        
-                        # Check if process is done
-                        if process.poll() is not None:
-                            break
-                    except OSError:
-                        break
-                
-                # Close master FD in monitor thread
+
+            # Start recording in background thread
+            def run_recording():
                 try:
-                    os.close(master)
-                except OSError:
-                    pass
-                    
-                with recording_lock:
-                    if gopro_id in recording_processes:
-                        del recording_processes[gopro_id]
-                print(f"Recording finished for {gopro_id}")
-                print(f"Full output: {''.join(output)}")
-            
-            threading.Thread(target=monitor, daemon=True).start()
-            
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+                    result = loop.run_until_complete(
+                        record_and_download_gopro(gopro_id, duration, session_name)
+                    )
+                    loop.close()
+
+                    with recording_lock:
+                        if gopro_id in recording_processes:
+                            recording_processes[gopro_id]['status'] = 'completed'
+                            recording_processes[gopro_id]['result'] = result
+                except Exception as e:
+                    print(f"Recording error: {e}")
+                    with recording_lock:
+                        if gopro_id in recording_processes:
+                            recording_processes[gopro_id]['status'] = 'failed'
+                            recording_processes[gopro_id]['error'] = str(e)
+
+            thread = threading.Thread(target=run_recording, daemon=True)
+            thread.start()
+
             return jsonify({
                 'success': True,
                 'message': f'Recording started for {duration}s',
-                'video_filename': video_filename,
-                'gopro_id': gopro_id, 
-                'video_path': video_path
+                'session_name': session_name,
+                'gopro_id': gopro_id
             })
-            
+
         except Exception as e:
-            if gopro_id in recording_processes:
-                del recording_processes[gopro_id]
+            with recording_lock:
+                if gopro_id in recording_processes:
+                    del recording_processes[gopro_id]
             return jsonify({'success': False, 'error': str(e)}), 500
 
 @app.route('/api/gopros/<gopro_id>/record/stop', methods=['POST'])
 def stop_recording(gopro_id):
     """Stop recording on a specific GoPro"""
-    global recording_processes
-    
     with recording_lock:
         if gopro_id not in recording_processes:
             return jsonify({'success': False, 'error': 'Not currently recording'}), 400
-        
+
         recording_info = recording_processes[gopro_id]
-        process = recording_info['process']
-        master_fd = recording_info.get('master_fd')
-        video_filename = recording_info['video_filename']
-        video_path = recording_info['video_path']
-    
+        status = recording_info.get('status')
+
     try:
-        print(f"=== Stopping Recording for {gopro_id} ===")
-        
-        # Send Ctrl+C (SIGINT) to the process group
-        # gopro-video handles this gracefully and stops recording properly
-        if process.poll() is None:
-            try:
-                # Send SIGINT to the process group
-                os.killpg(os.getpgid(process.pid), signal.SIGINT)
-                print(f"Sent SIGINT to process {process.pid}")
-                
-                # Wait for process to finish (with timeout)
-                try:
-                    process.wait(timeout=30)
-                    print(f"Process ended gracefully")
-                except subprocess.TimeoutExpired:
-                    print(f"Process didn't stop gracefully, sending SIGTERM")
-                    os.killpg(os.getpgid(process.pid), signal.SIGTERM)
-                    process.wait(timeout=10)
-                    
-            except Exception as e:
-                print(f"Error stopping process: {e}")
-                # Force kill as last resort
-                try:
-                    os.killpg(os.getpgid(process.pid), signal.SIGKILL)
-                except:
-                    pass
-        
-        # Close the PTY master fd
-        if master_fd:
-            try:
-                os.close(master_fd)
-            except:
-                pass
-        
-        # Clean up from recording_processes
-        with recording_lock:
-            if gopro_id in recording_processes:
-                del recording_processes[gopro_id]
-        
-        # Check if video file was created
-        if os.path.exists(video_path):
-            file_size_mb = os.path.getsize(video_path) / (1024 * 1024)
-            print(f"✓ Video saved: {video_path} ({file_size_mb:.2f} MB)")
-            
-            return jsonify({
-                'success': True,
-                'message': 'Recording stopped successfully',
-                'video_filename': video_filename,
-                'video_path': video_path,
-                'file_size_mb': round(file_size_mb, 2)
-            })
-        else:
+        print(f"=== Stop Recording Request for {gopro_id} ===")
+        print(f"Current status: {status}")
+
+        # If recording is still in progress, we can't stop it mid-session
+        # The recording runs for the full duration and downloads automatically
+        if status == 'starting' or status == 'recording':
             return jsonify({
                 'success': False,
-                'error': 'Recording stopped but video file not found',
-                'video_path': video_path
+                'error': 'Recording is in progress. Wait for it to complete or the session will stop automatically after the specified duration.',
+                'current_status': status
+            }), 400
+
+        # If completed or failed, return the result
+        if status == 'completed':
+            result = recording_info.get('result', {})
+            with recording_lock:
+                del recording_processes[gopro_id]
+
+            return jsonify({
+                'success': result.get('success', False),
+                'message': 'Recording session completed',
+                'videos_downloaded': result.get('videos_downloaded', 0),
+                'total_size_mb': result.get('total_size_mb', 0),
+                'files': result.get('files', [])
+            })
+
+        if status == 'failed':
+            error = recording_info.get('error', 'Unknown error')
+            with recording_lock:
+                del recording_processes[gopro_id]
+
+            return jsonify({
+                'success': False,
+                'error': f'Recording session failed: {error}'
             }), 500
-        
+
+        # Default response
+        return jsonify({
+            'success': False,
+            'error': 'Unknown recording status',
+            'status': status
+        }), 400
+
     except Exception as e:
-        print(f"Error stopping recording: {str(e)}")
+        print(f"Error in stop_recording: {str(e)}")
         return jsonify({'success': False, 'error': str(e)}), 500
 
 
@@ -603,6 +712,10 @@ def system_info():
         }), 500
 
 if __name__ == '__main__':
+    # Register signal handlers for graceful shutdown
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+
     print("=" * 60)
     print("🎥 GoPro Controller API Service Starting...")
     print("=" * 60)
@@ -622,5 +735,6 @@ if __name__ == '__main__':
     print("  DELETE /api/videos/<filename>")
     print("  GET  /api/system/info")
     print("=" * 60 + "\n")
-    
-    app.run(host='0.0.0.0', port=5000, debug=False, threaded=True)
+
+    # use_reloader=False is important for systemd to handle signals properly
+    app.run(host='0.0.0.0', port=5000, debug=False, threaded=True, use_reloader=False)
