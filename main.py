@@ -12,6 +12,7 @@ import signal
 import os
 import time
 import json
+import subprocess
 from datetime import datetime
 from pathlib import Path
 import requests
@@ -73,24 +74,26 @@ def create_app():
 def get_connected_gopros():
     """Discover all connected GoPro cameras"""
     gopros = []
-    
+
     try:
         # Check for GoPro USB network interfaces
-        result = subprocess.run(['ip', 'addr', 'show'], 
+        result = subprocess.run(['ip', 'addr', 'show'],
                               capture_output=True, text=True, timeout=5)
-        
+
         lines = result.stdout.split('\n')
         current_interface = None
         current_ip = None
-        
+        enx_interfaces = []
+
         for line in lines:
             # Look for interface lines like "13: enx0457470807ce:"
             if 'enx' in line and ':' in line:
                 current_interface = line.split(':')[1].strip().split('@')[0].strip()
+                enx_interfaces.append(current_interface)
             # Look for IP addresses in 172.x.x.x range (typical for GoPro)
             elif 'inet 172.' in line and current_interface:
                 current_ip = line.strip().split()[1].split('/')[0]
-                
+
                 # Try to get more info about this GoPro
                 gopro_info = {
                     'id': current_interface,
@@ -101,12 +104,18 @@ def get_connected_gopros():
                     'is_recording': current_interface in recording_processes
                 }
                 gopros.append(gopro_info)
+                print(f"✓ Discovered GoPro: {current_interface} at {current_ip}")
                 current_interface = None
                 current_ip = None
-                
+
+        if enx_interfaces:
+            print(f"Found {len(enx_interfaces)} enx interface(s): {enx_interfaces}")
+            if not gopros:
+                print(f"⚠️  Warning: Found enx interfaces but no GoPros with 172.x.x.x IP addresses")
+
     except Exception as e:
         print(f"Error discovering GoPros: {e}")
-    
+
     return gopros
 
 def get_video_list():
@@ -330,40 +339,49 @@ def recording_status(gopro_id):
 async def record_and_download_gopro(gopro_id, duration, session_name):
     """Record on GoPro and download all video files"""
     try:
-        print(f"\n=== Starting Recording Session: {session_name} ===")
-        print(f"Duration: {duration}s ({duration/60:.1f} minutes)")
+        print(f"\n[{gopro_id}] === Starting Recording Session: {session_name} ===")
+        print(f"[{gopro_id}] Duration: {duration}s ({duration/60:.1f} minutes)")
+        print(f"[{gopro_id}] GoPro ID: {gopro_id}")
 
-        async with WiredGoPro(serial=gopro_id[-3:]) as gopro:
+        # Extract serial number - try last 3 chars, but handle various formats
+        serial = gopro_id[-3:] if len(gopro_id) >= 3 else gopro_id
+        print(f"[{gopro_id}] Connecting to GoPro with serial: {serial}")
+
+        async with WiredGoPro(serial=serial) as gopro:
+            print(f"[{gopro_id}] ✓ Connected to GoPro")
             # Get media list before recording
-            print("Getting initial media list...")
+            print(f"[{gopro_id}] Getting initial media list...")
             media_before_response = await gopro.http_command.get_media_list()
             if not media_before_response.ok:
                 raise Exception("Failed to get initial media list from GoPro")
 
             media_before = set(media_before_response.data.files) if media_before_response.data.files else set()
-            print(f"Found {len(media_before)} files before recording")
+            print(f"[{gopro_id}] Found {len(media_before)} files before recording")
 
             # Start recording
-            print("Starting recording...")
+            print(f"[{gopro_id}] Starting recording...")
             await gopro.http_command.set_shutter(shutter=1)  # 1 = enable/start
+            print(f"[{gopro_id}] ✓ Recording started")
 
             with recording_lock:
                 if gopro_id in recording_processes:
                     recording_processes[gopro_id]['recording_started'] = True
+                    recording_processes[gopro_id]['status'] = 'recording'
 
             # Record for specified duration
-            print(f"Recording in progress...")
+            print(f"[{gopro_id}] Recording in progress for {duration}s...")
             await asyncio.sleep(duration)
 
             # Stop recording
-            print("Stopping recording...")
+            print(f"[{gopro_id}] Stopping recording...")
             await gopro.http_command.set_shutter(shutter=0)  # 0 = disable/stop
+            print(f"[{gopro_id}] ✓ Recording stopped")
 
             # Wait a bit for the last chunk to be written
             await asyncio.sleep(2)
 
             # Get media list after recording
-            print("Getting updated media list...")
+            print(f"[{gopro_id}] Getting updated media list...")
             media_after_response = await gopro.http_command.get_media_list()
             if not media_after_response.ok:
                 raise Exception("Failed to get media list after recording")
@@ -372,10 +390,10 @@ async def record_and_download_gopro(gopro_id, duration, session_name):
 
             # Find new video files
             new_videos = media_after.difference(media_before)
-            print(f"Found {len(new_videos)} new video file(s)")
+            print(f"[{gopro_id}] Found {len(new_videos)} new video file(s)")
 
             if not new_videos:
-                print("No new videos found!")
+                print(f"[{gopro_id}] No new videos found!")
                 return {
                     'success': False,
                     'error': 'No new video files created during recording',
@@ -392,8 +410,8 @@ async def record_and_download_gopro(gopro_id, duration, session_name):
                     local_filename = f"{session_name}_{idx:02d}_{camera_filename.split('/')[-1]}"
                     local_path = Path(VIDEO_STORAGE_DIR) / local_filename
 
-                    print(f"\nDownloading [{idx}/{len(new_videos)}]: {camera_filename}")
-                    print(f"  Destination: {local_path}")
+                    print(f"[{gopro_id}] Downloading [{idx}/{len(new_videos)}]: {camera_filename}")
+                    print(f"[{gopro_id}]   Destination: {local_path}")
 
                     # Download the file
                     download_response = await gopro.http_command.download_file(
@@ -404,7 +422,7 @@ async def record_and_download_gopro(gopro_id, duration, session_name):
                     if download_response.ok:
                         file_size_mb = local_path.stat().st_size / (1024 * 1024)
                         total_size_mb += file_size_mb
-                        print(f"  ✓ Downloaded successfully ({file_size_mb:.2f} MB)")
+                        print(f"[{gopro_id}]   ✓ Downloaded successfully ({file_size_mb:.2f} MB)")
 
                         downloaded_files.append({
                             'filename': local_filename,
@@ -412,10 +430,10 @@ async def record_and_download_gopro(gopro_id, duration, session_name):
                             'size_mb': round(file_size_mb, 2)
                         })
                     else:
-                        print(f"  ✗ Download failed: {download_response.status}")
+                        print(f"[{gopro_id}]   ✗ Download failed: {download_response.status}")
 
                 except Exception as e:
-                    print(f"  ✗ Error downloading {camera_filename}: {e}")
+                    print(f"[{gopro_id}]   ✗ Error downloading {camera_filename}: {e}")
 
             result = {
                 'success': len(downloaded_files) > 0,
@@ -424,8 +442,8 @@ async def record_and_download_gopro(gopro_id, duration, session_name):
                 'files': downloaded_files
             }
 
-            print(f"\n=== Recording Session Complete ===")
-            print(f"Downloaded {len(downloaded_files)} video file(s), {total_size_mb:.2f} MB total")
+            print(f"[{gopro_id}] === Recording Session Complete ===")
+            print(f"[{gopro_id}] Downloaded {len(downloaded_files)} video file(s), {total_size_mb:.2f} MB total")
 
             return result
 
@@ -441,13 +459,20 @@ async def record_and_download_gopro(gopro_id, duration, session_name):
 def start_recording(gopro_id):
     """Start recording on a specific GoPro"""
     gopros = get_connected_gopros()
+    print(f"\n=== Recording Start Request ===")
+    print(f"Available GoPros: {len(gopros)}")
+    for g in gopros:
+        print(f"  - {g['id']}: {g['name']} ({g['ip']})")
+
     gopro = next((g for g in gopros if g['id'] == gopro_id), None)
     if not gopro:
-        return jsonify({'success': False, 'error': 'GoPro not found'}), 404
+        print(f"ERROR: GoPro {gopro_id} not found!")
+        return jsonify({'success': False, 'error': f'GoPro {gopro_id} not found. Available: {[g["id"] for g in gopros]}'}), 404
 
     with recording_lock:
         if gopro_id in recording_processes:
-            return jsonify({'success': False, 'error': 'Already recording'}), 400
+            print(f"ERROR: GoPro {gopro_id} already recording!")
+            return jsonify({'success': False, 'error': f'GoPro {gopro_id} already recording'}), 400
 
         try:
             data = request.get_json() or {}
@@ -455,8 +480,7 @@ def start_recording(gopro_id):
             timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
             session_name = f'gopro_{gopro["name"]}_{timestamp}'
 
-            print(f"=== Recording Start Request ===")
-            print(f"GoPro ID: {gopro_id}")
+            print(f"Starting recording on {gopro_id}")
             print(f"Duration: {duration}s ({duration/60:.1f} minutes)")
             print(f"Session: {session_name}")
 
@@ -472,32 +496,40 @@ def start_recording(gopro_id):
             # Start recording in background thread
             def run_recording():
                 try:
+                    print(f"[{gopro_id}] Recording thread started")
                     loop = asyncio.new_event_loop()
                     asyncio.set_event_loop(loop)
+                    print(f"[{gopro_id}] Event loop created")
                     result = loop.run_until_complete(
                         record_and_download_gopro(gopro_id, duration, session_name)
                     )
                     loop.close()
+                    print(f"[{gopro_id}] Recording completed, result: {result}")
 
                     with recording_lock:
                         if gopro_id in recording_processes:
                             recording_processes[gopro_id]['status'] = 'completed'
                             recording_processes[gopro_id]['result'] = result
                 except Exception as e:
-                    print(f"Recording error: {e}")
+                    print(f"[{gopro_id}] Recording error: {e}")
+                    import traceback
+                    traceback.print_exc()
                     with recording_lock:
                         if gopro_id in recording_processes:
                             recording_processes[gopro_id]['status'] = 'failed'
                             recording_processes[gopro_id]['error'] = str(e)
 
-            thread = threading.Thread(target=run_recording, daemon=True)
+            thread = threading.Thread(target=run_recording, daemon=True, name=f"Recording-{gopro_id}")
             thread.start()
+            print(f"✓ Recording thread started for {gopro_id}")
+            print(f"✓ All threads are now running. GoPro initialization may take 30-60 seconds per camera.")
 
             return jsonify({
                 'success': True,
-                'message': f'Recording started for {duration}s',
+                'message': f'Recording started for {duration}s. GoPro initialization in progress...',
                 'session_name': session_name,
-                'gopro_id': gopro_id
+                'gopro_id': gopro_id,
+                'note': 'GoPro connection and initialization may take 30-60 seconds per camera'
             })
 
         except Exception as e:
