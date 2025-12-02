@@ -4,7 +4,7 @@ GoPro Controller API Service
 REST API for remote control of GoPro cameras connected to Jetson Nano
 """
 
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, send_file
 from flask_cors import CORS
 import subprocess
 import threading
@@ -324,23 +324,30 @@ def stop_recording(gopro_id):
         process = recording_info['process']
 
         logger.info(f"Stopping recording process for {gopro_id}")
+        logger.info(f"Process PID: {process.pid}, Poll status: {process.poll()}")
 
         # First, terminate the gopro-video process
         if process.poll() is None:
             logger.info(f"Terminating process {process.pid}")
             try:
-                os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+                # Use terminate() first (works cross-platform)
+                process.terminate()
+                logger.info(f"Sent SIGTERM to process {process.pid}")
                 process.wait(timeout=10)
                 logger.info(f"Process terminated successfully")
+            except subprocess.TimeoutExpired:
+                logger.error(f"Process did not terminate after SIGTERM, killing...")
+                try:
+                    process.kill()
+                    logger.info(f"Sent SIGKILL to process {process.pid}")
+                    process.wait(timeout=5)
+                    logger.info(f"Process killed successfully")
+                except Exception as e2:
+                    logger.error(f"Failed to kill process: {e2}")
             except Exception as e:
                 logger.error(f"Error terminating process: {e}")
-                try:
-                    os.killpg(os.getpgid(process.pid), signal.SIGKILL)
-                    process.wait(timeout=5)
-                except Exception as e2:
-                    logger.error(f"Failed to force kill process: {e2}")
         else:
-            logger.info(f"Process already terminated")
+            logger.info(f"Process already terminated with return code: {process.returncode}")
 
         # Close master FD
         master_fd = recording_info.get('master_fd')
@@ -348,8 +355,8 @@ def stop_recording(gopro_id):
             try:
                 os.close(master_fd)
                 logger.info(f"Master FD closed")
-            except:
-                pass
+            except Exception as e:
+                logger.debug(f"Error closing master FD: {e}")
 
         # Remove from recording processes
         with recording_lock:
@@ -453,23 +460,113 @@ def list_videos():
         'videos': videos
     })
 
+@app.route('/api/videos/<filename>/download', methods=['GET'])
+def download_video(filename):
+    """Download a specific video file"""
+    try:
+        video_path = os.path.join(VIDEO_STORAGE_DIR, filename)
+
+        # Security check: ensure path is within VIDEO_STORAGE_DIR
+        real_video_path = os.path.realpath(video_path)
+        real_storage_dir = os.path.realpath(VIDEO_STORAGE_DIR)
+
+        if not real_video_path.startswith(real_storage_dir):
+            logger.warning(f"Attempted path traversal: {video_path}")
+            return jsonify({
+                'success': False,
+                'error': 'Invalid file path'
+            }), 403
+
+        if not os.path.exists(video_path):
+            logger.warning(f"Video not found: {video_path}")
+            return jsonify({
+                'success': False,
+                'error': 'Video not found'
+            }), 404
+
+        logger.info(f"Downloading video: {filename}")
+        return send_file(
+            video_path,
+            mimetype='video/mp4',
+            as_attachment=True,
+            download_name=filename
+        )
+    except Exception as e:
+        logger.exception(f"Error downloading video {filename}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+@app.route('/api/videos/<filename>/stream', methods=['GET'])
+def stream_video(filename):
+    """Stream a video file for in-browser playback"""
+    try:
+        video_path = os.path.join(VIDEO_STORAGE_DIR, filename)
+
+        # Security check: ensure path is within VIDEO_STORAGE_DIR
+        real_video_path = os.path.realpath(video_path)
+        real_storage_dir = os.path.realpath(VIDEO_STORAGE_DIR)
+
+        if not real_video_path.startswith(real_storage_dir):
+            logger.warning(f"Attempted path traversal: {video_path}")
+            return jsonify({
+                'success': False,
+                'error': 'Invalid file path'
+            }), 403
+
+        if not os.path.exists(video_path):
+            logger.warning(f"Video not found for streaming: {video_path}")
+            return jsonify({
+                'success': False,
+                'error': 'Video not found'
+            }), 404
+
+        logger.info(f"Streaming video: {filename}")
+        return send_file(
+            video_path,
+            mimetype='video/mp4',
+            as_attachment=False
+        )
+    except Exception as e:
+        logger.exception(f"Error streaming video {filename}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
 @app.route('/api/videos/<filename>', methods=['DELETE'])
 def delete_video(filename):
     """Delete a specific video"""
     try:
         video_path = os.path.join(VIDEO_STORAGE_DIR, filename)
-        if os.path.exists(video_path) and video_path.startswith(VIDEO_STORAGE_DIR):
+
+        # Security check: ensure path is within VIDEO_STORAGE_DIR
+        real_video_path = os.path.realpath(video_path)
+        real_storage_dir = os.path.realpath(VIDEO_STORAGE_DIR)
+
+        if not real_video_path.startswith(real_storage_dir):
+            logger.warning(f"Attempted path traversal deletion: {video_path}")
+            return jsonify({
+                'success': False,
+                'error': 'Invalid file path'
+            }), 403
+
+        if os.path.exists(video_path):
             os.remove(video_path)
+            logger.info(f"Deleted video: {filename}")
             return jsonify({
                 'success': True,
                 'message': f'Video {filename} deleted'
             })
         else:
+            logger.warning(f"Video not found for deletion: {filename}")
             return jsonify({
                 'success': False,
                 'error': 'Video not found'
             }), 404
     except Exception as e:
+        logger.exception(f"Error deleting video {filename}")
         return jsonify({
             'success': False,
             'error': str(e)
