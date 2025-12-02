@@ -309,11 +309,8 @@ def stop_recording(gopro_id):
     """Stop recording on a specific GoPro"""
     global recording_processes
 
-    logger.info(f"=== Stop Recording Request for {gopro_id} ===")
-
     with recording_lock:
         if gopro_id not in recording_processes:
-            logger.warning(f"GoPro {gopro_id} not currently recording")
             return jsonify({'success': False, 'error': 'Not currently recording'}), 400
 
         recording_info = recording_processes[gopro_id].copy()
@@ -322,60 +319,134 @@ def stop_recording(gopro_id):
         video_path = recording_info['video_path']
         video_filename = recording_info['video_filename']
         process = recording_info['process']
-
-        logger.info(f"Stopping recording process for {gopro_id}")
-        logger.info(f"Process PID: {process.pid}, Poll status: {process.poll()}")
-
-        # First, terminate the gopro-video process
-        if process.poll() is None:
-            logger.info(f"Terminating process {process.pid}")
-            try:
-                # Use terminate() first (works cross-platform)
-                process.terminate()
-                logger.info(f"Sent SIGTERM to process {process.pid}")
-                process.wait(timeout=10)
-                logger.info(f"Process terminated successfully")
-            except subprocess.TimeoutExpired:
-                logger.error(f"Process did not terminate after SIGTERM, killing...")
-                try:
-                    process.kill()
-                    logger.info(f"Sent SIGKILL to process {process.pid}")
-                    process.wait(timeout=5)
-                    logger.info(f"Process killed successfully")
-                except Exception as e2:
-                    logger.error(f"Failed to kill process: {e2}")
-            except Exception as e:
-                logger.error(f"Error terminating process: {e}")
-        else:
-            logger.info(f"Process already terminated with return code: {process.returncode}")
-
-        # Close master FD
         master_fd = recording_info.get('master_fd')
+
+        # FIRST: Kill the gopro-video process immediately
+        if process.poll() is None:  # If still running
+            try:
+                # Send SIGTERM to the process group
+                os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+                
+                # Wait a bit for graceful shutdown
+                try:
+                    process.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    # Force kill if it doesn't stop
+                    os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+                    process.wait(timeout=1)
+                    
+                print(f"✓ Stopped gopro-video process for {gopro_id}")
+            except Exception as e:
+                print(f"Error stopping process: {e}")
+
+        # Close the PTY master
         if master_fd:
             try:
                 os.close(master_fd)
-                logger.info(f"Master FD closed")
-            except Exception as e:
-                logger.debug(f"Error closing master FD: {e}")
+            except:
+                pass
 
-        # Remove from recording processes
+        # Find GoPro IP
+        gopro_ip = get_gopro_wired_ip(gopro_id)
+        if not gopro_ip:
+            # Clean up and return error
+            with recording_lock:
+                if gopro_id in recording_processes:
+                    del recording_processes[gopro_id]
+            return jsonify({'success': False, 'error': 'Could not detect GoPro IP'}), 500
+
+        # Send stop command to GoPro
+        try:
+            response = requests.get(
+                f'http://{gopro_ip}:8080/gopro/camera/shutter/stop',
+                timeout=5
+            )
+            if response.status_code != 200:
+                print(f"Warning: Stop command returned {response.status_code}")
+        except Exception as e:
+            print(f"Warning: Could not send stop command to GoPro: {e}")
+
+        # Mark as downloading
         with recording_lock:
             if gopro_id in recording_processes:
-                del recording_processes[gopro_id]
+                recording_processes[gopro_id]['downloading'] = True
+                recording_processes[gopro_id]['download_progress'] = 0
+            else:
+                # Add it back temporarily for download tracking
+                recording_processes[gopro_id] = {
+                    'downloading': True,
+                    'download_progress': 0,
+                    'video_path': video_path,
+                    'video_filename': video_filename
+                }
 
-        logger.info(f"Recording stopped for {gopro_id}")
+        # Start download in background thread
+        def download_video():
+            try:
+                time.sleep(3)  # Wait for GoPro to finalize
+
+                # Get media list
+                media_response = requests.get(
+                    f'http://{gopro_ip}:8080/gopro/media/list',
+                    timeout=10
+                )
+                media_list = media_response.json()
+
+                last_dir = media_list['media'][-1]
+                last_file = last_dir['fs'][-1]
+                gopro_filename = last_file['n']
+
+                download_url = f'http://{gopro_ip}:8080/videos/DCIM/{last_dir["d"]}/{gopro_filename}'
+
+                print(f"Downloading from: {download_url}")
+
+                download_response = requests.get(download_url, stream=True, timeout=300)
+                total_size = int(download_response.headers.get('content-length', 0))
+                downloaded = 0
+
+                with open(video_path, 'wb') as f:
+                    for chunk in download_response.iter_content(chunk_size=8192):
+                        if chunk:
+                            f.write(chunk)
+                            downloaded += len(chunk)
+
+                            # Update progress
+                            if total_size > 0:
+                                progress = int((downloaded / total_size) * 100)
+                                with recording_lock:
+                                    if gopro_id in recording_processes:
+                                        recording_processes[gopro_id]['download_progress'] = progress
+
+                print(f"✓ Download complete: {video_path}")
+
+                # Final cleanup
+                with recording_lock:
+                    if gopro_id in recording_processes:
+                        del recording_processes[gopro_id]
+
+            except Exception as e:
+                print(f"Download error: {e}")
+                with recording_lock:
+                    if gopro_id in recording_processes:
+                        recording_processes[gopro_id]['download_error'] = str(e)
+
+        threading.Thread(target=download_video, daemon=True).start()
 
         return jsonify({
             'success': True,
-            'message': 'Recording stopped',
+            'message': 'Recording stopped, downloading video...',
             'video_filename': video_filename,
-            'video_path': video_path
+            'note': 'Check status endpoint for download progress'
         })
 
     except Exception as e:
-        logger.exception(f"Error stopping recording for {gopro_id}")
+        print(f"Error: {str(e)}")
+        # Make sure to clean up
+        with recording_lock:
+            if gopro_id in recording_processes:
+                del recording_processes[gopro_id]
         return jsonify({'success': False, 'error': str(e)}), 500
-
+    
 def get_gopro_wired_ip(gopro_id):
     """Get the actual GoPro IP by checking what gopro-video is using"""
     try:
