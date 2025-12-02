@@ -4,7 +4,7 @@ GoPro Controller API Service
 REST API for remote control of GoPro cameras connected to Jetson Nano
 """
 
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, send_file, Response, send_from_directory
 from flask_cors import CORS
 import subprocess
 import threading
@@ -577,6 +577,110 @@ def system_info():
                 'total_video_size_mb': round(total_video_size_mb, 2)
             }
         })
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+
+@app.route('/api/videos/<filename>/download', methods=['GET'])
+def download_video(filename):
+    """Download a specific video file"""
+    try:
+        video_path = os.path.join(VIDEO_STORAGE_DIR, filename)
+        
+        # Security check: ensure the file exists and is within VIDEO_STORAGE_DIR
+        if not os.path.exists(video_path):
+            return jsonify({
+                'success': False,
+                'error': 'Video not found'
+            }), 404
+            
+        if not video_path.startswith(VIDEO_STORAGE_DIR):
+            return jsonify({
+                'success': False,
+                'error': 'Invalid file path'
+            }), 403
+        
+        # Send file as attachment (triggers download)
+        return send_file(
+            video_path,
+            as_attachment=True,
+            download_name=filename,
+            mimetype='video/mp4'
+        )
+        
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+
+@app.route('/api/videos/<filename>/stream', methods=['GET'])
+def stream_video(filename):
+    """Stream a specific video file with support for range requests"""
+    try:
+        video_path = os.path.join(VIDEO_STORAGE_DIR, filename)
+        
+        # Security check: ensure the file exists and is within VIDEO_STORAGE_DIR
+        if not os.path.exists(video_path):
+            return jsonify({
+                'success': False,
+                'error': 'Video not found'
+            }), 404
+            
+        if not video_path.startswith(VIDEO_STORAGE_DIR):
+            return jsonify({
+                'success': False,
+                'error': 'Invalid file path'
+            }), 403
+        
+        # Get file size
+        file_size = os.path.getsize(video_path)
+        
+        # Check if client requested a range
+        range_header = request.headers.get('Range', None)
+        
+        if not range_header:
+            # No range requested, send entire file
+            return send_file(
+                video_path,
+                mimetype='video/mp4',
+                conditional=True
+            )
+        
+        # Parse range header
+        # Format: "bytes=start-end"
+        byte_range = range_header.replace('bytes=', '').split('-')
+        start = int(byte_range[0]) if byte_range[0] else 0
+        end = int(byte_range[1]) if byte_range[1] else file_size - 1
+        
+        # Ensure end doesn't exceed file size
+        end = min(end, file_size - 1)
+        length = end - start + 1
+        
+        # Read the requested chunk
+        with open(video_path, 'rb') as f:
+            f.seek(start)
+            data = f.read(length)
+        
+        # Create response with partial content
+        response = Response(
+            data,
+            206,  # Partial Content status code
+            mimetype='video/mp4',
+            direct_passthrough=True
+        )
+        
+        # Set headers for range request
+        response.headers.add('Content-Range', f'bytes {start}-{end}/{file_size}')
+        response.headers.add('Accept-Ranges', 'bytes')
+        response.headers.add('Content-Length', str(length))
+        
+        return response
+        
     except Exception as e:
         return jsonify({
             'success': False,
