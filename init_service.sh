@@ -1,293 +1,451 @@
-#!/usr/bin/env python3
-"""
-GoPro Segmented Video Downloader
-Downloads videos in segments and merges them into a final video
-"""
+#!/bin/bash
+# Complete Jetson Nano Setup Script
+# Sets up existing Flask app as service + Cloudflare Tunnel
 
-import os
-import time
-import requests
-import subprocess
-from datetime import datetime, timedelta
-from pathlib import Path
-from typing import List, Optional, Tuple
-import json
-import logging
+set -e
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+echo "=========================================="
+echo "Complete Jetson Nano Setup"
+echo "Flask Service + Cloudflare Tunnel"
+echo "=========================================="
+echo ""
 
+# Check if running as root
+if [ "$EUID" -ne 0 ]; then 
+    echo "❌ Please run as root (use sudo)"
+    exit 1
+fi
 
-class GoProSegmentDownloader:
-    def __init__(self, gopro_ip: str = "10.5.5.9", output_dir: str = "./gopro_downloads"):
-        self.gopro_ip = gopro_ip
-        self.base_url = f"http://{gopro_ip}:8080"
-        self.output_dir = Path(output_dir)
-        self.output_dir.mkdir(parents=True, exist_ok=True)
-        self.segment_dir = self.output_dir / "segments"
-        self.segment_dir.mkdir(exist_ok=True)
-        
-    def get_media_list(self) -> List[dict]:
-        """Get list of media files from GoPro via WiFi API"""
-        try:
-            response = requests.get(f"{self.base_url}/gopro/media/list", timeout=5)
-            if response.status_code == 200:
-                data = response.json()
-                media_list = []
-                for directory in data.get('media', []):
-                    for file in directory.get('fs', []):
-                        # Parse the creation time
-                        file['directory'] = directory['d']
-                        file['timestamp'] = self._parse_gopro_time(file.get('mod', ''))
-                        media_list.append(file)
-                return sorted(media_list, key=lambda x: x.get('timestamp', 0))
-            else:
-                logger.error(f"Failed to get media list: {response.status_code}")
-                return []
-        except Exception as e:
-            logger.error(f"Error getting media list: {e}")
-            return []
-    
-    def _parse_gopro_time(self, time_str: str) -> float:
-        """Parse GoPro timestamp to Unix timestamp"""
-        try:
-            # GoPro uses format like "1234567890"
-            return float(time_str) if time_str else 0
-        except:
-            return 0
-    
-    def download_video(self, directory: str, filename: str, output_path: Path) -> bool:
-        """Download a single video file from GoPro"""
-        try:
-            url = f"{self.base_url}/videos/DCIM/{directory}/{filename}"
-            logger.info(f"Downloading {filename}...")
-            
-            response = requests.get(url, stream=True, timeout=30)
-            if response.status_code == 200:
-                total_size = int(response.headers.get('content-length', 0))
-                downloaded = 0
-                
-                with open(output_path, 'wb') as f:
-                    for chunk in response.iter_content(chunk_size=8192):
-                        if chunk:
-                            f.write(chunk)
-                            downloaded += len(chunk)
-                            if total_size:
-                                progress = (downloaded / total_size) * 100
-                                print(f"\rProgress: {progress:.1f}%", end='')
-                print()  # New line after progress
-                logger.info(f"Downloaded: {output_path}")
-                return True
-            else:
-                logger.error(f"Failed to download {filename}: {response.status_code}")
-                return False
-        except Exception as e:
-            logger.error(f"Error downloading {filename}: {e}")
-            return False
-    
-    def continuous_download(self, interval_minutes: int = 10, stop_event=None) -> List[Path]:
-        """
-        Continuously download new videos every interval_minutes
-        Returns list of downloaded video paths
-        """
-        downloaded_files = []
-        last_check_time = time.time()
-        processed_files = set()
-        
-        logger.info(f"Starting continuous download (checking every {interval_minutes} minutes)")
-        
-        while True:
-            if stop_event and stop_event.is_set():
-                logger.info("Stop signal received")
-                break
-            
-            # Check every interval
-            time.sleep(interval_minutes * 60)
-            
-            try:
-                media_list = self.get_media_list()
-                
-                # Find new videos since last check
-                for media in media_list:
-                    if media['timestamp'] > last_check_time and media['n'] not in processed_files:
-                        if media['n'].lower().endswith(('.mp4', '.mov')):
-                            output_path = self.segment_dir / media['n']
-                            if self.download_video(media['directory'], media['n'], output_path):
-                                downloaded_files.append(output_path)
-                                processed_files.add(media['n'])
-                
-                last_check_time = time.time()
-                
-            except Exception as e:
-                logger.error(f"Error in continuous download: {e}")
-                time.sleep(60)  # Wait a bit before retrying
-        
-        return downloaded_files
-    
-    def time_range_download(self, start_time: datetime, end_time: datetime) -> List[Path]:
-        """
-        Download all videos between start_time and end_time
-        Returns list of downloaded video paths
-        """
-        downloaded_files = []
-        
-        logger.info(f"Downloading videos from {start_time} to {end_time}")
-        
-        try:
-            media_list = self.get_media_list()
-            
-            start_ts = start_time.timestamp()
-            end_ts = end_time.timestamp()
-            
-            for media in media_list:
-                media_ts = media.get('timestamp', 0)
-                
-                # Check if video is in time range
-                if start_ts <= media_ts <= end_ts:
-                    if media['n'].lower().endswith(('.mp4', '.mov')):
-                        output_path = self.segment_dir / media['n']
-                        logger.info(f"Found video in range: {media['n']}")
-                        if self.download_video(media['directory'], media['n'], output_path):
-                            downloaded_files.append(output_path)
-            
-            logger.info(f"Downloaded {len(downloaded_files)} videos in time range")
-            
-        except Exception as e:
-            logger.error(f"Error in time range download: {e}")
-        
-        return downloaded_files
-    
-    def merge_videos(self, video_files: List[Path], output_name: str = "merged_video.mp4") -> Optional[str]:
-        """
-        Merge multiple video files into one using ffmpeg
-        Returns URL/path to merged video
-        """
-        if not video_files:
-            logger.error("No videos to merge")
-            return None
-        
-        # Sort files by modification time
-        video_files = sorted(video_files, key=lambda x: x.stat().st_mtime)
-        
-        output_path = self.output_dir / output_name
-        
-        # Create file list for ffmpeg concat
-        concat_file = self.segment_dir / "concat_list.txt"
-        with open(concat_file, 'w') as f:
-            for video in video_files:
-                # Use absolute paths
-                f.write(f"file '{video.absolute()}'\n")
-        
-        logger.info(f"Merging {len(video_files)} videos...")
-        
-        try:
-            # Use ffmpeg to concatenate videos
-            cmd = [
-                'ffmpeg',
-                '-f', 'concat',
-                '-safe', '0',
-                '-i', str(concat_file),
-                '-c', 'copy',  # Copy streams without re-encoding (fast)
-                '-y',  # Overwrite output
-                str(output_path)
-            ]
-            
-            result = subprocess.run(cmd, capture_output=True, text=True)
-            
-            if result.returncode == 0:
-                logger.info(f"Successfully merged videos to: {output_path}")
-                # Clean up concat file
-                concat_file.unlink()
-                return str(output_path)
-            else:
-                logger.error(f"FFmpeg error: {result.stderr}")
-                return None
-                
-        except Exception as e:
-            logger.error(f"Error merging videos: {e}")
-            return None
-    
-    def cleanup_segments(self):
-        """Remove individual segment files after merging"""
-        try:
-            for file in self.segment_dir.glob("*.mp4"):
-                file.unlink()
-            for file in self.segment_dir.glob("*.mov"):
-                file.unlink()
-            logger.info("Cleaned up segment files")
-        except Exception as e:
-            logger.error(f"Error cleaning up segments: {e}")
+# Get the actual user
+ACTUAL_USER=${SUDO_USER:-$USER}
+USER_HOME=$(eval echo ~$ACTUAL_USER)
 
+echo "📋 Configuration:"
+echo "   User: $ACTUAL_USER"
+echo "   Home: $USER_HOME"
+echo ""
 
-# Example usage
-if __name__ == "__main__":
-    import threading
-    import sys
+# Prompt for Flask app directory
+read -p "Enter path to your Flask app directory (e.g., $USER_HOME/gopro-controller): " APP_DIR
+if [ -z "$APP_DIR" ]; then
+    echo "❌ Flask app directory cannot be empty"
+    exit 1
+fi
+
+# Expand home directory if needed
+APP_DIR="${APP_DIR/#\~/$USER_HOME}"
+
+# Check if directory exists
+if [ ! -d "$APP_DIR" ]; then
+    echo "❌ Directory does not exist: $APP_DIR"
+    exit 1
+fi
+
+# Prompt for Flask app file name
+read -p "Enter Flask app filename (default: app.py): " FLASK_FILE
+FLASK_FILE=${FLASK_FILE:-app.py}
+
+# Check if Flask app exists
+if [ ! -f "$APP_DIR/$FLASK_FILE" ]; then
+    echo "❌ Flask app not found: $APP_DIR/$FLASK_FILE"
+    exit 1
+fi
+
+echo "✅ Found Flask app: $APP_DIR/$FLASK_FILE"
+
+# Check for virtual environment
+if [ -d "$APP_DIR/venv" ]; then
+    echo "✅ Found virtual environment: $APP_DIR/venv"
+    USE_VENV=true
+else
+    echo "⚠️  No virtual environment found at $APP_DIR/venv"
+    USE_VENV=false
+fi
+
+# Check for requirements.txt
+if [ -f "$APP_DIR/requirements.txt" ]; then
+    echo "✅ Found requirements.txt"
+else
+    echo "⚠️  No requirements.txt found"
+fi
+
+echo ""
+
+# Prompt for Jetson name
+read -p "Enter Jetson name (e.g., jetson-1): " JETSON_NAME
+if [ -z "$JETSON_NAME" ]; then
+    echo "❌ Jetson name cannot be empty"
+    exit 1
+fi
+
+# Prompt for port
+read -p "Enter Flask port (default: 5000): " FLASK_PORT
+FLASK_PORT=${FLASK_PORT:-5000}
+
+echo ""
+echo "Configuration Summary:"
+echo "   Flask app:     $APP_DIR/$FLASK_FILE"
+echo "   Port:          $FLASK_PORT"
+echo "   Jetson name:   $JETSON_NAME"
+echo "   Public URL:    https://$JETSON_NAME.uai.tech"
+echo ""
+read -p "Continue? (y/n): " CONTINUE
+if [ "$CONTINUE" != "y" ]; then
+    echo "Setup cancelled"
+    exit 0
+fi
+
+echo ""
+echo "=========================================="
+echo "Part 1: Setting up Flask Service"
+echo "=========================================="
+echo ""
+
+# Install dependencies if needed
+echo "📦 Installing Python dependencies..."
+if [ -d "$VENV_PATH" ]; then
+    echo "✅ Using virtual environment: $VENV_PATH"
     
-    downloader = GoProSegmentDownloader()
+    # Check for requirements.txt
+    if [ -f "$APP_DIR/requirements.txt" ]; then
+        echo "📄 Found requirements.txt, installing dependencies..."
+        $VENV_PATH/bin/pip install -r "$APP_DIR/requirements.txt" || {
+            echo "⚠️  Some dependencies failed to install, continuing..."
+        }
+    else
+        echo "⚠️  No requirements.txt found, installing basic dependencies..."
+        $VENV_PATH/bin/pip install -q flask flask-cors 2>/dev/null || echo "Dependencies already installed"
+    fi
+else
+    echo "⚠️  No venv found, using system Python"
     
-    print("GoPro Segmented Video Downloader")
-    print("=" * 50)
-    print("1. Continuous mode (download every N minutes)")
-    print("2. Time range mode (download videos in time range)")
+    if [ -f "$APP_DIR/requirements.txt" ]; then
+        echo "📄 Found requirements.txt, installing dependencies..."
+        pip3 install -r "$APP_DIR/requirements.txt" || {
+            echo "⚠️  Some dependencies failed to install, continuing..."
+        }
+    else
+        pip3 install -q flask flask-cors || echo "Dependencies already installed"
+    fi
+fi
+
+# Create .env file if it doesn't exist
+if [ ! -f "$APP_DIR/.env" ]; then
+    echo "📄 Creating .env file..."
+    cat > "$APP_DIR/.env" << EOF
+FLASK_APP=$FLASK_FILE
+FLASK_ENV=production
+EOF
+    chown $ACTUAL_USER:$ACTUAL_USER "$APP_DIR/.env"
+fi
+
+# Check for virtual environment
+VENV_PATH="$APP_DIR/venv"
+if [ -d "$VENV_PATH" ]; then
+    echo "✅ Found virtual environment: $VENV_PATH"
+    PYTHON_EXEC="$VENV_PATH/bin/python3"
+    FLASK_EXEC="$VENV_PATH/bin/flask"
+else
+    echo "⚠️  No virtual environment found, using system Python"
+    PYTHON_EXEC="/usr/bin/python3"
+    FLASK_EXEC="python3 -m flask"
+fi
+
+# Create or update systemd service
+echo "⚙️  Creating systemd service..."
+cat > /etc/systemd/system/gopro-controller.service << EOF
+[Unit]
+Description=GoPro Controller Flask API Service
+After=network.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=$ACTUAL_USER
+WorkingDirectory=$APP_DIR
+Environment="FLASK_APP=$FLASK_FILE"
+Environment="FLASK_ENV=production"
+Environment="PATH=$VENV_PATH/bin:/usr/local/bin:/usr/bin:/bin"
+ExecStart=$FLASK_EXEC run --host=0.0.0.0 --port=$FLASK_PORT
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# Reload systemd
+echo "🔄 Reloading systemd..."
+systemctl daemon-reload
+
+# Enable service
+echo "✅ Enabling service to start on boot..."
+systemctl enable gopro-controller.service
+
+# Restart service
+echo "▶️  Starting/restarting service..."
+systemctl restart gopro-controller.service
+
+# Wait for service to start
+sleep 3
+
+# Check if service is running
+if systemctl is-active --quiet gopro-controller; then
+    echo "✅ Flask service is running"
+else
+    echo "⚠️  Flask service may have issues. Check logs:"
+    echo "   sudo journalctl -u gopro-controller -n 50"
+    read -p "Continue with Cloudflare setup anyway? (y/n): " CONTINUE_CF
+    if [ "$CONTINUE_CF" != "y" ]; then
+        exit 1
+    fi
+fi
+
+echo ""
+echo "=========================================="
+echo "Part 2: Installing Cloudflare Tunnel"
+echo "=========================================="
+echo ""
+
+# Detect architecture
+ARCH=$(uname -m)
+echo "📊 Detected architecture: $ARCH"
+
+# Check if cloudflared is already installed
+if command -v cloudflared &> /dev/null; then
+    echo "✅ cloudflared already installed"
+    cloudflared --version
+else
+    # Download cloudflared
+    echo "📦 Downloading cloudflared..."
+    if [ "$ARCH" = "aarch64" ] || [ "$ARCH" = "arm64" ]; then
+        wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-arm64 -O /usr/local/bin/cloudflared
+    elif [ "$ARCH" = "x86_64" ]; then
+        wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -O /usr/local/bin/cloudflared
+    else
+        echo "❌ Unsupported architecture: $ARCH"
+        exit 1
+    fi
     
-    choice = input("Select mode (1 or 2): ").strip()
+    chmod +x /usr/local/bin/cloudflared
+    echo "✅ cloudflared installed"
+    cloudflared --version
+fi
+
+echo ""
+
+# Create cloudflared config directory
+CLOUDFLARED_DIR="$USER_HOME/.cloudflared"
+mkdir -p "$CLOUDFLARED_DIR"
+chown -R $ACTUAL_USER:$ACTUAL_USER "$CLOUDFLARED_DIR"
+
+# Check authentication
+echo "=========================================="
+echo "🔐 Cloudflare Authentication"
+echo "=========================================="
+echo ""
+
+if [ -f "$CLOUDFLARED_DIR/cert.pem" ]; then
+    echo "✅ Found existing Cloudflare certificate"
+    AUTHENTICATED=true
+else
+    echo "⚠️  No Cloudflare certificate found"
+    echo ""
+    echo "You need to authenticate with Cloudflare."
+    echo "This will open a browser window where you'll:"
+    echo "  1. Login to Cloudflare"
+    echo "  2. Select domain: uai.tech"
+    echo "  3. Authorize the tunnel"
+    echo ""
+    read -p "Authenticate now? (y/n): " AUTH_NOW
     
-    if choice == "1":
-        # Continuous mode
-        interval = int(input("Check interval in minutes (default 10): ") or "10")
+    if [ "$AUTH_NOW" = "y" ]; then
+        echo ""
+        echo "Switching to user $ACTUAL_USER..."
+        echo "A browser window will open..."
+        sleep 2
+        su - $ACTUAL_USER -c "cloudflared tunnel login"
         
-        stop_event = threading.Event()
-        
-        def signal_handler():
-            input("\nPress Enter to stop and merge videos...\n")
-            stop_event.set()
-        
-        # Start input listener in separate thread
-        listener = threading.Thread(target=signal_handler, daemon=True)
-        listener.start()
-        
-        try:
-            downloaded = downloader.continuous_download(interval, stop_event)
-            
-            if downloaded:
-                print(f"\nDownloaded {len(downloaded)} video segments")
-                merged = downloader.merge_videos(downloaded)
-                if merged:
-                    print(f"\n✅ Merged video available at: {merged}")
-                    cleanup = input("Delete segment files? (y/n): ").lower()
-                    if cleanup == 'y':
-                        downloader.cleanup_segments()
-            else:
-                print("No videos were downloaded")
-                
-        except KeyboardInterrupt:
-            print("\nInterrupted by user")
-            
-    elif choice == "2":
-        # Time range mode
-        print("\nEnter time range (format: YYYY-MM-DD HH:MM:SS)")
-        start_str = input("Start time: ")
-        end_str = input("End time: ")
-        
-        try:
-            start_time = datetime.strptime(start_str, "%Y-%m-%d %H:%M:%S")
-            end_time = datetime.strptime(end_str, "%Y-%m-%d %H:%M:%S")
-            
-            downloaded = downloader.time_range_download(start_time, end_time)
-            
-            if downloaded:
-                print(f"\nDownloaded {len(downloaded)} videos")
-                merged = downloader.merge_videos(downloaded)
-                if merged:
-                    print(f"\n✅ Merged video available at: {merged}")
-                    cleanup = input("Delete segment files? (y/n): ").lower()
-                    if cleanup == 'y':
-                        downloader.cleanup_segments()
-            else:
-                print("No videos found in specified time range")
-                
-        except ValueError as e:
-            print(f"Error parsing dates: {e}")
-    else:
-        print("Invalid choice")
+        if [ $? -eq 0 ]; then
+            echo "✅ Authentication successful"
+            AUTHENTICATED=true
+        else
+            echo "❌ Authentication failed"
+            AUTHENTICATED=false
+        fi
+    else
+        AUTHENTICATED=false
+    fi
+fi
+
+if [ "$AUTHENTICATED" = false ]; then
+    echo ""
+    echo "=========================================="
+    echo "⚠️  Setup Incomplete"
+    echo "=========================================="
+    echo ""
+    echo "Flask service is running, but Cloudflare Tunnel is not configured."
+    echo ""
+    echo "To complete setup later:"
+    echo "  1. Authenticate:"
+    echo "     su - $ACTUAL_USER -c 'cloudflared tunnel login'"
+    echo ""
+    echo "  2. Run this command to finish setup:"
+    echo "     sudo $0"
+    echo ""
+    echo "Flask service info:"
+    echo "   Status: sudo systemctl status gopro-controller"
+    echo "   Logs:   sudo journalctl -u gopro-controller -f"
+    echo "   Local:  curl http://localhost:$FLASK_PORT/health"
+    echo ""
+    exit 0
+fi
+
+echo ""
+echo "🚇 Creating tunnel: $JETSON_NAME"
+
+# Create tunnel
+su - $ACTUAL_USER -c "cloudflared tunnel create $JETSON_NAME" 2>/dev/null || {
+    echo "⚠️  Tunnel may already exist. Checking..."
+}
+
+# Get tunnel ID
+TUNNEL_ID=$(su - $ACTUAL_USER -c "cloudflared tunnel list" | grep "$JETSON_NAME" | awk '{print $1}')
+
+if [ -z "$TUNNEL_ID" ]; then
+    echo "❌ Failed to create or find tunnel: $JETSON_NAME"
+    echo ""
+    echo "Existing tunnels:"
+    su - $ACTUAL_USER -c "cloudflared tunnel list"
+    exit 1
+fi
+
+echo "✅ Tunnel ID: $TUNNEL_ID"
+
+# Create or update config
+echo "📝 Creating tunnel configuration..."
+cat > "$CLOUDFLARED_DIR/config.yml" << EOF
+tunnel: $TUNNEL_ID
+credentials-file: $CLOUDFLARED_DIR/$TUNNEL_ID.json
+
+ingress:
+  - hostname: $JETSON_NAME.uai.tech
+    service: http://localhost:$FLASK_PORT
+    originRequest:
+      noTLSVerify: true
+  - service: http_status:404
+EOF
+
+chown $ACTUAL_USER:$ACTUAL_USER "$CLOUDFLARED_DIR/config.yml"
+
+# Create DNS route
+echo "🌐 Creating DNS route..."
+su - $ACTUAL_USER -c "cloudflared tunnel route dns $JETSON_NAME $JETSON_NAME.uai.tech" 2>/dev/null || {
+    echo "⚠️  DNS route may already exist"
+}
+
+# Install or update cloudflared service
+echo "⚙️  Installing cloudflared service..."
+
+# Create systemd service
+cat > /etc/systemd/system/cloudflared.service << EOF
+[Unit]
+Description=Cloudflare Tunnel - $JETSON_NAME
+After=network.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=$ACTUAL_USER
+ExecStart=/usr/local/bin/cloudflared tunnel --config $CLOUDFLARED_DIR/config.yml run
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# Reload systemd
+systemctl daemon-reload
+
+# Enable and start service
+echo "▶️  Starting cloudflared service..."
+systemctl enable cloudflared
+systemctl restart cloudflared
+
+# Wait for tunnel to connect
+sleep 5
+
+echo ""
+echo "=========================================="
+echo "✅ Setup Complete!"
+echo "=========================================="
+echo ""
+echo "🎉 Your Jetson is now accessible at:"
+echo "   https://$JETSON_NAME.uai.tech"
+echo ""
+echo "📂 Configuration:"
+echo "   Flask app:         $APP_DIR/$FLASK_FILE"
+echo "   Flask port:        $FLASK_PORT"
+echo "   Tunnel config:     $CLOUDFLARED_DIR/config.yml"
+echo ""
+echo "📊 Services Status:"
+echo ""
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "Flask Service (gopro-controller):"
+systemctl status gopro-controller --no-pager -l | head -5
+echo ""
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "Cloudflare Tunnel:"
+systemctl status cloudflared --no-pager -l | head -5
+echo ""
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo ""
+echo "🧪 Test Commands:"
+echo "   # Local test:"
+echo "   curl http://localhost:$FLASK_PORT/health"
+echo ""
+echo "   # Public test (wait 30 seconds for DNS):"
+echo "   curl https://$JETSON_NAME.uai.tech/health"
+echo ""
+echo "📝 Useful Commands:"
+echo ""
+echo "   # Edit your Flask app:"
+echo "   nano $APP_DIR/$FLASK_FILE"
+echo ""
+echo "   # Restart Flask after changes:"
+echo "   sudo systemctl restart gopro-controller"
+echo ""
+echo "   # Check service status:"
+echo "   sudo systemctl status gopro-controller"
+echo "   sudo systemctl status cloudflared"
+echo ""
+echo "   # View logs:"
+echo "   sudo journalctl -u gopro-controller -f"
+echo "   sudo journalctl -u cloudflared -f"
+echo ""
+echo "   # Stop/Start services:"
+echo "   sudo systemctl stop gopro-controller"
+echo "   sudo systemctl start gopro-controller"
+echo "   sudo systemctl restart cloudflared"
+echo ""
+echo "   # Disable auto-start on boot:"
+echo "   sudo systemctl disable gopro-controller"
+echo "   sudo systemctl disable cloudflared"
+echo ""
+echo "🌐 Cloudflare Tunnel Info:"
+echo "   Tunnel name:       $JETSON_NAME"
+echo "   Tunnel ID:         $TUNNEL_ID"
+echo "   Public URL:        https://$JETSON_NAME.uai.tech"
+echo "   Local service:     http://localhost:$FLASK_PORT"
+echo ""
+echo "   # View all tunnels:"
+echo "   cloudflared tunnel list"
+echo ""
+echo "   # Get tunnel info:"
+echo "   cloudflared tunnel info $JETSON_NAME"
+echo ""
