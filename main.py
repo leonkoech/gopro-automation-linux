@@ -19,6 +19,7 @@ import select
 import requests
 import re
 from videoupload import VideoUploadService
+from media_service import get_media_service
 
 app = Flask(__name__)
 CORS(app)
@@ -359,7 +360,9 @@ def start_recording(gopro_id):
 
         # === FIX 2: Get list of existing files BEFORE recording ===
         pre_record_files = get_gopro_files(gopro_ip)
-        print(f"Pre-recording files on {gopro_id}: {len(pre_record_files)} files")
+        print(f"Pre-recording files on {gopro_id} ({gopro_ip}): {len(pre_record_files)} files")
+        if len(pre_record_files) == 0:
+            print(f"⚠ WARNING: No pre-record files found for {gopro_id} - this may cause issues!")
 
         data = request.get_json() or {}
         duration = data.get('duration', 18000)
@@ -576,12 +579,20 @@ def stop_recording(gopro_id):
             if gopro_id in recording_processes:
                 recording_processes[gopro_id]['downloading'] = True
                 recording_processes[gopro_id]['download_progress'] = 0
+                recording_processes[gopro_id]['stage'] = 'stopping'
+                recording_processes[gopro_id]['stage_message'] = 'Stopping GoPro...'
 
         def download_all_chapters():
             """Download ALL new video chapters created during recording"""
             try:
+                # Update stage: downloading
+                with recording_lock:
+                    if gopro_id in recording_processes:
+                        recording_processes[gopro_id]['stage'] = 'downloading'
+                        recording_processes[gopro_id]['stage_message'] = 'Downloading video from GoPro...'
+
                 time.sleep(3)  # Wait for camera to finalize files
-                
+
                 print(f"Getting media list from {gopro_ip}...")
                 media_response = requests.get(
                     f'http://{gopro_ip}:8080/gopro/media/list',
@@ -605,6 +616,22 @@ def stop_recording(gopro_id):
                 # Sort by filename to maintain correct chapter order
                 # GoPro names: GX010028.MP4, GX020028.MP4, GX030028.MP4 for same recording
                 new_chapters.sort(key=lambda x: x['filename'])
+
+                # Safety check: if we found too many "new" files, something is wrong
+                # (likely pre_record_files wasn't captured properly)
+                MAX_CHAPTERS = 20
+                total_size_bytes = sum(ch['size'] for ch in new_chapters)
+                total_size_gb = total_size_bytes / (1024**3)
+
+                if len(new_chapters) > MAX_CHAPTERS:
+                    print(f"⚠ WARNING: Found {len(new_chapters)} new chapters ({total_size_gb:.1f} GB) - this seems too many!")
+                    print(f"  Pre-record files count: {len(pre_record_files)}")
+                    print(f"  Limiting to last {MAX_CHAPTERS} chapters to avoid downloading entire SD card")
+                    new_chapters = new_chapters[-MAX_CHAPTERS:]
+                    total_size_bytes = sum(ch['size'] for ch in new_chapters)
+                    total_size_gb = total_size_bytes / (1024**3)
+
+                print(f"Total download size: {total_size_gb:.2f} GB")
                 
                 print(f"Found {len(new_chapters)} new chapters to download")
                 for ch in new_chapters:
@@ -653,6 +680,12 @@ def stop_recording(gopro_id):
 
                 # Merge all chapters
                 if downloaded_files:
+                    # Update stage: merging
+                    with recording_lock:
+                        if gopro_id in recording_processes:
+                            recording_processes[gopro_id]['stage'] = 'merging'
+                            recording_processes[gopro_id]['stage_message'] = 'Merging video chapters...'
+
                     print(f"Merging {len(downloaded_files)} chapters into {video_path}...")
 
                     if merge_videos_ffmpeg(downloaded_files, video_path):
@@ -670,6 +703,12 @@ def stop_recording(gopro_id):
 
                         # Upload to S3 if enabled
                         if upload_service:
+                            # Update stage: uploading
+                            with recording_lock:
+                                if gopro_id in recording_processes:
+                                    recording_processes[gopro_id]['stage'] = 'uploading'
+                                    recording_processes[gopro_id]['stage_message'] = 'Uploading to cloud...'
+
                             try:
                                 print(f"Starting upload of {video_filename} to S3...")
                                 upload_date = datetime.now().strftime('%Y-%m-%d')
@@ -691,6 +730,12 @@ def stop_recording(gopro_id):
                                 )
                                 print(f"✓ Video uploaded to: {s3_uri}")
 
+                                # Update stage: done
+                                with recording_lock:
+                                    if gopro_id in recording_processes:
+                                        recording_processes[gopro_id]['stage'] = 'done'
+                                        recording_processes[gopro_id]['stage_message'] = 'Done!'
+
                                 # Optionally delete local file after upload
                                 if DELETE_AFTER_UPLOAD:
                                     try:
@@ -700,6 +745,16 @@ def stop_recording(gopro_id):
                                         print(f"⚠ Failed to delete local file: {e}")
                             except Exception as e:
                                 print(f"✗ Upload failed: {e}")
+                                with recording_lock:
+                                    if gopro_id in recording_processes:
+                                        recording_processes[gopro_id]['stage'] = 'done'
+                                        recording_processes[gopro_id]['stage_message'] = 'Done (upload failed)'
+                        else:
+                            # No upload service, mark as done
+                            with recording_lock:
+                                if gopro_id in recording_processes:
+                                    recording_processes[gopro_id]['stage'] = 'done'
+                                    recording_processes[gopro_id]['stage_message'] = 'Done!'
                     else:
                         print(f"✗ Failed to merge chapters - keeping individual files in {session_dir}")
                 else:
@@ -757,6 +812,8 @@ def recording_status(gopro_id):
             'is_stopping': info.get('is_stopping', False),
             'downloading': info.get('downloading', False),
             'download_progress': info.get('download_progress', 0),
+            'stage': info.get('stage', 'recording'),
+            'stage_message': info.get('stage_message', 'Recording...'),
             'error': info.get('error')
         })
 
@@ -909,9 +966,178 @@ def stream_video(filename):
             'error': str(e)
         }), 500
 
+# ==================== Media Management Endpoints ====================
+
+media_service = get_media_service(VIDEO_STORAGE_DIR)
+
+@app.route('/api/media/gopro/<gopro_id>/files', methods=['GET'])
+def get_gopro_files_list(gopro_id):
+    """Get list of all files on a specific GoPro"""
+    gopro_ip = get_gopro_wired_ip(gopro_id)
+    if not gopro_ip:
+        return jsonify({'success': False, 'error': 'GoPro not found or not connected'}), 404
+
+    result = media_service.get_gopro_media_list(gopro_ip)
+    return jsonify(result), 200 if result['success'] else 500
+
+@app.route('/api/media/gopro/<gopro_id>/storage', methods=['GET'])
+def get_gopro_storage(gopro_id):
+    """Get storage info for a specific GoPro"""
+    gopro_ip = get_gopro_wired_ip(gopro_id)
+    if not gopro_ip:
+        return jsonify({'success': False, 'error': 'GoPro not found or not connected'}), 404
+
+    result = media_service.get_gopro_storage_info(gopro_ip)
+    return jsonify(result), 200 if result['success'] else 500
+
+@app.route('/api/media/gopro/<gopro_id>/files/<directory>/<filename>', methods=['GET'])
+def get_gopro_file_details(gopro_id, directory, filename):
+    """Get detailed info about a specific file on GoPro"""
+    gopro_ip = get_gopro_wired_ip(gopro_id)
+    if not gopro_ip:
+        return jsonify({'success': False, 'error': 'GoPro not found or not connected'}), 404
+
+    result = media_service.get_gopro_file_info(gopro_ip, directory, filename)
+    return jsonify(result), 200 if result['success'] else 500
+
+@app.route('/api/media/gopro/<gopro_id>/files/<directory>/<filename>', methods=['DELETE'])
+def delete_gopro_file_endpoint(gopro_id, directory, filename):
+    """Delete a specific file from GoPro"""
+    gopro_ip = get_gopro_wired_ip(gopro_id)
+    if not gopro_ip:
+        return jsonify({'success': False, 'error': 'GoPro not found or not connected'}), 404
+
+    result = media_service.delete_gopro_file(gopro_ip, directory, filename)
+    return jsonify(result), 200 if result['success'] else 500
+
+@app.route('/api/media/gopro/<gopro_id>/files/all', methods=['DELETE'])
+def delete_all_gopro_files_endpoint(gopro_id):
+    """Delete ALL files from a GoPro (use with caution!)"""
+    gopro_ip = get_gopro_wired_ip(gopro_id)
+    if not gopro_ip:
+        return jsonify({'success': False, 'error': 'GoPro not found or not connected'}), 404
+
+    # Require confirmation parameter
+    confirm = request.args.get('confirm', 'false').lower() == 'true'
+    if not confirm:
+        return jsonify({
+            'success': False,
+            'error': 'Must pass ?confirm=true to delete all files'
+        }), 400
+
+    result = media_service.delete_gopro_all_files(gopro_ip)
+    return jsonify(result), 200 if result['success'] else 500
+
+@app.route('/api/media/gopro/<gopro_id>/files/<directory>/<filename>/download', methods=['GET'])
+def download_gopro_file(gopro_id, directory, filename):
+    """Proxy download of a file from GoPro"""
+    gopro_ip = get_gopro_wired_ip(gopro_id)
+    if not gopro_ip:
+        return jsonify({'success': False, 'error': 'GoPro not found or not connected'}), 404
+
+    try:
+        download_url = f'http://{gopro_ip}:8080/videos/DCIM/{directory}/{filename}'
+        response = requests.get(download_url, stream=True, timeout=300)
+
+        def generate():
+            for chunk in response.iter_content(chunk_size=65536):
+                yield chunk
+
+        return Response(
+            generate(),
+            headers={
+                'Content-Type': 'video/mp4',
+                'Content-Disposition': f'attachment; filename="{filename}"',
+                'Content-Length': response.headers.get('Content-Length', '')
+            }
+        )
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.route('/api/media/gopro/<gopro_id>/files/<directory>/<filename>/thumbnail', methods=['GET'])
+def get_gopro_thumbnail(gopro_id, directory, filename):
+    """Get thumbnail for a GoPro file"""
+    gopro_ip = get_gopro_wired_ip(gopro_id)
+    if not gopro_ip:
+        return jsonify({'success': False, 'error': 'GoPro not found or not connected'}), 404
+
+    try:
+        thumb_url = f'http://{gopro_ip}:8080/gopro/media/thumbnail?path={directory}/{filename}'
+        response = requests.get(thumb_url, timeout=10)
+
+        return Response(
+            response.content,
+            headers={
+                'Content-Type': 'image/jpeg',
+                'Cache-Control': 'max-age=3600'
+            }
+        )
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.route('/api/media/gopro/<gopro_id>/files/<directory>/<filename>/stream', methods=['GET'])
+def stream_gopro_file(gopro_id, directory, filename):
+    """Stream a video file from GoPro (for preview)"""
+    gopro_ip = get_gopro_wired_ip(gopro_id)
+    if not gopro_ip:
+        return jsonify({'success': False, 'error': 'GoPro not found or not connected'}), 404
+
+    try:
+        stream_url = f'http://{gopro_ip}:8080/videos/DCIM/{directory}/{filename}'
+
+        # Handle range requests for video seeking
+        range_header = request.headers.get('Range', None)
+        headers = {}
+        if range_header:
+            headers['Range'] = range_header
+
+        response = requests.get(stream_url, headers=headers, stream=True, timeout=30)
+
+        def generate():
+            for chunk in response.iter_content(chunk_size=65536):
+                yield chunk
+
+        resp_headers = {
+            'Content-Type': 'video/mp4',
+            'Accept-Ranges': 'bytes'
+        }
+
+        if 'Content-Range' in response.headers:
+            resp_headers['Content-Range'] = response.headers['Content-Range']
+        if 'Content-Length' in response.headers:
+            resp_headers['Content-Length'] = response.headers['Content-Length']
+
+        return Response(
+            generate(),
+            status=response.status_code,
+            headers=resp_headers
+        )
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+# ==================== Local/Jetson Media Endpoints ====================
+
+@app.route('/api/media/local/files', methods=['GET'])
+def get_local_files_list():
+    """Get list of all local video files on Jetson"""
+    result = media_service.get_local_media_list()
+    return jsonify(result), 200 if result['success'] else 500
+
+@app.route('/api/media/local/storage', methods=['GET'])
+def get_local_storage():
+    """Get local storage info"""
+    result = media_service.get_local_storage_info()
+    return jsonify(result), 200 if result['success'] else 500
+
+@app.route('/api/media/local/files/<filename>', methods=['DELETE'])
+def delete_local_file_endpoint(filename):
+    """Delete a local video file"""
+    result = media_service.delete_local_file(filename)
+    return jsonify(result), 200 if result['success'] else 500
+
 if __name__ == '__main__':
     print("=" * 60)
-    print("🎥 GoPro Controller API Service Starting...")
+    print("GoPro Controller API Service Starting...")
     print("=" * 60)
     print(f"📁 Video storage: {VIDEO_STORAGE_DIR}")
     print(f"📂 Segments storage: {SEGMENTS_DIR}")
