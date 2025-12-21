@@ -18,6 +18,7 @@ import pty
 import select
 import requests
 import re
+from videoupload import VideoUploadService
 
 app = Flask(__name__)
 CORS(app)
@@ -27,6 +28,33 @@ VIDEO_STORAGE_DIR = os.path.expanduser('~/gopro_videos')
 SEGMENTS_DIR = os.path.join(VIDEO_STORAGE_DIR, 'segments')
 os.makedirs(VIDEO_STORAGE_DIR, exist_ok=True)
 os.makedirs(SEGMENTS_DIR, exist_ok=True)
+
+# Upload configuration
+UPLOAD_ENABLED = os.getenv('UPLOAD_ENABLED', 'true').lower() == 'true'
+UPLOAD_LOCATION = os.getenv('UPLOAD_LOCATION', 'default-location')
+UPLOAD_DEVICE_NAME = os.getenv('UPLOAD_DEVICE_NAME', os.uname().nodename)
+UPLOAD_BUCKET = os.getenv('UPLOAD_BUCKET', 'jetson-videos')
+UPLOAD_REGION = os.getenv('UPLOAD_REGION', 'us-east-1')
+DELETE_AFTER_UPLOAD = os.getenv('DELETE_AFTER_UPLOAD', 'false').lower() == 'true'
+
+# Initialize upload service
+upload_service = None
+if UPLOAD_ENABLED:
+    aws_access_key = os.getenv('AWS_ACCESS_KEY_ID')
+    aws_secret_key = os.getenv('AWS_SECRET_ACCESS_KEY')
+    if aws_access_key and aws_secret_key:
+        try:
+            upload_service = VideoUploadService(
+                aws_access_key_id=aws_access_key,
+                aws_secret_access_key=aws_secret_key,
+                bucket_name=UPLOAD_BUCKET,
+                region=UPLOAD_REGION
+            )
+            print(f"✓ Video upload service initialized (bucket: {UPLOAD_BUCKET})")
+        except Exception as e:
+            print(f"⚠ Failed to initialize upload service: {e}")
+    else:
+        print("⚠ Upload enabled but AWS credentials not found in environment")
 
 # Global state
 recording_processes = {}
@@ -143,6 +171,20 @@ def get_gopro_files(gopro_ip):
     except Exception as e:
         print(f"Error getting GoPro files: {e}")
     return files
+
+def get_gopro_camera_name(gopro_ip):
+    """Get the camera name from GoPro's API (ap_ssid field)"""
+    try:
+        response = requests.get(f'http://{gopro_ip}:8080/gopro/camera/info', timeout=5)
+        if response.status_code == 200:
+            info = response.json()
+            camera_name = info.get('info', {}).get('ap_ssid')
+            if camera_name:
+                print(f"✓ Got camera name from GoPro: {camera_name}")
+                return camera_name
+    except Exception as e:
+        print(f"⚠ Could not get camera name from {gopro_ip}: {e}")
+    return None
 
 def get_video_list():
     """Get list of all recorded videos"""
@@ -612,11 +654,11 @@ def stop_recording(gopro_id):
                 # Merge all chapters
                 if downloaded_files:
                     print(f"Merging {len(downloaded_files)} chapters into {video_path}...")
-                    
+
                     if merge_videos_ffmpeg(downloaded_files, video_path):
                         final_size_mb = os.path.getsize(video_path) / (1024 * 1024)
                         print(f"✓ Merged video saved: {video_path} ({final_size_mb:.1f} MB)")
-                        
+
                         # Cleanup chapter files
                         try:
                             for f in downloaded_files:
@@ -625,6 +667,39 @@ def stop_recording(gopro_id):
                             print(f"✓ Cleaned up {len(downloaded_files)} chapter files")
                         except Exception as e:
                             print(f"Warning: Cleanup error: {e}")
+
+                        # Upload to S3 if enabled
+                        if upload_service:
+                            try:
+                                print(f"Starting upload of {video_filename} to S3...")
+                                upload_date = datetime.now().strftime('%Y-%m-%d')
+
+                                # Get camera name from GoPro API, fallback to interface-based name
+                                camera_name = get_gopro_camera_name(gopro_ip)
+                                if not camera_name:
+                                    camera_name = f"GoPro-{gopro_id[-4:]}"
+                                    print(f"Using fallback camera name: {camera_name}")
+
+                                s3_uri = upload_service.upload_video(
+                                    video_path=video_path,
+                                    location=UPLOAD_LOCATION,
+                                    date=upload_date,
+                                    device_name=UPLOAD_DEVICE_NAME,
+                                    camera_name=camera_name,
+                                    compress=True,
+                                    delete_compressed_after_upload=True
+                                )
+                                print(f"✓ Video uploaded to: {s3_uri}")
+
+                                # Optionally delete local file after upload
+                                if DELETE_AFTER_UPLOAD:
+                                    try:
+                                        os.remove(video_path)
+                                        print(f"✓ Local file deleted after upload: {video_filename}")
+                                    except Exception as e:
+                                        print(f"⚠ Failed to delete local file: {e}")
+                            except Exception as e:
+                                print(f"✗ Upload failed: {e}")
                     else:
                         print(f"✗ Failed to merge chapters - keeping individual files in {session_dir}")
                 else:
