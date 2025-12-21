@@ -1135,6 +1135,153 @@ def delete_local_file_endpoint(filename):
     result = media_service.delete_local_file(filename)
     return jsonify(result), 200 if result['success'] else 500
 
+# ==================== Cloud/S3 Video Endpoints ====================
+
+@app.route('/api/cloud/videos', methods=['GET'])
+def list_cloud_videos():
+    """List all videos stored in S3 cloud storage"""
+    if not upload_service:
+        return jsonify({
+            'success': False,
+            'error': 'Cloud storage not configured'
+        }), 503
+
+    try:
+        location = request.args.get('location')
+        date = request.args.get('date')
+
+        videos = upload_service.list_videos_with_metadata(location=location, date=date)
+
+        total_size_mb = sum(v['size_mb'] for v in videos)
+
+        return jsonify({
+            'success': True,
+            'video_count': len(videos),
+            'total_size_mb': round(total_size_mb, 2),
+            'total_size_gb': round(total_size_mb / 1024, 2),
+            'videos': videos
+        })
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+@app.route('/api/cloud/videos/stream', methods=['GET'])
+def get_cloud_video_stream_url():
+    """Get a presigned URL for streaming a cloud video"""
+    if not upload_service:
+        return jsonify({
+            'success': False,
+            'error': 'Cloud storage not configured'
+        }), 503
+
+    try:
+        s3_key = request.args.get('key')
+        if not s3_key:
+            return jsonify({
+                'success': False,
+                'error': 'Missing required parameter: key'
+            }), 400
+
+        # Generate URL valid for 2 hours
+        url = upload_service.get_presigned_url(s3_key, expiration=7200)
+
+        return jsonify({
+            'success': True,
+            'stream_url': url,
+            'expires_in': 7200
+        })
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+@app.route('/api/cloud/videos', methods=['DELETE'])
+def delete_cloud_video():
+    """Delete a video from S3 cloud storage"""
+    if not upload_service:
+        return jsonify({
+            'success': False,
+            'error': 'Cloud storage not configured'
+        }), 503
+
+    try:
+        s3_key = request.args.get('key')
+        if not s3_key:
+            return jsonify({
+                'success': False,
+                'error': 'Missing required parameter: key'
+            }), 400
+
+        upload_service.delete_video(s3_key)
+
+        return jsonify({
+            'success': True,
+            'message': f'Video deleted: {s3_key}'
+        })
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+@app.route('/api/cloud/locations', methods=['GET'])
+def list_cloud_locations():
+    """List all unique locations in cloud storage"""
+    if not upload_service:
+        return jsonify({
+            'success': False,
+            'error': 'Cloud storage not configured'
+        }), 503
+
+    try:
+        locations = upload_service.get_unique_locations()
+
+        return jsonify({
+            'success': True,
+            'locations': locations
+        })
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+@app.route('/api/cloud/locations/<location>/dates', methods=['GET'])
+def list_cloud_dates(location):
+    """List all dates for a specific location in cloud storage"""
+    if not upload_service:
+        return jsonify({
+            'success': False,
+            'error': 'Cloud storage not configured'
+        }), 503
+
+    try:
+        dates = upload_service.get_dates_for_location(location)
+
+        return jsonify({
+            'success': True,
+            'location': location,
+            'dates': dates
+        })
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+@app.route('/api/cloud/status', methods=['GET'])
+def cloud_status():
+    """Check if cloud storage is configured and accessible"""
+    return jsonify({
+        'success': True,
+        'enabled': upload_service is not None,
+        'bucket': UPLOAD_BUCKET if upload_service else None,
+        'region': UPLOAD_REGION if upload_service else None
+    })
+
 if __name__ == '__main__':
     print("=" * 60)
     print("GoPro Controller API Service Starting...")

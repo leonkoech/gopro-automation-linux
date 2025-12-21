@@ -234,11 +234,11 @@ class VideoUploadService:
     def list_videos(self, location: Optional[str] = None, date: Optional[str] = None) -> list:
         """
         List videos in the bucket, optionally filtered by location and/or date.
-        
+
         Args:
             location: Filter by location (optional)
             date: Filter by date (optional)
-        
+
         Returns:
             List of S3 object keys
         """
@@ -247,20 +247,176 @@ class VideoUploadService:
             prefix = f"{location}/"
             if date:
                 prefix = f"{location}/{date}/"
-        
+
         try:
             response = self.s3_client.list_objects_v2(
                 Bucket=self.bucket_name,
                 Prefix=prefix
             )
-            
+
             if 'Contents' not in response:
                 return []
-            
+
             return [obj['Key'] for obj in response['Contents']]
-            
+
         except ClientError as e:
             logger.error(f"Error listing videos: {e}")
+            raise
+
+    def list_videos_with_metadata(self, location: Optional[str] = None, date: Optional[str] = None) -> list:
+        """
+        List videos in the bucket with full metadata.
+
+        Args:
+            location: Filter by location (optional)
+            date: Filter by date (optional)
+
+        Returns:
+            List of video objects with metadata
+        """
+        prefix = ""
+        if location:
+            prefix = f"{location}/"
+            if date:
+                prefix = f"{location}/{date}/"
+
+        try:
+            videos = []
+            paginator = self.s3_client.get_paginator('list_objects_v2')
+
+            for page in paginator.paginate(Bucket=self.bucket_name, Prefix=prefix):
+                if 'Contents' not in page:
+                    continue
+
+                for obj in page['Contents']:
+                    key = obj['Key']
+                    # Skip non-video files
+                    if not key.lower().endswith('.mp4'):
+                        continue
+
+                    # Parse the key to extract location, date, device, camera
+                    parts = key.split('/')
+                    if len(parts) >= 3:
+                        vid_location = parts[0]
+                        vid_date = parts[1]
+                        filename = parts[2]
+
+                        # Parse filename: "device_name - camera_name.mp4"
+                        name_part = filename.replace('.mp4', '')
+                        if ' - ' in name_part:
+                            device_name, camera_name = name_part.split(' - ', 1)
+                        else:
+                            device_name = name_part
+                            camera_name = 'Unknown'
+                    else:
+                        vid_location = 'Unknown'
+                        vid_date = 'Unknown'
+                        device_name = 'Unknown'
+                        camera_name = 'Unknown'
+                        filename = key.split('/')[-1]
+
+                    videos.append({
+                        'key': key,
+                        'filename': filename,
+                        'location': vid_location,
+                        'date': vid_date,
+                        'device_name': device_name,
+                        'camera_name': camera_name,
+                        'size_bytes': obj['Size'],
+                        'size_mb': round(obj['Size'] / (1024 * 1024), 2),
+                        'last_modified': obj['LastModified'].isoformat(),
+                        'etag': obj['ETag'].strip('"')
+                    })
+
+            # Sort by last modified, newest first
+            videos.sort(key=lambda x: x['last_modified'], reverse=True)
+            return videos
+
+        except ClientError as e:
+            logger.error(f"Error listing videos: {e}")
+            raise
+
+    def get_presigned_url(self, s3_key: str, expiration: int = 3600) -> str:
+        """
+        Generate a presigned URL for streaming/downloading a video.
+
+        Args:
+            s3_key: The S3 object key
+            expiration: URL expiration time in seconds (default 1 hour)
+
+        Returns:
+            Presigned URL string
+        """
+        try:
+            url = self.s3_client.generate_presigned_url(
+                'get_object',
+                Params={
+                    'Bucket': self.bucket_name,
+                    'Key': s3_key
+                },
+                ExpiresIn=expiration
+            )
+            return url
+        except ClientError as e:
+            logger.error(f"Error generating presigned URL: {e}")
+            raise
+
+    def delete_video(self, s3_key: str) -> bool:
+        """
+        Delete a video from S3.
+
+        Args:
+            s3_key: The S3 object key
+
+        Returns:
+            True if successful
+        """
+        try:
+            self.s3_client.delete_object(Bucket=self.bucket_name, Key=s3_key)
+            logger.info(f"Deleted video: s3://{self.bucket_name}/{s3_key}")
+            return True
+        except ClientError as e:
+            logger.error(f"Error deleting video: {e}")
+            raise
+
+    def get_unique_locations(self) -> list:
+        """Get list of unique locations in the bucket."""
+        try:
+            response = self.s3_client.list_objects_v2(
+                Bucket=self.bucket_name,
+                Delimiter='/'
+            )
+
+            locations = []
+            if 'CommonPrefixes' in response:
+                for prefix in response['CommonPrefixes']:
+                    location = prefix['Prefix'].rstrip('/')
+                    locations.append(location)
+
+            return sorted(locations)
+        except ClientError as e:
+            logger.error(f"Error listing locations: {e}")
+            raise
+
+    def get_dates_for_location(self, location: str) -> list:
+        """Get list of dates for a specific location."""
+        try:
+            response = self.s3_client.list_objects_v2(
+                Bucket=self.bucket_name,
+                Prefix=f"{location}/",
+                Delimiter='/'
+            )
+
+            dates = []
+            if 'CommonPrefixes' in response:
+                for prefix in response['CommonPrefixes']:
+                    # Extract date from "location/date/"
+                    date = prefix['Prefix'].split('/')[-2]
+                    dates.append(date)
+
+            return sorted(dates, reverse=True)
+        except ClientError as e:
+            logger.error(f"Error listing dates: {e}")
             raise
 
 
