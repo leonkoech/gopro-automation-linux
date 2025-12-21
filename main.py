@@ -610,7 +610,7 @@ def stop_recording(gopro_id):
                             new_chapters.append({
                                 'directory': dir_name,
                                 'filename': filename,
-                                'size': file_info.get('s', 0)
+                                'size': int(file_info.get('s', 0))
                             })
 
                 # Sort by filename to maintain correct chapter order
