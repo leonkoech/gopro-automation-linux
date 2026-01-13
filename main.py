@@ -156,6 +156,22 @@ def get_gopro_wired_ip(gopro_id):
     
     return None
 
+def enable_usb_control(gopro_ip):
+    """Enable USB control mode on the GoPro - required before sending commands"""
+    try:
+        response = requests.get(
+            f'http://{gopro_ip}:8080/gopro/camera/control/wired_usb?p=1',
+            timeout=5
+        )
+        if response.status_code == 200:
+            print(f"✓ USB control enabled on {gopro_ip}")
+            return True
+        else:
+            print(f"⚠ USB control response: {response.status_code}")
+    except Exception as e:
+        print(f"⚠ Failed to enable USB control: {e}")
+    return False
+
 def get_gopro_files(gopro_ip):
     """Get set of all current files on GoPro"""
     files = set()
@@ -340,17 +356,22 @@ def start_recording(gopro_id):
         return jsonify({'success': False, 'error': f'Could not find GoPro IP for {gopro_id}'}), 500
 
     try:
-        # Set camera to Video mode (preset group 1000 = Video)
+        # Enable USB control first - required for wired control
+        print(f"Enabling USB control on {gopro_id} ({gopro_ip})...")
+        enable_usb_control(gopro_ip)
+        time.sleep(0.5)
+
+        # Set camera to Video mode
         print(f"Setting {gopro_id} ({gopro_ip}) to Video mode...")
         try:
             response = requests.get(
-                f'http://{gopro_ip}:8080/gopro/camera/presets/set_group?id=1000',
+                f'http://{gopro_ip}:8080/gopro/camera/presets/load?id=0',
                 timeout=5
             )
             if response.status_code == 200:
-                print(f"✓ Set {gopro_id} to Video preset group")
+                print(f"✓ Set {gopro_id} to Video preset")
             else:
-                print(f"⚠ Failed to set preset group: {response.status_code}")
+                print(f"⚠ Failed to set preset: {response.status_code}")
             time.sleep(0.5)
         except Exception as e:
             print(f"⚠ Warning: Could not set video mode for {gopro_id}: {e}")
@@ -373,6 +394,34 @@ def start_recording(gopro_id):
                 'success': False,
                 'error': f'Failed to start recording: {error_text}'
             }), 500
+
+        # Check if response contains an error
+        try:
+            resp_json = response.json()
+            if 'error' in resp_json:
+                print(f"✗ GoPro returned error: {resp_json}")
+                return jsonify({
+                    'success': False,
+                    'error': f'GoPro error: {resp_json.get("error", "Unknown error")}'
+                }), 500
+        except:
+            pass  # Response might not be JSON
+
+        # Wait a moment and verify recording actually started
+        time.sleep(1)
+        try:
+            state_response = requests.get(f'http://{gopro_ip}:8080/gopro/camera/state', timeout=5)
+            if state_response.status_code == 200:
+                state = state_response.json()
+                # Status 8 = busy/encoding, Status 10 = recording
+                is_recording = state.get('status', {}).get('8', 0) == 1 or state.get('status', {}).get('10', 0) == 1
+                if not is_recording:
+                    print(f"⚠ Recording may not have started - camera not in recording state")
+                    # Don't fail - the shutter command succeeded, camera might just be slow
+                else:
+                    print(f"✓ Confirmed recording active on {gopro_id}")
+        except Exception as e:
+            print(f"⚠ Could not verify recording state: {e}")
 
         print(f"✓ Recording started on {gopro_id}")
 
