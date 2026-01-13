@@ -37,7 +37,7 @@ class VideoUploadService:
         self,
         aws_access_key_id: str,
         aws_secret_access_key: str,
-        bucket_name: str = "jetson-videos",
+        bucket_name: str = "jetson-videos-uai",
         region: str = "us-east-1"
     ):
         """
