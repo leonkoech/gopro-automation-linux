@@ -17,6 +17,11 @@ import requests
 import re
 from videoupload import VideoUploadService
 from media_service import get_media_service
+from logging_service import get_logging_service, get_logger
+
+# Initialize logging service first
+logging_service = get_logging_service()
+logger = get_logger('gopro.main')
 
 app = Flask(__name__)
 CORS(app)
@@ -192,13 +197,23 @@ def get_gopro_camera_name(gopro_ip):
         response = requests.get(f'http://{gopro_ip}:8080/gopro/camera/info', timeout=5)
         if response.status_code == 200:
             info = response.json()
-            camera_name = info.get('info', {}).get('ap_ssid')
+            # ap_ssid can be at top level or nested under 'info'
+            camera_name = info.get('ap_ssid') or info.get('info', {}).get('ap_ssid')
             if camera_name:
                 print(f"✓ Got camera name from GoPro: {camera_name}")
                 return camera_name
     except Exception as e:
         print(f"⚠ Could not get camera name from {gopro_ip}: {e}")
     return None
+
+
+def sanitize_filename(name):
+    """Sanitize a string for use in a filename"""
+    # Replace characters that are invalid in filenames
+    invalid_chars = '<>:"/\\|?*'
+    for char in invalid_chars:
+        name = name.replace(char, '_')
+    return name.strip()
 
 def get_video_list():
     """Get list of all recorded videos"""
@@ -425,25 +440,32 @@ def start_recording(gopro_id):
 
         print(f"✓ Recording started on {gopro_id}")
 
-        # Prepare session info
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        video_filename = f'gopro_{gopro["name"]}_{timestamp}.mp4'
-        video_path = os.path.join(VIDEO_STORAGE_DIR, video_filename)
+        # Get camera name (ap_ssid) from GoPro for the filename
+        camera_name = get_gopro_camera_name(gopro_ip)
+        if not camera_name:
+            camera_name = f"GoPro-{gopro_id[-4:]}"
+            print(f"Using fallback camera name: {camera_name}")
+
+        # Prepare session info - store start datetime for filename generation at stop time
+        start_datetime = datetime.now()
+        timestamp = start_datetime.strftime('%Y%m%d_%H%M%S')
         session_id = f"{gopro_id}_{timestamp}"
         session_dir = os.path.join(SEGMENTS_DIR, session_id)
         os.makedirs(session_dir, exist_ok=True)
 
-        # Store recording state
+        # Store recording state (video_path and video_filename will be generated at stop time)
         with recording_lock:
             recording_processes[gopro_id] = {
-                'start_time': datetime.now().isoformat(),
+                'start_time': start_datetime.isoformat(),
+                'start_datetime': start_datetime,
                 'gopro_ip': gopro_ip,
                 'gopro_name': gopro['name'],
+                'camera_name': camera_name,
                 'pre_record_files': pre_record_files,
                 'recording_started': True,
                 'is_stopping': False,
-                'video_path': video_path,
-                'video_filename': video_filename,
+                'video_path': None,  # Will be set at stop time
+                'video_filename': None,  # Will be set at stop time
                 'session_id': session_id,
                 'session_dir': session_dir,
                 'error': None,
@@ -456,7 +478,7 @@ def start_recording(gopro_id):
             'message': 'Recording started',
             'gopro_id': gopro_id,
             'gopro_ip': gopro_ip,
-            'video_filename': video_filename,
+            'camera_name': camera_name,
             'session_id': session_id
         })
 
@@ -491,11 +513,26 @@ def stop_recording(gopro_id):
         recording_info = recording_processes[gopro_id].copy()
 
     try:
-        video_path = recording_info['video_path']
-        video_filename = recording_info['video_filename']
         session_dir = recording_info.get('session_dir')
         gopro_ip = recording_info.get('gopro_ip')
         pre_record_files = recording_info.get('pre_record_files', set())
+        camera_name = recording_info.get('camera_name', f'GoPro-{gopro_id[-4:]}')
+        start_datetime = recording_info.get('start_datetime', datetime.now())
+
+        # Generate filename with format: YYYYMMDD HHMMSS - HHMMSS camera_name.mp4
+        stop_datetime = datetime.now()
+        date_str = start_datetime.strftime('%Y%m%d')
+        start_time_str = start_datetime.strftime('%H%M%S')
+        stop_time_str = stop_datetime.strftime('%H%M%S')
+        safe_camera_name = sanitize_filename(camera_name)
+        video_filename = f'{date_str} {start_time_str} - {stop_time_str} {safe_camera_name}.mp4'
+        video_path = os.path.join(VIDEO_STORAGE_DIR, video_filename)
+
+        # Update recording info with the generated filename
+        with recording_lock:
+            if gopro_id in recording_processes:
+                recording_processes[gopro_id]['video_path'] = video_path
+                recording_processes[gopro_id]['video_filename'] = video_filename
 
         if not gopro_ip:
             gopro_ip = get_gopro_wired_ip(gopro_id)
@@ -531,33 +568,70 @@ def stop_recording(gopro_id):
                 with recording_lock:
                     if gopro_id in recording_processes:
                         recording_processes[gopro_id]['stage'] = 'downloading'
-                        recording_processes[gopro_id]['stage_message'] = 'Downloading video from GoPro...'
+                        recording_processes[gopro_id]['stage_message'] = 'Waiting for GoPro to finalize files...'
 
-                time.sleep(3)  # Wait for camera to finalize files
+                # Wait for camera to finalize all chapter files
+                # GoPro needs more time after long recordings to write all chapters
+                logger.info(f"[{gopro_id}] Waiting for GoPro to finalize files...")
+                time.sleep(5)  # Initial wait
 
-                print(f"Getting media list from {gopro_ip}...")
-                media_response = requests.get(
-                    f'http://{gopro_ip}:8080/gopro/media/list',
-                    timeout=15
-                )
-                media_list = media_response.json()
-
-                # === FIX 4: Find ALL new files (not just the last one) ===
+                # Retry loop to ensure all chapters are available
+                # GoPro may take time to register all chapters after stopping
                 new_chapters = []
-                for directory in media_list.get('media', []):
-                    dir_name = directory['d']
-                    for file_info in directory.get('fs', []):
-                        filename = file_info['n']
-                        if filename not in pre_record_files and filename.lower().endswith('.mp4'):
-                            new_chapters.append({
-                                'directory': dir_name,
-                                'filename': filename,
-                                'size': int(file_info.get('s', 0))
-                            })
+                last_chapter_count = 0
+                stable_count = 0
+                max_retries = 10
 
-                # Sort by filename to maintain correct chapter order
-                # GoPro names: GX010028.MP4, GX020028.MP4, GX030028.MP4 for same recording
-                new_chapters.sort(key=lambda x: x['filename'])
+                for attempt in range(max_retries):
+                    logger.info(f"[{gopro_id}] Getting media list from {gopro_ip} (attempt {attempt + 1}/{max_retries})...")
+                    media_response = requests.get(
+                        f'http://{gopro_ip}:8080/gopro/media/list',
+                        timeout=15
+                    )
+                    media_list = media_response.json()
+
+                    # Find ALL new files
+                    new_chapters = []
+                    for directory in media_list.get('media', []):
+                        dir_name = directory['d']
+                        for file_info in directory.get('fs', []):
+                            filename = file_info['n']
+                            if filename not in pre_record_files and filename.lower().endswith('.mp4'):
+                                new_chapters.append({
+                                    'directory': dir_name,
+                                    'filename': filename,
+                                    'size': int(file_info.get('s', 0))
+                                })
+
+                    logger.info(f"[{gopro_id}] Found {len(new_chapters)} new chapters")
+
+                    # Check if chapter count has stabilized
+                    if len(new_chapters) == last_chapter_count and len(new_chapters) > 0:
+                        stable_count += 1
+                        if stable_count >= 2:
+                            logger.info(f"[{gopro_id}] Chapter count stable at {len(new_chapters)}")
+                            break
+                    else:
+                        stable_count = 0
+                        last_chapter_count = len(new_chapters)
+
+                    # Wait before next check
+                    if attempt < max_retries - 1:
+                        time.sleep(2)
+
+                # Sort chapters properly for GoPro naming convention
+                # GoPro naming: GXzzxxxx.MP4 where zz=chapter, xxxx=video number
+                # e.g., GX010028, GX020028, GX030028 are chapters 1,2,3 of video 0028
+                # We need to sort by video number first, then chapter number
+                def gopro_sort_key(chapter):
+                    filename = chapter['filename'].upper()
+                    if len(filename) >= 8 and filename.startswith('G'):
+                        chapter_num = filename[2:4]  # e.g., "01"
+                        video_num = filename[4:8]    # e.g., "0028"
+                        return (video_num, chapter_num)
+                    return (filename, "00")
+
+                new_chapters.sort(key=gopro_sort_key)
 
                 # Safety check: if we found too many "new" files, something is wrong
                 # (likely pre_record_files wasn't captured properly)
@@ -566,21 +640,21 @@ def stop_recording(gopro_id):
                 total_size_gb = total_size_bytes / (1024**3)
 
                 if len(new_chapters) > MAX_CHAPTERS:
-                    print(f"⚠ WARNING: Found {len(new_chapters)} new chapters ({total_size_gb:.1f} GB) - this seems too many!")
-                    print(f"  Pre-record files count: {len(pre_record_files)}")
-                    print(f"  Limiting to last {MAX_CHAPTERS} chapters to avoid downloading entire SD card")
+                    logger.warning(f"[{gopro_id}] Found {len(new_chapters)} new chapters ({total_size_gb:.1f} GB) - this seems too many!")
+                    logger.warning(f"[{gopro_id}] Pre-record files count: {len(pre_record_files)}")
+                    logger.warning(f"[{gopro_id}] Limiting to last {MAX_CHAPTERS} chapters to avoid downloading entire SD card")
                     new_chapters = new_chapters[-MAX_CHAPTERS:]
                     total_size_bytes = sum(ch['size'] for ch in new_chapters)
                     total_size_gb = total_size_bytes / (1024**3)
 
-                print(f"Total download size: {total_size_gb:.2f} GB")
-                
-                print(f"Found {len(new_chapters)} new chapters to download")
+                logger.info(f"[{gopro_id}] Total download size: {total_size_gb:.2f} GB")
+
+                logger.info(f"[{gopro_id}] Found {len(new_chapters)} new chapters to download")
                 for ch in new_chapters:
-                    print(f"  - {ch['filename']} ({ch['size']} bytes)")
+                    logger.info(f"[{gopro_id}]   - {ch['filename']} ({ch['size']} bytes)")
 
                 if not new_chapters:
-                    print(f"No new chapters found for {gopro_id}")
+                    logger.warning(f"[{gopro_id}] No new chapters found")
                     with recording_lock:
                         if gopro_id in recording_processes:
                             del recording_processes[gopro_id]
@@ -594,31 +668,31 @@ def stop_recording(gopro_id):
                     chapter_path = os.path.join(session_dir, f'chapter_{i+1:03d}_{chapter["filename"]}')
                     download_url = f'http://{gopro_ip}:8080/videos/DCIM/{chapter["directory"]}/{chapter["filename"]}'
                     
-                    print(f"Downloading chapter {i+1}/{total_chapters}: {chapter['filename']}")
-                    
+                    logger.info(f"[{gopro_id}] Downloading chapter {i+1}/{total_chapters}: {chapter['filename']}")
+
                     try:
                         response = requests.get(download_url, stream=True, timeout=600)
                         total_size = int(response.headers.get('content-length', 0))
                         downloaded = 0
-                        
+
                         with open(chapter_path, 'wb') as f:
                             for chunk in response.iter_content(chunk_size=65536):
                                 if chunk:
                                     f.write(chunk)
                                     downloaded += len(chunk)
-                                    
+
                         downloaded_files.append(chapter_path)
                         file_size_mb = os.path.getsize(chapter_path) / (1024 * 1024)
-                        print(f"✓ Downloaded chapter {i+1}: {file_size_mb:.1f} MB")
-                        
+                        logger.info(f"[{gopro_id}] Downloaded chapter {i+1}: {file_size_mb:.1f} MB")
+
                         # Update progress
                         with recording_lock:
                             if gopro_id in recording_processes:
                                 progress = int(((i + 1) / total_chapters) * 100)
                                 recording_processes[gopro_id]['download_progress'] = progress
-                                
+
                     except Exception as e:
-                        print(f"✗ Error downloading chapter {chapter['filename']}: {e}")
+                        logger.error(f"[{gopro_id}] Error downloading chapter {chapter['filename']}: {e}")
 
                 # Merge all chapters
                 if downloaded_files:
@@ -628,20 +702,20 @@ def stop_recording(gopro_id):
                             recording_processes[gopro_id]['stage'] = 'merging'
                             recording_processes[gopro_id]['stage_message'] = 'Merging video chapters...'
 
-                    print(f"Merging {len(downloaded_files)} chapters into {video_path}...")
+                    logger.info(f"[{gopro_id}] Merging {len(downloaded_files)} chapters into {video_path}...")
 
                     if merge_videos_ffmpeg(downloaded_files, video_path):
                         final_size_mb = os.path.getsize(video_path) / (1024 * 1024)
-                        print(f"✓ Merged video saved: {video_path} ({final_size_mb:.1f} MB)")
+                        logger.info(f"[{gopro_id}] Merged video saved: {video_path} ({final_size_mb:.1f} MB)")
 
                         # Cleanup chapter files
                         try:
                             for f in downloaded_files:
                                 os.remove(f)
                             os.rmdir(session_dir)
-                            print(f"✓ Cleaned up {len(downloaded_files)} chapter files")
+                            logger.info(f"[{gopro_id}] Cleaned up {len(downloaded_files)} chapter files")
                         except Exception as e:
-                            print(f"Warning: Cleanup error: {e}")
+                            logger.warning(f"[{gopro_id}] Cleanup error: {e}")
 
                         # Upload to S3 if enabled
                         if upload_service:
@@ -652,14 +726,14 @@ def stop_recording(gopro_id):
                                     recording_processes[gopro_id]['stage_message'] = 'Uploading to cloud...'
 
                             try:
-                                print(f"Starting upload of {video_filename} to S3...")
+                                logger.info(f"[{gopro_id}] Starting upload of {video_filename} to S3...")
                                 upload_date = datetime.now().strftime('%Y-%m-%d')
 
                                 # Get camera name from GoPro API, fallback to interface-based name
                                 camera_name = get_gopro_camera_name(gopro_ip)
                                 if not camera_name:
                                     camera_name = f"GoPro-{gopro_id[-4:]}"
-                                    print(f"Using fallback camera name: {camera_name}")
+                                    logger.info(f"[{gopro_id}] Using fallback camera name: {camera_name}")
 
                                 s3_uri = upload_service.upload_video(
                                     video_path=video_path,
@@ -670,7 +744,7 @@ def stop_recording(gopro_id):
                                     compress=True,
                                     delete_compressed_after_upload=True
                                 )
-                                print(f"✓ Video uploaded to: {s3_uri}")
+                                logger.info(f"[{gopro_id}] Video uploaded to: {s3_uri}")
 
                                 # Update stage: done
                                 with recording_lock:
@@ -682,11 +756,11 @@ def stop_recording(gopro_id):
                                 if DELETE_AFTER_UPLOAD:
                                     try:
                                         os.remove(video_path)
-                                        print(f"✓ Local file deleted after upload: {video_filename}")
+                                        logger.info(f"[{gopro_id}] Local file deleted after upload: {video_filename}")
                                     except Exception as e:
-                                        print(f"⚠ Failed to delete local file: {e}")
+                                        logger.warning(f"[{gopro_id}] Failed to delete local file: {e}")
                             except Exception as e:
-                                print(f"✗ Upload failed: {e}")
+                                logger.error(f"[{gopro_id}] Upload failed: {e}")
                                 with recording_lock:
                                     if gopro_id in recording_processes:
                                         recording_processes[gopro_id]['stage'] = 'done'
@@ -698,9 +772,9 @@ def stop_recording(gopro_id):
                                     recording_processes[gopro_id]['stage'] = 'done'
                                     recording_processes[gopro_id]['stage_message'] = 'Done!'
                     else:
-                        print(f"✗ Failed to merge chapters - keeping individual files in {session_dir}")
+                        logger.error(f"[{gopro_id}] Failed to merge chapters - keeping individual files in {session_dir}")
                 else:
-                    print(f"No chapters downloaded for {gopro_id}")
+                    logger.warning(f"[{gopro_id}] No chapters downloaded")
 
                 with recording_lock:
                     if gopro_id in recording_processes:
@@ -1224,14 +1298,90 @@ def cloud_status():
         'region': UPLOAD_REGION if upload_service else None
     })
 
+
+# ============================================================================
+# Log Streaming API Endpoints
+# ============================================================================
+
+@app.route('/api/logs/stream', methods=['GET'])
+def stream_logs():
+    """Stream live logs via Server-Sent Events (SSE)"""
+    def generate():
+        yield "data: {\"type\": \"connected\", \"message\": \"Log stream connected\"}\n\n"
+        for log_entry in logging_service.stream_logs():
+            yield log_entry
+
+    return Response(
+        generate(),
+        mimetype='text/event-stream',
+        headers={
+            'Cache-Control': 'no-cache',
+            'Connection': 'keep-alive',
+            'X-Accel-Buffering': 'no'
+        }
+    )
+
+
+@app.route('/api/logs/recent', methods=['GET'])
+def get_recent_logs():
+    """Get recent log entries from memory buffer"""
+    count = request.args.get('count', 100, type=int)
+    count = min(count, 1000)  # Limit to 1000
+    logs = logging_service.get_recent_logs(count)
+    return jsonify({
+        'success': True,
+        'count': len(logs),
+        'logs': logs
+    })
+
+
+@app.route('/api/logs/files', methods=['GET'])
+def get_log_files():
+    """Get list of available log files"""
+    files = logging_service.get_log_files()
+    return jsonify({
+        'success': True,
+        'log_dir': logging_service.log_dir,
+        'files': files
+    })
+
+
+@app.route('/api/logs/files/<filename>', methods=['GET'])
+def read_log_file(filename):
+    """Read contents of a specific log file"""
+    lines = request.args.get('lines', 500, type=int)
+    offset = request.args.get('offset', 0, type=int)
+    result = logging_service.read_log_file(filename, lines=lines, offset=offset)
+    return jsonify(result), 200 if result.get('success') else 404
+
+
+@app.route('/api/logs/search', methods=['GET'])
+def search_logs():
+    """Search logs for a query string"""
+    query = request.args.get('q', '')
+    filename = request.args.get('file')
+
+    if not query:
+        return jsonify({'success': False, 'error': 'Query parameter "q" is required'}), 400
+
+    results = logging_service.search_logs(query, filename)
+    return jsonify({
+        'success': True,
+        'query': query,
+        'count': len(results),
+        'results': results
+    })
+
+
 if __name__ == '__main__':
-    print("=" * 60)
-    print("GoPro Controller API Service Starting...")
-    print("=" * 60)
-    print(f"📁 Video storage: {VIDEO_STORAGE_DIR}")
-    print(f"📂 Segments storage: {SEGMENTS_DIR}")
-    print(f"🌐 API endpoint: http://0.0.0.0:5000")
-    print(f"💡 Make sure GoPros are connected via USB")
-    print("=" * 60)
+    logger.info("=" * 60)
+    logger.info("GoPro Controller API Service Starting...")
+    logger.info("=" * 60)
+    logger.info(f"Video storage: {VIDEO_STORAGE_DIR}")
+    logger.info(f"Segments storage: {SEGMENTS_DIR}")
+    logger.info(f"Log directory: {logging_service.log_dir}")
+    logger.info(f"API endpoint: http://0.0.0.0:5000")
+    logger.info("Make sure GoPros are connected via USB")
+    logger.info("=" * 60)
 
     app.run(host='0.0.0.0', port=5000, debug=False, threaded=True)
