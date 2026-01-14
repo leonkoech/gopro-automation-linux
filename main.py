@@ -1151,6 +1151,113 @@ def delete_local_file_endpoint(filename):
     result = media_service.delete_local_file(filename)
     return jsonify(result), 200 if result['success'] else 500
 
+# ==================== Segments Endpoints ====================
+
+@app.route('/api/media/segments', methods=['GET'])
+def get_segments_list():
+    """Get list of all segment sessions on Jetson"""
+    result = media_service.get_segments_list()
+    return jsonify(result), 200 if result['success'] else 500
+
+@app.route('/api/media/segments/<session_name>', methods=['GET'])
+def get_segment_session_files(session_name):
+    """Get list of files in a specific segment session"""
+    result = media_service.get_segment_session_files(session_name)
+    return jsonify(result), 200 if result['success'] else 500
+
+@app.route('/api/media/segments/<session_name>', methods=['DELETE'])
+def delete_segment_session_endpoint(session_name):
+    """Delete an entire segment session"""
+    result = media_service.delete_segment_session(session_name)
+    return jsonify(result), 200 if result['success'] else 500
+
+@app.route('/api/media/segments/<session_name>/<filename>', methods=['DELETE'])
+def delete_segment_file_endpoint(session_name, filename):
+    """Delete a specific file from a segment session"""
+    result = media_service.delete_segment_file(session_name, filename)
+    return jsonify(result), 200 if result['success'] else 500
+
+@app.route('/api/media/segments/<session_name>/<filename>/download', methods=['GET'])
+def download_segment_file(session_name, filename):
+    """Download a specific segment file"""
+    try:
+        file_path = media_service.get_segment_file_path(session_name, filename)
+
+        if not file_path:
+            return jsonify({
+                'success': False,
+                'error': 'Segment file not found'
+            }), 404
+
+        return send_file(
+            file_path,
+            as_attachment=True,
+            download_name=filename
+        )
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+@app.route('/api/media/segments/<session_name>/<filename>/stream', methods=['GET'])
+def stream_segment_file(session_name, filename):
+    """Stream a segment video file with range request support"""
+    try:
+        file_path = media_service.get_segment_file_path(session_name, filename)
+
+        if not file_path:
+            return jsonify({
+                'success': False,
+                'error': 'Segment file not found'
+            }), 404
+
+        file_size = os.path.getsize(file_path)
+        range_header = request.headers.get('Range')
+
+        if range_header:
+            byte_start = 0
+            byte_end = file_size - 1
+
+            range_match = range_header.replace('bytes=', '').split('-')
+            if range_match[0]:
+                byte_start = int(range_match[0])
+            if range_match[1]:
+                byte_end = int(range_match[1])
+
+            length = byte_end - byte_start + 1
+
+            def generate():
+                with open(file_path, 'rb') as f:
+                    f.seek(byte_start)
+                    remaining = length
+                    while remaining > 0:
+                        chunk_size = min(8192, remaining)
+                        data = f.read(chunk_size)
+                        if not data:
+                            break
+                        remaining -= len(data)
+                        yield data
+
+            response = Response(
+                generate(),
+                status=206,
+                mimetype='video/mp4',
+                direct_passthrough=True
+            )
+            response.headers['Content-Range'] = f'bytes {byte_start}-{byte_end}/{file_size}'
+            response.headers['Accept-Ranges'] = 'bytes'
+            response.headers['Content-Length'] = length
+            return response
+
+        return send_file(file_path, mimetype='video/mp4')
+
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
 # ==================== Cloud/S3 Video Endpoints ====================
 
 @app.route('/api/cloud/videos', methods=['GET'])
