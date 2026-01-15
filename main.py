@@ -11,6 +11,7 @@ import threading
 import os
 import time
 import json
+import tempfile
 from datetime import datetime, timedelta
 from pathlib import Path
 import requests
@@ -1257,6 +1258,361 @@ def stream_segment_file(session_name, filename):
             'success': False,
             'error': str(e)
         }), 500
+
+# ==================== Segment Upload Endpoints ====================
+
+# Track ongoing segment uploads
+segment_upload_status = {}
+segment_upload_lock = threading.Lock()
+
+@app.route('/api/media/segments/upload', methods=['POST'])
+def upload_segments_to_cloud():
+    """
+    Upload segment sessions to S3 cloud storage.
+
+    Request body:
+    {
+        "sessions": ["session_name1", "session_name2"],  // optional, if empty uploads all non-empty sessions
+        "camera_name_map": {  // optional mapping of interface IDs to camera names
+            "enxd43260ef4d38": "GoPro Front",
+            "enxd43260dc857e": "GoPro Back"
+        },
+        "delete_after_upload": false  // optional, delete segments after successful upload
+    }
+    """
+    if not upload_service:
+        return jsonify({
+            'success': False,
+            'error': 'Cloud storage not configured. Check AWS credentials.'
+        }), 503
+
+    try:
+        data = request.get_json() or {}
+        requested_sessions = data.get('sessions', [])
+        camera_name_map = data.get('camera_name_map', {})
+        delete_after_upload = data.get('delete_after_upload', False)
+
+        # Get all segments
+        segments_result = media_service.get_segments_list()
+        if not segments_result.get('success'):
+            return jsonify({
+                'success': False,
+                'error': segments_result.get('error', 'Failed to get segments')
+            }), 500
+
+        all_sessions = segments_result.get('sessions', [])
+
+        # Filter sessions - only those with files
+        sessions_to_upload = []
+        for session in all_sessions:
+            if session['file_count'] == 0:
+                continue
+            if requested_sessions and session['session_name'] not in requested_sessions:
+                continue
+            sessions_to_upload.append(session)
+
+        if not sessions_to_upload:
+            return jsonify({
+                'success': True,
+                'message': 'No sessions with files to upload',
+                'uploaded': 0
+            })
+
+        # Generate upload ID
+        upload_id = f"upload_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+
+        # Start upload in background thread
+        def upload_sessions_background():
+            results = []
+            total_sessions = len(sessions_to_upload)
+
+            with segment_upload_lock:
+                segment_upload_status[upload_id] = {
+                    'status': 'in_progress',
+                    'total': total_sessions,
+                    'completed': 0,
+                    'current_session': None,
+                    'results': [],
+                    'errors': []
+                }
+
+            for idx, session in enumerate(sessions_to_upload):
+                session_name = session['session_name']
+
+                with segment_upload_lock:
+                    segment_upload_status[upload_id]['current_session'] = session_name
+                    segment_upload_status[upload_id]['current_index'] = idx + 1
+
+                try:
+                    result = upload_single_segment_session(
+                        session,
+                        camera_name_map,
+                        delete_after_upload
+                    )
+                    results.append(result)
+
+                    with segment_upload_lock:
+                        segment_upload_status[upload_id]['completed'] = idx + 1
+                        segment_upload_status[upload_id]['results'].append(result)
+
+                except Exception as e:
+                    error_result = {
+                        'session_name': session_name,
+                        'success': False,
+                        'error': str(e)
+                    }
+                    results.append(error_result)
+
+                    with segment_upload_lock:
+                        segment_upload_status[upload_id]['completed'] = idx + 1
+                        segment_upload_status[upload_id]['errors'].append(error_result)
+
+            with segment_upload_lock:
+                segment_upload_status[upload_id]['status'] = 'completed'
+                segment_upload_status[upload_id]['current_session'] = None
+
+        # Start background thread
+        upload_thread = threading.Thread(target=upload_sessions_background)
+        upload_thread.daemon = True
+        upload_thread.start()
+
+        return jsonify({
+            'success': True,
+            'message': f'Started uploading {len(sessions_to_upload)} sessions',
+            'upload_id': upload_id,
+            'sessions_queued': [s['session_name'] for s in sessions_to_upload]
+        })
+
+    except Exception as e:
+        logger.error(f"Error starting segment upload: {e}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+
+def upload_single_segment_session(session: dict, camera_name_map: dict, delete_after_upload: bool) -> dict:
+    """
+    Upload a single segment session to S3.
+    Merges chapter files and uploads with proper naming.
+    """
+    import shutil
+
+    session_name = session['session_name']
+    session_path = session['path']
+    files = session['files']
+
+    logger.info(f"[SegmentUpload] Processing session: {session_name}")
+
+    # Parse session name: format is interfaceId_YYYYMMDD_HHMMSS
+    parts = session_name.split('_')
+    if len(parts) < 3:
+        return {
+            'session_name': session_name,
+            'success': False,
+            'error': f'Invalid session name format: {session_name}'
+        }
+
+    interface_id = '_'.join(parts[:-2])  # Everything except last 2 parts
+    date_str = parts[-2]  # YYYYMMDD
+    time_str = parts[-1]  # HHMMSS
+
+    # Format date for S3: YYYY-MM-DD
+    upload_date = f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:8]}"
+
+    # Determine camera name
+    camera_name = camera_name_map.get(interface_id)
+    if not camera_name:
+        # Fallback: use last 4 chars of interface ID
+        camera_name = f"GoPro-{interface_id[-4:]}"
+
+    logger.info(f"[SegmentUpload] Camera: {camera_name}, Date: {upload_date}")
+
+    # Get only video files, sorted by name (chapters in order)
+    video_files = sorted([f for f in files if f['is_video']], key=lambda x: x['filename'])
+
+    if not video_files:
+        return {
+            'session_name': session_name,
+            'success': False,
+            'error': 'No video files in session'
+        }
+
+    # Create temp directory for processing
+    temp_dir = tempfile.mkdtemp(prefix='segment_upload_')
+
+    try:
+        if len(video_files) == 1:
+            # Single file - no merge needed
+            input_path = os.path.join(session_path, video_files[0]['filename'])
+            logger.info(f"[SegmentUpload] Single file, no merge needed: {video_files[0]['filename']}")
+        else:
+            # Multiple files - need to merge
+            logger.info(f"[SegmentUpload] Merging {len(video_files)} chapter files...")
+
+            # Create concat file for ffmpeg
+            concat_file = os.path.join(temp_dir, 'concat.txt')
+            with open(concat_file, 'w') as f:
+                for vf in video_files:
+                    file_path = os.path.join(session_path, vf['filename'])
+                    # Escape special characters in path
+                    escaped_path = file_path.replace("'", "'\\''")
+                    f.write(f"file '{escaped_path}'\n")
+
+            # Merge using ffmpeg concat demuxer (fast, no re-encoding)
+            merged_path = os.path.join(temp_dir, 'merged.mp4')
+            merge_cmd = [
+                'ffmpeg',
+                '-f', 'concat',
+                '-safe', '0',
+                '-i', concat_file,
+                '-c', 'copy',  # Copy streams without re-encoding
+                '-y',
+                merged_path
+            ]
+
+            logger.info(f"[SegmentUpload] Running ffmpeg merge...")
+            result = subprocess.run(merge_cmd, capture_output=True, text=True)
+
+            if result.returncode != 0:
+                logger.error(f"[SegmentUpload] FFmpeg merge error: {result.stderr}")
+                return {
+                    'session_name': session_name,
+                    'success': False,
+                    'error': f'FFmpeg merge failed: {result.stderr[:200]}'
+                }
+
+            input_path = merged_path
+            logger.info(f"[SegmentUpload] Merge complete")
+
+        # Upload to S3
+        logger.info(f"[SegmentUpload] Uploading to S3...")
+        s3_uri = upload_service.upload_video(
+            video_path=input_path,
+            location=UPLOAD_LOCATION,
+            date=upload_date,
+            device_name=UPLOAD_DEVICE_NAME,
+            camera_name=camera_name,
+            compress=True,  # Compress to 1080p
+            delete_compressed_after_upload=True
+        )
+
+        logger.info(f"[SegmentUpload] Upload complete: {s3_uri}")
+
+        # Delete segments if requested
+        if delete_after_upload:
+            logger.info(f"[SegmentUpload] Deleting session after upload...")
+            media_service.delete_segment_session(session_name)
+
+        return {
+            'session_name': session_name,
+            'success': True,
+            's3_uri': s3_uri,
+            'camera_name': camera_name,
+            'date': upload_date,
+            'files_merged': len(video_files)
+        }
+
+    except Exception as e:
+        logger.error(f"[SegmentUpload] Error processing {session_name}: {e}")
+        return {
+            'session_name': session_name,
+            'success': False,
+            'error': str(e)
+        }
+    finally:
+        # Clean up temp directory
+        try:
+            shutil.rmtree(temp_dir)
+        except:
+            pass
+
+
+@app.route('/api/media/segments/upload/<upload_id>/status', methods=['GET'])
+def get_segment_upload_status(upload_id):
+    """Get the status of a segment upload job"""
+    with segment_upload_lock:
+        if upload_id not in segment_upload_status:
+            return jsonify({
+                'success': False,
+                'error': 'Upload job not found'
+            }), 404
+
+        status = segment_upload_status[upload_id].copy()
+
+    return jsonify({
+        'success': True,
+        'upload_id': upload_id,
+        **status
+    })
+
+
+@app.route('/api/media/segments/upload/jobs', methods=['GET'])
+def list_segment_upload_jobs():
+    """List all segment upload jobs"""
+    with segment_upload_lock:
+        jobs = []
+        for upload_id, status in segment_upload_status.items():
+            jobs.append({
+                'upload_id': upload_id,
+                'status': status['status'],
+                'total': status['total'],
+                'completed': status['completed']
+            })
+
+    return jsonify({
+        'success': True,
+        'jobs': jobs
+    })
+
+
+@app.route('/api/media/segments/<session_name>/upload', methods=['POST'])
+def upload_single_segment(session_name):
+    """Upload a single segment session to S3"""
+    if not upload_service:
+        return jsonify({
+            'success': False,
+            'error': 'Cloud storage not configured'
+        }), 503
+
+    try:
+        data = request.get_json() or {}
+        camera_name_map = data.get('camera_name_map', {})
+        delete_after_upload = data.get('delete_after_upload', False)
+
+        # Get session info
+        session_result = media_service.get_segment_session_files(session_name)
+        if not session_result.get('success'):
+            return jsonify({
+                'success': False,
+                'error': session_result.get('error', 'Session not found')
+            }), 404
+
+        session = {
+            'session_name': session_name,
+            'path': session_result['path'],
+            'files': session_result['files'],
+            'file_count': session_result['file_count']
+        }
+
+        if session['file_count'] == 0:
+            return jsonify({
+                'success': False,
+                'error': 'Session has no files'
+            }), 400
+
+        # Upload synchronously for single session
+        result = upload_single_segment_session(session, camera_name_map, delete_after_upload)
+
+        return jsonify(result), 200 if result.get('success') else 500
+
+    except Exception as e:
+        logger.error(f"Error uploading segment {session_name}: {e}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
 
 # ==================== Cloud/S3 Video Endpoints ====================
 
