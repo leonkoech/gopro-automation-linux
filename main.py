@@ -1290,6 +1290,7 @@ def upload_segments_to_cloud():
         requested_sessions = data.get('sessions', [])
         camera_name_map = data.get('camera_name_map', {})
         delete_after_upload = data.get('delete_after_upload', False)
+        compress = data.get('compress', False)  # Default to no compression to save space
 
         # Get all segments
         segments_result = media_service.get_segments_list()
@@ -1346,7 +1347,8 @@ def upload_segments_to_cloud():
                     result = upload_single_segment_session(
                         session,
                         camera_name_map,
-                        delete_after_upload
+                        delete_after_upload,
+                        compress
                     )
                     results.append(result)
 
@@ -1390,10 +1392,16 @@ def upload_segments_to_cloud():
         }), 500
 
 
-def upload_single_segment_session(session: dict, camera_name_map: dict, delete_after_upload: bool) -> dict:
+def upload_single_segment_session(session: dict, camera_name_map: dict, delete_after_upload: bool, compress: bool = False) -> dict:
     """
     Upload a single segment session to S3.
     Merges chapter files and uploads with proper naming.
+
+    Args:
+        session: Session dict with name, path, files
+        camera_name_map: Map of interface ID to camera name
+        delete_after_upload: Whether to delete session after successful upload
+        compress: Whether to compress video to 1080p (default False to save disk space)
     """
     import shutil
 
@@ -1429,6 +1437,27 @@ def upload_single_segment_session(session: dict, camera_name_map: dict, delete_a
 
     # Get only video files, sorted by name (chapters in order)
     video_files = sorted([f for f in files if f['is_video']], key=lambda x: x['filename'])
+
+    if not video_files:
+        return {
+            'session_name': session_name,
+            'success': False,
+            'error': 'No video files in session'
+        }
+
+    # Validate video files - filter out corrupted ones (missing moov atom)
+    valid_video_files = []
+    for vf in video_files:
+        file_path = os.path.join(session_path, vf['filename'])
+        # Use ffprobe to check if file is valid
+        check_cmd = ['ffprobe', '-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=codec_type', '-of', 'csv=p=0', file_path]
+        result = subprocess.run(check_cmd, capture_output=True, text=True)
+        if result.returncode == 0 and 'video' in result.stdout:
+            valid_video_files.append(vf)
+        else:
+            logger.warning(f"[SegmentUpload] Skipping corrupted file: {vf['filename']} (moov atom missing or invalid)")
+
+    video_files = valid_video_files
 
     if not video_files:
         return {
@@ -1487,14 +1516,14 @@ def upload_single_segment_session(session: dict, camera_name_map: dict, delete_a
             logger.info(f"[SegmentUpload] Merge complete")
 
         # Upload to S3
-        logger.info(f"[SegmentUpload] Uploading to S3...")
+        logger.info(f"[SegmentUpload] Uploading to S3 (compress={compress})...")
         s3_uri = upload_service.upload_video(
             video_path=input_path,
             location=UPLOAD_LOCATION,
             date=upload_date,
             device_name=UPLOAD_DEVICE_NAME,
             camera_name=camera_name,
-            compress=True,  # Compress to 1080p
+            compress=compress,  # Only compress if requested (saves disk space)
             delete_compressed_after_upload=True
         )
 
