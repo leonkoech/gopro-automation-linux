@@ -73,13 +73,13 @@ class VideoUploadService:
             config=boto_config
         )
 
-        # Transfer config with smaller chunks to avoid SSL issues on ARM devices
-        # 8MB chunks instead of default 8MB, with fewer concurrent threads
+        # Transfer config for Jetson/ARM devices with SSL issues
+        # Use single-threaded uploads to avoid SSL EOF errors
         self.transfer_config = TransferConfig(
-            multipart_threshold=8 * 1024 * 1024,  # 8MB
-            max_concurrency=2,  # Reduce concurrent uploads to avoid SSL issues
-            multipart_chunksize=8 * 1024 * 1024,  # 8MB chunks
-            use_threads=True
+            multipart_threshold=50 * 1024 * 1024,  # 50MB - only use multipart for larger files
+            max_concurrency=1,  # Single thread to avoid SSL issues on ARM
+            multipart_chunksize=50 * 1024 * 1024,  # 50MB chunks - fewer parts = fewer SSL connections
+            use_threads=False  # Disable threading entirely
         )
 
         self._ensure_bucket_exists()
