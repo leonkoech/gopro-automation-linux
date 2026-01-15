@@ -1403,8 +1403,6 @@ def upload_single_segment_session(session: dict, camera_name_map: dict, delete_a
         delete_after_upload: Whether to delete session after successful upload
         compress: Whether to compress video to 1080p (default False to save disk space)
     """
-    import shutil
-
     session_name = session['session_name']
     session_path = session['path']
     files = session['files']
@@ -1445,120 +1443,60 @@ def upload_single_segment_session(session: dict, camera_name_map: dict, delete_a
             'error': 'No video files in session'
         }
 
-    # Validate video files - filter out corrupted ones (missing moov atom)
-    valid_video_files = []
-    for vf in video_files:
+    # Upload each file directly - no merging, no validation, no temp space needed
+    logger.info(f"[SegmentUpload] Uploading {len(video_files)} files directly...")
+
+    uploaded_uris = []
+    for idx, vf in enumerate(video_files):
         file_path = os.path.join(session_path, vf['filename'])
-        # Use ffprobe to check if file is valid
-        check_cmd = ['ffprobe', '-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=codec_type', '-of', 'csv=p=0', file_path]
-        result = subprocess.run(check_cmd, capture_output=True, text=True)
-        if result.returncode == 0 and 'video' in result.stdout:
-            valid_video_files.append(vf)
+
+        # For multiple files, append chapter number to camera name
+        if len(video_files) > 1:
+            file_camera_name = f"{camera_name}_ch{idx+1:02d}"
         else:
-            logger.warning(f"[SegmentUpload] Skipping corrupted file: {vf['filename']} (moov atom missing or invalid)")
+            file_camera_name = camera_name
 
-    video_files = valid_video_files
+        logger.info(f"[SegmentUpload] Uploading file {idx+1}/{len(video_files)}: {vf['filename']}")
 
-    if not video_files:
+        try:
+            s3_uri = upload_service.upload_video(
+                video_path=file_path,
+                location=UPLOAD_LOCATION,
+                date=upload_date,
+                device_name=UPLOAD_DEVICE_NAME,
+                camera_name=file_camera_name,
+                compress=False,  # Never compress - just upload raw files
+                delete_compressed_after_upload=False
+            )
+            uploaded_uris.append(s3_uri)
+            logger.info(f"[SegmentUpload] Uploaded: {s3_uri}")
+        except Exception as upload_err:
+            logger.warning(f"[SegmentUpload] Failed to upload {vf['filename']}: {upload_err}")
+            # Continue with other files even if one fails
+
+    # Check if any files were uploaded
+    if not uploaded_uris:
         return {
             'session_name': session_name,
             'success': False,
-            'error': 'No valid video files in session (all may be corrupted)'
+            'error': 'Failed to upload any files'
         }
 
-    # Track temp directory - only created if needed
-    temp_dir = None
+    logger.info(f"[SegmentUpload] Upload complete: {len(uploaded_uris)} files uploaded")
 
-    try:
-        if len(video_files) == 1:
-            # Single file - no merge needed, upload directly (no temp space required!)
-            input_path = os.path.join(session_path, video_files[0]['filename'])
-            logger.info(f"[SegmentUpload] Single file, no merge needed: {video_files[0]['filename']}")
-        else:
-            # Multiple files - need to merge (requires temp space)
-            logger.info(f"[SegmentUpload] Merging {len(video_files)} chapter files...")
+    # Delete segments if requested
+    if delete_after_upload:
+        logger.info(f"[SegmentUpload] Deleting session after upload...")
+        media_service.delete_segment_session(session_name)
 
-            # Create temp directory only when needed for merging
-            temp_dir = os.path.join(VIDEO_STORAGE_DIR, 'temp', f'segment_upload_{datetime.now().strftime("%Y%m%d_%H%M%S")}_{session_name}')
-            os.makedirs(temp_dir, exist_ok=True)
-
-            # Create concat file for ffmpeg
-            concat_file = os.path.join(temp_dir, 'concat.txt')
-            with open(concat_file, 'w') as f:
-                for vf in video_files:
-                    file_path = os.path.join(session_path, vf['filename'])
-                    # Escape special characters in path
-                    escaped_path = file_path.replace("'", "'\\''")
-                    f.write(f"file '{escaped_path}'\n")
-
-            # Merge using ffmpeg concat demuxer (fast, no re-encoding)
-            merged_path = os.path.join(temp_dir, 'merged.mp4')
-            merge_cmd = [
-                'ffmpeg',
-                '-f', 'concat',
-                '-safe', '0',
-                '-i', concat_file,
-                '-c', 'copy',  # Copy streams without re-encoding
-                '-y',
-                merged_path
-            ]
-
-            logger.info(f"[SegmentUpload] Running ffmpeg merge...")
-            result = subprocess.run(merge_cmd, capture_output=True, text=True)
-
-            if result.returncode != 0:
-                logger.error(f"[SegmentUpload] FFmpeg merge error: {result.stderr}")
-                return {
-                    'session_name': session_name,
-                    'success': False,
-                    'error': f'FFmpeg merge failed: {result.stderr[:200]}'
-                }
-
-            input_path = merged_path
-            logger.info(f"[SegmentUpload] Merge complete")
-
-        # Upload to S3
-        logger.info(f"[SegmentUpload] Uploading to S3 (compress={compress})...")
-        s3_uri = upload_service.upload_video(
-            video_path=input_path,
-            location=UPLOAD_LOCATION,
-            date=upload_date,
-            device_name=UPLOAD_DEVICE_NAME,
-            camera_name=camera_name,
-            compress=compress,  # Only compress if requested (saves disk space)
-            delete_compressed_after_upload=True
-        )
-
-        logger.info(f"[SegmentUpload] Upload complete: {s3_uri}")
-
-        # Delete segments if requested
-        if delete_after_upload:
-            logger.info(f"[SegmentUpload] Deleting session after upload...")
-            media_service.delete_segment_session(session_name)
-
-        return {
-            'session_name': session_name,
-            'success': True,
-            's3_uri': s3_uri,
-            'camera_name': camera_name,
-            'date': upload_date,
-            'files_merged': len(video_files)
-        }
-
-    except Exception as e:
-        logger.error(f"[SegmentUpload] Error processing {session_name}: {e}")
-        return {
-            'session_name': session_name,
-            'success': False,
-            'error': str(e)
-        }
-    finally:
-        # Clean up temp directory if it was created
-        if temp_dir:
-            try:
-                shutil.rmtree(temp_dir)
-            except:
-                pass
+    return {
+        'session_name': session_name,
+        'success': True,
+        's3_uri': uploaded_uris[0] if len(uploaded_uris) == 1 else uploaded_uris,
+        'camera_name': camera_name,
+        'date': upload_date,
+        'files_merged': len(uploaded_uris)
+    }
 
 
 @app.route('/api/media/segments/upload/<upload_id>/status', methods=['GET'])
