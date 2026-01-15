@@ -11,7 +11,6 @@ import threading
 import os
 import time
 import json
-import tempfile
 from datetime import datetime, timedelta
 from pathlib import Path
 import requests
@@ -1438,8 +1437,10 @@ def upload_single_segment_session(session: dict, camera_name_map: dict, delete_a
             'error': 'No video files in session'
         }
 
-    # Create temp directory for processing
-    temp_dir = tempfile.mkdtemp(prefix='segment_upload_')
+    # Create temp directory for processing inside VIDEO_STORAGE_DIR
+    # (system temp dirs may not be available/writable on Jetson)
+    temp_dir = os.path.join(VIDEO_STORAGE_DIR, 'temp', f'segment_upload_{datetime.now().strftime("%Y%m%d_%H%M%S")}_{session_name}')
+    os.makedirs(temp_dir, exist_ok=True)
 
     try:
         if len(video_files) == 1:
