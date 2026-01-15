@@ -16,10 +16,12 @@ from typing import Optional
 
 from dotenv import load_dotenv
 import boto3
+from boto3.s3.transfer import TransferConfig
 
 # Load environment variables from .env file
 load_dotenv()
 from botocore.exceptions import ClientError
+from botocore.config import Config as BotoConfig
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -51,14 +53,35 @@ class VideoUploadService:
         """
         self.bucket_name = bucket_name
         self.region = region
-        
+
+        # Configure boto with retries and timeouts for Jetson devices
+        boto_config = BotoConfig(
+            retries={
+                'max_attempts': 5,
+                'mode': 'adaptive'
+            },
+            connect_timeout=30,
+            read_timeout=60,
+            max_pool_connections=10
+        )
+
         self.s3_client = boto3.client(
             's3',
             aws_access_key_id=aws_access_key_id,
             aws_secret_access_key=aws_secret_access_key,
-            region_name=region
+            region_name=region,
+            config=boto_config
         )
-        
+
+        # Transfer config with smaller chunks to avoid SSL issues on ARM devices
+        # 8MB chunks instead of default 8MB, with fewer concurrent threads
+        self.transfer_config = TransferConfig(
+            multipart_threshold=8 * 1024 * 1024,  # 8MB
+            max_concurrency=2,  # Reduce concurrent uploads to avoid SSL issues
+            multipart_chunksize=8 * 1024 * 1024,  # 8MB chunks
+            use_threads=True
+        )
+
         self._ensure_bucket_exists()
     
     def _ensure_bucket_exists(self) -> None:
@@ -213,7 +236,8 @@ class VideoUploadService:
                 self.bucket_name,
                 s3_key,
                 Callback=ProgressCallback(file_size) if file_size > 10 * 1024 * 1024 else None,
-                ExtraArgs={'ContentType': 'video/mp4'}
+                ExtraArgs={'ContentType': 'video/mp4'},
+                Config=self.transfer_config
             )
             
             s3_uri = f"s3://{self.bucket_name}/{s3_key}"
