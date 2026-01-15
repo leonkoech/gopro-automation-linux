@@ -24,7 +24,7 @@ logging_service = get_logging_service()
 logger = get_logger('gopro.main')
 
 app = Flask(__name__)
-CORS(app)
+CORS(app, resources={r"/*": {"origins": "*", "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"], "allow_headers": ["Content-Type", "Authorization"]}})
 
 # Configuration
 VIDEO_STORAGE_DIR = os.path.expanduser('~/gopro_videos')
