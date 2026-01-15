@@ -1463,22 +1463,24 @@ def upload_single_segment_session(session: dict, camera_name_map: dict, delete_a
         return {
             'session_name': session_name,
             'success': False,
-            'error': 'No video files in session'
+            'error': 'No valid video files in session (all may be corrupted)'
         }
 
-    # Create temp directory for processing inside VIDEO_STORAGE_DIR
-    # (system temp dirs may not be available/writable on Jetson)
-    temp_dir = os.path.join(VIDEO_STORAGE_DIR, 'temp', f'segment_upload_{datetime.now().strftime("%Y%m%d_%H%M%S")}_{session_name}')
-    os.makedirs(temp_dir, exist_ok=True)
+    # Track temp directory - only created if needed
+    temp_dir = None
 
     try:
         if len(video_files) == 1:
-            # Single file - no merge needed
+            # Single file - no merge needed, upload directly (no temp space required!)
             input_path = os.path.join(session_path, video_files[0]['filename'])
             logger.info(f"[SegmentUpload] Single file, no merge needed: {video_files[0]['filename']}")
         else:
-            # Multiple files - need to merge
+            # Multiple files - need to merge (requires temp space)
             logger.info(f"[SegmentUpload] Merging {len(video_files)} chapter files...")
+
+            # Create temp directory only when needed for merging
+            temp_dir = os.path.join(VIDEO_STORAGE_DIR, 'temp', f'segment_upload_{datetime.now().strftime("%Y%m%d_%H%M%S")}_{session_name}')
+            os.makedirs(temp_dir, exist_ok=True)
 
             # Create concat file for ffmpeg
             concat_file = os.path.join(temp_dir, 'concat.txt')
@@ -1551,11 +1553,12 @@ def upload_single_segment_session(session: dict, camera_name_map: dict, delete_a
             'error': str(e)
         }
     finally:
-        # Clean up temp directory
-        try:
-            shutil.rmtree(temp_dir)
-        except:
-            pass
+        # Clean up temp directory if it was created
+        if temp_dir:
+            try:
+                shutil.rmtree(temp_dir)
+            except:
+                pass
 
 
 @app.route('/api/media/segments/upload/<upload_id>/status', methods=['GET'])
