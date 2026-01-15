@@ -6,7 +6,10 @@ Run with: python upload.py
 Optionally pass --delete to delete segments after successful upload.
 """
 
+# Fix SSL issues on Jetson/ARM devices - MUST be set before any imports
 import os
+os.environ['OPENSSL_CONF'] = '/dev/null'
+
 import sys
 from pathlib import Path
 from dotenv import load_dotenv

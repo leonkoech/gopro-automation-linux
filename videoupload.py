@@ -7,7 +7,10 @@ Requirements:
     sudo apt install ffmpeg
 """
 
+# Fix SSL issues on Jetson/ARM devices - MUST be set before any SSL imports
 import os
+os.environ['OPENSSL_CONF'] = '/dev/null'
+
 import subprocess
 import tempfile
 import logging
@@ -57,12 +60,13 @@ class VideoUploadService:
         # Configure boto with retries and timeouts for Jetson devices
         boto_config = BotoConfig(
             retries={
-                'max_attempts': 5,
+                'max_attempts': 10,
                 'mode': 'adaptive'
             },
-            connect_timeout=30,
-            read_timeout=60,
-            max_pool_connections=10
+            connect_timeout=60,
+            read_timeout=300,  # 5 minute read timeout for large chunks
+            max_pool_connections=1,  # Single connection to avoid SSL issues
+            tcp_keepalive=True  # Keep connection alive
         )
 
         self.s3_client = boto3.client(
@@ -74,12 +78,14 @@ class VideoUploadService:
         )
 
         # Transfer config for Jetson/ARM devices with SSL issues
-        # Use single-threaded uploads to avoid SSL EOF errors
+        # Use single-threaded uploads with very large chunks to minimize SSL connections
         self.transfer_config = TransferConfig(
-            multipart_threshold=50 * 1024 * 1024,  # 50MB - only use multipart for larger files
+            multipart_threshold=100 * 1024 * 1024,  # 100MB - only use multipart for larger files
             max_concurrency=1,  # Single thread to avoid SSL issues on ARM
-            multipart_chunksize=50 * 1024 * 1024,  # 50MB chunks - fewer parts = fewer SSL connections
-            use_threads=False  # Disable threading entirely
+            multipart_chunksize=100 * 1024 * 1024,  # 100MB chunks - fewer parts = fewer SSL connections
+            use_threads=False,  # Disable threading entirely
+            max_io_queue=1,  # Minimize queued IO operations
+            num_download_attempts=5  # More retry attempts
         )
 
         self._ensure_bucket_exists()

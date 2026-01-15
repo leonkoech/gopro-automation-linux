@@ -4,6 +4,10 @@ GoPro Controller API Service with Automatic Segmentation
 REST API for remote control of GoPro cameras connected to Jetson Nano
 """
 
+# Fix SSL issues on Jetson/ARM devices - MUST be set before any SSL imports
+import os
+os.environ['OPENSSL_CONF'] = '/dev/null'
+
 from flask import Flask, jsonify, request, send_file, Response, send_from_directory
 from flask_cors import CORS
 import subprocess
