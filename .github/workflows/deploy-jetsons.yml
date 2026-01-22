@@ -1,0 +1,197 @@
+name: Deploy Backend to Jetsons
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: 'Deploy target'
+        required: true
+        default: 'all'
+        type: choice
+        options:
+          - all
+          - jetson-nano-001
+          - jetson-nano-002
+
+env:
+  # Use existing service name to avoid duplicates
+  SERVICE_NAME: gopro-controller
+  DEPLOY_PATH: /home/developer/Development/gopro-automation-linux
+  SERVICE_PORT: 5000
+
+jobs:
+  discover-jetsons:
+    name: Discover Online Jetsons
+    runs-on: ubuntu-latest
+    outputs:
+      jetsons: ${{ steps.discover.outputs.jetsons }}
+      count: ${{ steps.discover.outputs.count }}
+    steps:
+      - name: Discover Jetsons via Tailscale API
+        id: discover
+        env:
+          TAILSCALE_API_KEY: ${{ secrets.TAILSCALE_API_KEY }}
+        run: |
+          echo "Fetching devices from Tailscale API..."
+
+          RESPONSE=$(curl -s -H "Authorization: Bearer $TAILSCALE_API_KEY" \
+            "https://api.tailscale.com/api/v2/tailnet/-/devices")
+
+          # Filter for online Jetsons
+          if [ "${{ github.event.inputs.target }}" == "all" ]; then
+            JETSONS=$(echo "$RESPONSE" | jq -c '[.devices[] | select(.hostname | test("jetson"; "i")) | select(.connectedToControl == true) | {name: .hostname, ip: .addresses[0]}]')
+          else
+            TARGET_NAME="${{ github.event.inputs.target }}"
+            JETSONS=$(echo "$RESPONSE" | jq -c --arg target "$TARGET_NAME" '[.devices[] | select(.hostname | test($target; "i")) | select(.connectedToControl == true) | {name: .hostname, ip: .addresses[0]}]')
+          fi
+
+          COUNT=$(echo "$JETSONS" | jq 'length')
+
+          echo "Found $COUNT online Jetson(s)"
+          echo "$JETSONS" | jq .
+
+          echo "jetsons=$JETSONS" >> $GITHUB_OUTPUT
+          echo "count=$COUNT" >> $GITHUB_OUTPUT
+
+          if [ "$COUNT" -eq 0 ]; then
+            echo "::error::No online Jetsons found!"
+            exit 1
+          fi
+
+  deploy:
+    name: Deploy to ${{ matrix.jetson.name }}
+    needs: discover-jetsons
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        jetson: ${{ fromJson(needs.discover-jetsons.outputs.jetsons) }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup SSH Key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.JETSON_SSH_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan -H ${{ matrix.jetson.ip }} >> ~/.ssh/known_hosts 2>/dev/null || true
+
+      - name: Install Tailscale
+        uses: tailscale/github-action@v3
+        with:
+          oauth-client-id: ""
+          oauth-secret: ""
+          authkey: ${{ secrets.TAILSCALE_AUTH_KEY }}
+          version: 1.76.6
+
+      - name: Wait for Tailscale connection
+        run: |
+          echo "Waiting for Tailscale to connect..."
+          sleep 10
+          tailscale status
+
+      - name: Test SSH Connection
+        run: |
+          echo "Testing SSH connection to ${{ matrix.jetson.name }} (${{ matrix.jetson.ip }})..."
+          ssh -o StrictHostKeyChecking=no -o ConnectTimeout=30 developer@${{ matrix.jetson.ip }} "echo 'SSH connection successful' && hostname"
+
+      - name: Deploy to Jetson
+        env:
+          JETSON_IP: ${{ matrix.jetson.ip }}
+          JETSON_NAME: ${{ matrix.jetson.name }}
+        run: |
+          echo "========================================"
+          echo "Deploying to $JETSON_NAME ($JETSON_IP)"
+          echo "========================================"
+
+          # Create deployment script
+          cat << 'DEPLOY_SCRIPT' > deploy.sh
+          #!/bin/bash
+          set -e
+
+          SERVICE_NAME="gopro-controller"
+          DEPLOY_PATH="/home/developer/Development/gopro-automation-linux"
+
+          echo "[1/7] Stopping service before deployment..."
+          sudo systemctl stop $SERVICE_NAME 2>/dev/null || echo "Service was not running"
+
+          echo "[2/7] Navigating to project directory..."
+          if [ ! -d "$DEPLOY_PATH" ]; then
+            echo "Creating directory and cloning repository..."
+            mkdir -p "$(dirname $DEPLOY_PATH)"
+            git clone https://github.com/$GITHUB_REPOSITORY.git "$DEPLOY_PATH"
+          fi
+          cd "$DEPLOY_PATH"
+
+          echo "[3/7] Fetching latest changes..."
+          git fetch origin main
+          git reset --hard origin/main
+
+          echo "[4/7] Setting up Python environment..."
+          if [ ! -d "venv" ]; then
+            python3 -m venv venv
+          fi
+          source venv/bin/activate
+
+          echo "[5/7] Installing dependencies..."
+          pip install --upgrade pip -q
+          pip install -r requirements.txt -q
+
+          echo "[6/7] Starting service..."
+          sudo systemctl start $SERVICE_NAME
+
+          echo "[7/7] Verifying deployment..."
+          sleep 3
+          if systemctl is-active --quiet $SERVICE_NAME; then
+            echo "Service is running"
+            # Health check
+            if curl -s http://localhost:5000/health > /dev/null 2>&1; then
+              echo "Health check PASSED"
+            else
+              echo "Warning: Health endpoint not responding yet"
+            fi
+          else
+            echo "ERROR: Service failed to start"
+            sudo journalctl -u $SERVICE_NAME --no-pager -n 20
+            exit 1
+          fi
+
+          echo ""
+          echo "=========================================="
+          echo "Deployment complete!"
+          echo "Service: $SERVICE_NAME"
+          echo "Status: $(systemctl is-active $SERVICE_NAME)"
+          echo "=========================================="
+          DEPLOY_SCRIPT
+
+          # Copy and execute deployment script
+          scp -o StrictHostKeyChecking=no deploy.sh developer@$JETSON_IP:/tmp/deploy.sh
+          ssh -o StrictHostKeyChecking=no developer@$JETSON_IP "chmod +x /tmp/deploy.sh && GITHUB_REPOSITORY=${{ github.repository }} /tmp/deploy.sh"
+
+      - name: Deployment Summary
+        if: always()
+        run: |
+          echo "========================================"
+          echo "Deployment to ${{ matrix.jetson.name }} completed"
+          echo "IP: ${{ matrix.jetson.ip }}"
+          echo "Status: ${{ job.status }}"
+          echo "========================================"
+
+  summary:
+    name: Deployment Summary
+    needs: [discover-jetsons, deploy]
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Print Summary
+        run: |
+          echo "========================================"
+          echo "BACKEND DEPLOYMENT SUMMARY"
+          echo "========================================"
+          echo "Total Jetsons targeted: ${{ needs.discover-jetsons.outputs.count }}"
+          echo "Target selection: ${{ github.event.inputs.target }}"
+          echo "Branch: ${{ github.ref_name }}"
+          echo "Commit: ${{ github.sha }}"
+          echo "Service: gopro-controller"
+          echo "========================================"

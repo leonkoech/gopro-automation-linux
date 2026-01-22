@@ -24,7 +24,9 @@ class MediaService:
             local_storage_dir: Path to local video storage directory
         """
         self.local_storage_dir = local_storage_dir or os.path.expanduser('~/gopro_videos')
+        self.segments_dir = os.path.join(self.local_storage_dir, 'segments')
         os.makedirs(self.local_storage_dir, exist_ok=True)
+        os.makedirs(self.segments_dir, exist_ok=True)
 
     # ==================== GoPro Media Management ====================
 
@@ -316,6 +318,219 @@ class MediaService:
 
         except Exception as e:
             return {'success': False, 'error': str(e)}
+
+    # ==================== Segments Management ====================
+
+    def get_segments_list(self) -> Dict[str, Any]:
+        """
+        Get list of all segment folders and their contents.
+
+        Returns:
+            Dict with segments list organized by recording session
+        """
+        try:
+            segments_path = Path(self.segments_dir)
+            sessions = []
+            total_size = 0
+            total_files = 0
+
+            # Each subfolder is a recording session
+            for session_dir in sorted(segments_path.iterdir(), reverse=True):
+                if session_dir.is_dir():
+                    session_files = []
+                    session_size = 0
+
+                    # Get all files in the session folder
+                    for segment_file in session_dir.glob('*'):
+                        if segment_file.is_file():
+                            try:
+                                stat = segment_file.stat()
+                                size = stat.st_size
+                                session_size += size
+                                total_files += 1
+
+                                session_files.append({
+                                    'filename': segment_file.name,
+                                    'size_bytes': size,
+                                    'size_mb': round(size / (1024 * 1024), 2),
+                                    'modified': datetime.fromtimestamp(stat.st_mtime).isoformat(),
+                                    'is_video': segment_file.suffix.lower() in ['.mp4', '.mov']
+                                })
+                            except Exception as e:
+                                print(f"Error reading segment file {segment_file}: {e}")
+
+                    # Sort files by name
+                    session_files.sort(key=lambda x: x['filename'])
+                    total_size += session_size
+
+                    # Parse session name for metadata (format: deviceid_YYYYMMDD_HHMMSS)
+                    session_name = session_dir.name
+                    session_date = None
+                    try:
+                        # Try to extract date from session name
+                        parts = session_name.split('_')
+                        if len(parts) >= 2:
+                            date_str = parts[-2]  # YYYYMMDD
+                            time_str = parts[-1]  # HHMMSS
+                            session_date = f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:8]} {time_str[:2]}:{time_str[2:4]}:{time_str[4:6]}"
+                    except:
+                        pass
+
+                    sessions.append({
+                        'session_name': session_name,
+                        'session_date': session_date,
+                        'path': str(session_dir),
+                        'file_count': len(session_files),
+                        'total_size_bytes': session_size,
+                        'total_size_mb': round(session_size / (1024 * 1024), 2),
+                        'files': session_files
+                    })
+
+            return {
+                'success': True,
+                'segments_path': self.segments_dir,
+                'session_count': len(sessions),
+                'total_file_count': total_files,
+                'total_size_mb': round(total_size / (1024 * 1024), 2),
+                'total_size_gb': round(total_size / (1024 ** 3), 2),
+                'sessions': sessions
+            }
+
+        except Exception as e:
+            return {'success': False, 'error': str(e)}
+
+    def get_segment_session_files(self, session_name: str) -> Dict[str, Any]:
+        """
+        Get list of files in a specific segment session.
+
+        Args:
+            session_name: Name of the session folder
+
+        Returns:
+            Dict with session file list
+        """
+        try:
+            session_path = Path(self.segments_dir) / session_name
+
+            if not session_path.exists():
+                return {'success': False, 'error': 'Session not found'}
+
+            if not session_path.is_dir():
+                return {'success': False, 'error': 'Invalid session path'}
+
+            files = []
+            total_size = 0
+
+            for segment_file in session_path.glob('*'):
+                if segment_file.is_file():
+                    try:
+                        stat = segment_file.stat()
+                        size = stat.st_size
+                        total_size += size
+
+                        files.append({
+                            'filename': segment_file.name,
+                            'path': str(segment_file),
+                            'size_bytes': size,
+                            'size_mb': round(size / (1024 * 1024), 2),
+                            'modified': datetime.fromtimestamp(stat.st_mtime).isoformat(),
+                            'is_video': segment_file.suffix.lower() in ['.mp4', '.mov']
+                        })
+                    except Exception as e:
+                        print(f"Error reading segment file {segment_file}: {e}")
+
+            files.sort(key=lambda x: x['filename'])
+
+            return {
+                'success': True,
+                'session_name': session_name,
+                'path': str(session_path),
+                'file_count': len(files),
+                'total_size_mb': round(total_size / (1024 * 1024), 2),
+                'files': files
+            }
+
+        except Exception as e:
+            return {'success': False, 'error': str(e)}
+
+    def delete_segment_session(self, session_name: str) -> Dict[str, Any]:
+        """
+        Delete an entire segment session folder.
+
+        Args:
+            session_name: Name of the session folder to delete
+
+        Returns:
+            Dict with result
+        """
+        try:
+            import shutil
+            session_path = os.path.join(self.segments_dir, session_name)
+
+            # Security check
+            if not session_path.startswith(self.segments_dir):
+                return {'success': False, 'error': 'Invalid session path'}
+
+            if not os.path.exists(session_path):
+                return {'success': False, 'error': 'Session not found'}
+
+            if not os.path.isdir(session_path):
+                return {'success': False, 'error': 'Not a valid session directory'}
+
+            shutil.rmtree(session_path)
+            return {
+                'success': True,
+                'message': f'Deleted session {session_name}'
+            }
+
+        except Exception as e:
+            return {'success': False, 'error': str(e)}
+
+    def delete_segment_file(self, session_name: str, filename: str) -> Dict[str, Any]:
+        """
+        Delete a specific file from a segment session.
+
+        Args:
+            session_name: Name of the session folder
+            filename: Name of the file to delete
+
+        Returns:
+            Dict with result
+        """
+        try:
+            file_path = os.path.join(self.segments_dir, session_name, filename)
+
+            # Security check
+            if not file_path.startswith(self.segments_dir):
+                return {'success': False, 'error': 'Invalid file path'}
+
+            if not os.path.exists(file_path):
+                return {'success': False, 'error': 'File not found'}
+
+            os.remove(file_path)
+            return {
+                'success': True,
+                'message': f'Deleted {filename} from session {session_name}'
+            }
+
+        except Exception as e:
+            return {'success': False, 'error': str(e)}
+
+    def get_segment_file_path(self, session_name: str, filename: str) -> Optional[str]:
+        """
+        Get full path to a segment file if it exists.
+
+        Args:
+            session_name: Name of the session folder
+            filename: Name of the file
+
+        Returns:
+            Full path or None if not found
+        """
+        file_path = os.path.join(self.segments_dir, session_name, filename)
+        if os.path.exists(file_path) and file_path.startswith(self.segments_dir):
+            return file_path
+        return None
 
 
 # Singleton instance

@@ -7,19 +7,28 @@ Requirements:
     sudo apt install ffmpeg
 """
 
+# Fix SSL issues on Jetson/ARM devices - MUST be set before any SSL imports
 import os
+os.environ['OPENSSL_CONF'] = '/dev/null'
+
 import subprocess
 import tempfile
 import logging
 from pathlib import Path
 from typing import Optional
+import urllib3
+
+# Disable SSL warnings when verification is disabled
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 from dotenv import load_dotenv
 import boto3
+from boto3.s3.transfer import TransferConfig
 
 # Load environment variables from .env file
 load_dotenv()
 from botocore.exceptions import ClientError
+from botocore.config import Config as BotoConfig
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -37,7 +46,7 @@ class VideoUploadService:
         self,
         aws_access_key_id: str,
         aws_secret_access_key: str,
-        bucket_name: str = "jetson-videos",
+        bucket_name: str = "jetson-videos-uai",
         region: str = "us-east-1"
     ):
         """
@@ -51,14 +60,39 @@ class VideoUploadService:
         """
         self.bucket_name = bucket_name
         self.region = region
-        
+
+        # Configure boto with retries and timeouts for Jetson devices
+        boto_config = BotoConfig(
+            retries={
+                'max_attempts': 10,
+                'mode': 'adaptive'
+            },
+            connect_timeout=60,
+            read_timeout=300,  # 5 minute read timeout for large chunks
+            max_pool_connections=1,  # Single connection to avoid SSL issues
+            tcp_keepalive=True  # Keep connection alive
+        )
+
         self.s3_client = boto3.client(
             's3',
             aws_access_key_id=aws_access_key_id,
             aws_secret_access_key=aws_secret_access_key,
-            region_name=region
+            region_name=region,
+            config=boto_config,
+            verify=False  # Disable SSL verification to fix EOF errors on Jetson/ARM
         )
-        
+
+        # Transfer config for Jetson/ARM devices with SSL issues
+        # Use single-threaded uploads with very large chunks to minimize SSL connections
+        self.transfer_config = TransferConfig(
+            multipart_threshold=100 * 1024 * 1024,  # 100MB - only use multipart for larger files
+            max_concurrency=1,  # Single thread to avoid SSL issues on ARM
+            multipart_chunksize=100 * 1024 * 1024,  # 100MB chunks - fewer parts = fewer SSL connections
+            use_threads=False,  # Disable threading entirely
+            max_io_queue=1,  # Minimize queued IO operations
+            num_download_attempts=5  # More retry attempts
+        )
+
         self._ensure_bucket_exists()
     
     def _ensure_bucket_exists(self) -> None:
@@ -213,7 +247,8 @@ class VideoUploadService:
                 self.bucket_name,
                 s3_key,
                 Callback=ProgressCallback(file_size) if file_size > 10 * 1024 * 1024 else None,
-                ExtraArgs={'ContentType': 'video/mp4'}
+                ExtraArgs={'ContentType': 'video/mp4'},
+                Config=self.transfer_config
             )
             
             s3_uri = f"s3://{self.bucket_name}/{s3_key}"
