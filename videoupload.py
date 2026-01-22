@@ -16,6 +16,10 @@ import tempfile
 import logging
 from pathlib import Path
 from typing import Optional
+import urllib3
+
+# Disable SSL warnings when verification is disabled
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 from dotenv import load_dotenv
 import boto3
@@ -74,7 +78,8 @@ class VideoUploadService:
             aws_access_key_id=aws_access_key_id,
             aws_secret_access_key=aws_secret_access_key,
             region_name=region,
-            config=boto_config
+            config=boto_config,
+            verify=False  # Disable SSL verification to fix EOF errors on Jetson/ARM
         )
 
         # Transfer config for Jetson/ARM devices with SSL issues
