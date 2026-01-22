@@ -16,6 +16,8 @@ from typing import Optional
 
 from dotenv import load_dotenv
 import boto3
+from boto3.s3.transfer import TransferConfig
+from botocore.config import Config as BotoConfig
 
 # Load environment variables from .env file
 load_dotenv()
@@ -51,14 +53,32 @@ class VideoUploadService:
         """
         self.bucket_name = bucket_name
         self.region = region
-        
+
+        # Configure boto client with reduced connection pool to prevent SSL issues on Jetson
+        boto_config = BotoConfig(
+            max_pool_connections=5,
+            retries={'max_attempts': 3, 'mode': 'adaptive'}
+        )
+
         self.s3_client = boto3.client(
             's3',
             aws_access_key_id=aws_access_key_id,
             aws_secret_access_key=aws_secret_access_key,
-            region_name=region
+            region_name=region,
+            config=boto_config
         )
-        
+
+        # Transfer config optimized for Jetson/ARM devices to prevent SSL EOF errors
+        # - Smaller chunks reduce memory pressure and SSL buffer issues
+        # - Single-threaded avoids SSL context conflicts
+        # - Lower threshold triggers multipart earlier for better reliability
+        self.transfer_config = TransferConfig(
+            multipart_threshold=5 * 1024 * 1024,   # 5MB - use multipart for files > 5MB
+            multipart_chunksize=5 * 1024 * 1024,   # 5MB chunks
+            max_concurrency=2,                      # Reduce concurrent connections
+            use_threads=False                       # Single-threaded to avoid SSL issues
+        )
+
         self._ensure_bucket_exists()
     
     def _ensure_bucket_exists(self) -> None:
@@ -212,6 +232,7 @@ class VideoUploadService:
                 upload_path,
                 self.bucket_name,
                 s3_key,
+                Config=self.transfer_config,
                 Callback=ProgressCallback(file_size) if file_size > 10 * 1024 * 1024 else None,
                 ExtraArgs={'ContentType': 'video/mp4'}
             )
