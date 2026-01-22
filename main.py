@@ -1543,7 +1543,7 @@ def list_segment_upload_jobs():
 
 @app.route('/api/media/segments/<session_name>/upload', methods=['POST'])
 def upload_single_segment(session_name):
-    """Upload a single segment session to S3"""
+    """Upload a single segment session to S3 (async with progress tracking)"""
     if not upload_service:
         return jsonify({
             'success': False,
@@ -1554,6 +1554,8 @@ def upload_single_segment(session_name):
         data = request.get_json() or {}
         camera_name_map = data.get('camera_name_map', {})
         delete_after_upload = data.get('delete_after_upload', False)
+        # Allow sync mode for backward compatibility (default to async)
+        async_mode = data.get('async', True)
 
         # Get session info
         session_result = media_service.get_segment_session_files(session_name)
@@ -1576,17 +1578,195 @@ def upload_single_segment(session_name):
                 'error': 'Session has no files'
             }), 400
 
-        # Upload synchronously for single session
-        result = upload_single_segment_session(session, camera_name_map, delete_after_upload)
+        # Calculate total size
+        total_size_mb = sum(f.get('size_mb', 0) for f in session['files'] if f.get('is_video'))
+        video_files = [f for f in session['files'] if f.get('is_video')]
 
-        return jsonify(result), 200 if result.get('success') else 500
+        if not async_mode:
+            # Synchronous upload (for backward compatibility)
+            result = upload_single_segment_session(session, camera_name_map, delete_after_upload)
+            return jsonify(result), 200 if result.get('success') else 500
+
+        # Generate upload ID for this single session
+        upload_id = f"single_{session_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+
+        # Initialize status tracking
+        with segment_upload_lock:
+            segment_upload_status[upload_id] = {
+                'status': 'starting',
+                'session_name': session_name,
+                'total_files': len(video_files),
+                'total_size_mb': round(total_size_mb, 2),
+                'current_file': None,
+                'current_file_index': 0,
+                'current_file_progress': 0,
+                'files_completed': 0,
+                'uploaded_uris': [],
+                'errors': [],
+                'started_at': datetime.now().isoformat(),
+                'completed_at': None
+            }
+
+        # Background upload function
+        def upload_session_background():
+            try:
+                with segment_upload_lock:
+                    segment_upload_status[upload_id]['status'] = 'in_progress'
+
+                # Run the upload with progress tracking
+                result = upload_single_segment_session_with_progress(
+                    session, camera_name_map, delete_after_upload, upload_id
+                )
+
+                with segment_upload_lock:
+                    if result.get('success'):
+                        segment_upload_status[upload_id]['status'] = 'completed'
+                        segment_upload_status[upload_id]['uploaded_uris'] = result.get('s3_uri', [])
+                        if isinstance(segment_upload_status[upload_id]['uploaded_uris'], str):
+                            segment_upload_status[upload_id]['uploaded_uris'] = [segment_upload_status[upload_id]['uploaded_uris']]
+                    else:
+                        segment_upload_status[upload_id]['status'] = 'failed'
+                        segment_upload_status[upload_id]['errors'].append(result.get('error', 'Unknown error'))
+                    segment_upload_status[upload_id]['completed_at'] = datetime.now().isoformat()
+
+            except Exception as e:
+                logger.error(f"Background upload error for {session_name}: {e}")
+                with segment_upload_lock:
+                    segment_upload_status[upload_id]['status'] = 'failed'
+                    segment_upload_status[upload_id]['errors'].append(str(e))
+                    segment_upload_status[upload_id]['completed_at'] = datetime.now().isoformat()
+
+        # Start background thread
+        upload_thread = threading.Thread(target=upload_session_background, daemon=True)
+        upload_thread.start()
+
+        return jsonify({
+            'success': True,
+            'message': f'Upload started for session {session_name}',
+            'upload_id': upload_id,
+            'session_name': session_name,
+            'total_files': len(video_files),
+            'total_size_mb': round(total_size_mb, 2),
+            'status_url': f'/api/media/segments/upload/{upload_id}/status'
+        })
 
     except Exception as e:
-        logger.error(f"Error uploading segment {session_name}: {e}")
+        logger.error(f"Error starting upload for segment {session_name}: {e}")
         return jsonify({
             'success': False,
             'error': str(e)
         }), 500
+
+
+def upload_single_segment_session_with_progress(session: dict, camera_name_map: dict, delete_after_upload: bool, upload_id: str) -> dict:
+    """
+    Upload a single segment session with progress tracking.
+    Updates segment_upload_status with per-file progress.
+    """
+    session_name = session['session_name']
+    session_path = session['path']
+    files = session['files']
+
+    logger.info(f"[SegmentUpload] Processing session: {session_name}")
+
+    # Parse session name: format is interfaceId_YYYYMMDD_HHMMSS
+    parts = session_name.split('_')
+    if len(parts) < 3:
+        return {
+            'session_name': session_name,
+            'success': False,
+            'error': f'Invalid session name format: {session_name}'
+        }
+
+    interface_id = '_'.join(parts[:-2])
+    date_str = parts[-2]
+    upload_date = f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:8]}"
+
+    camera_name = camera_name_map.get(interface_id)
+    if not camera_name:
+        camera_name = f"GoPro-{interface_id[-4:]}"
+
+    logger.info(f"[SegmentUpload] Camera: {camera_name}, Date: {upload_date}")
+
+    video_files = sorted([f for f in files if f['is_video']], key=lambda x: x['filename'])
+
+    if not video_files:
+        return {
+            'session_name': session_name,
+            'success': False,
+            'error': 'No video files in session'
+        }
+
+    logger.info(f"[SegmentUpload] Uploading {len(video_files)} files directly...")
+
+    uploaded_uris = []
+    for idx, vf in enumerate(video_files):
+        file_path = os.path.join(session_path, vf['filename'])
+
+        # Update status with current file
+        with segment_upload_lock:
+            segment_upload_status[upload_id]['current_file'] = vf['filename']
+            segment_upload_status[upload_id]['current_file_index'] = idx + 1
+            segment_upload_status[upload_id]['current_file_progress'] = 0
+
+        if len(video_files) > 1:
+            file_camera_name = f"{camera_name}_ch{idx+1:02d}"
+        else:
+            file_camera_name = camera_name
+
+        logger.info(f"[SegmentUpload] Uploading file {idx+1}/{len(video_files)}: {vf['filename']}")
+
+        try:
+            # Create progress callback for this file
+            def progress_callback(percent):
+                with segment_upload_lock:
+                    if upload_id in segment_upload_status:
+                        segment_upload_status[upload_id]['current_file_progress'] = percent
+
+            s3_uri = upload_service.upload_video(
+                video_path=file_path,
+                location=UPLOAD_LOCATION,
+                date=upload_date,
+                device_name=UPLOAD_DEVICE_NAME,
+                camera_name=file_camera_name,
+                compress=False,
+                delete_compressed_after_upload=False,
+                progress_callback=progress_callback
+            )
+            uploaded_uris.append(s3_uri)
+            logger.info(f"[SegmentUpload] Uploaded: {s3_uri}")
+
+            # Update completed count
+            with segment_upload_lock:
+                segment_upload_status[upload_id]['files_completed'] = idx + 1
+                segment_upload_status[upload_id]['current_file_progress'] = 100
+
+        except Exception as upload_err:
+            logger.warning(f"[SegmentUpload] Failed to upload {vf['filename']}: {upload_err}")
+            with segment_upload_lock:
+                segment_upload_status[upload_id]['errors'].append(f"Failed to upload {vf['filename']}: {str(upload_err)}")
+
+    if not uploaded_uris:
+        return {
+            'session_name': session_name,
+            'success': False,
+            'error': 'Failed to upload any files'
+        }
+
+    logger.info(f"[SegmentUpload] Upload complete: {len(uploaded_uris)} files uploaded")
+
+    if delete_after_upload:
+        logger.info(f"[SegmentUpload] Deleting session after upload...")
+        media_service.delete_segment_session(session_name)
+
+    return {
+        'session_name': session_name,
+        'success': True,
+        's3_uri': uploaded_uris[0] if len(uploaded_uris) == 1 else uploaded_uris,
+        'camera_name': camera_name,
+        'date': upload_date,
+        'files_uploaded': len(uploaded_uris)
+    }
 
 
 # ==================== Cloud/S3 Video Endpoints ====================

@@ -208,11 +208,12 @@ class VideoUploadService:
         device_name: str,
         camera_name: str,
         compress: bool = True,
-        delete_compressed_after_upload: bool = True
+        delete_compressed_after_upload: bool = True,
+        progress_callback=None
     ) -> str:
         """
         Compress (optionally) and upload a video to S3.
-        
+
         Args:
             video_path: Path to the video file
             location: Location identifier for folder structure
@@ -221,32 +222,36 @@ class VideoUploadService:
             camera_name: Camera name for filename
             compress: Whether to compress to 1080p before uploading
             delete_compressed_after_upload: Delete temp compressed file after upload
-        
+            progress_callback: Optional callback function(percent) for progress updates
+
         Returns:
             S3 URI of the uploaded video
         """
         if not os.path.exists(video_path):
             raise FileNotFoundError(f"Video not found: {video_path}")
-        
+
         # Compress if requested
         if compress:
             upload_path = self.compress_to_1080p(video_path)
         else:
             upload_path = video_path
-        
+
         # Build S3 key
         s3_key = self._build_s3_key(location, date, device_name, camera_name)
-        
+
         try:
             # Upload with progress callback for large files
             file_size = os.path.getsize(upload_path)
             logger.info(f"Uploading {upload_path} ({file_size / 1024 / 1024:.2f} MB) to s3://{self.bucket_name}/{s3_key}")
-            
+
+            # Create progress callback with optional external callback
+            callback = ProgressCallback(file_size, progress_callback) if file_size > 10 * 1024 * 1024 else None
+
             self.s3_client.upload_file(
                 upload_path,
                 self.bucket_name,
                 s3_key,
-                Callback=ProgressCallback(file_size) if file_size > 10 * 1024 * 1024 else None,
+                Callback=callback,
                 ExtraArgs={'ContentType': 'video/mp4'},
                 Config=self.transfer_config
             )
@@ -457,20 +462,28 @@ class VideoUploadService:
 
 class ProgressCallback:
     """Callback class to track upload progress."""
-    
-    def __init__(self, total_size: int):
+
+    def __init__(self, total_size: int, external_callback=None):
         self.total_size = total_size
         self.uploaded = 0
         self.last_percentage = 0
-    
+        self.external_callback = external_callback
+
     def __call__(self, bytes_amount: int):
         self.uploaded += bytes_amount
         percentage = int((self.uploaded / self.total_size) * 100)
-        
+
         # Only log every 10%
         if percentage >= self.last_percentage + 10:
             self.last_percentage = percentage
             logger.info(f"Upload progress: {percentage}%")
+
+            # Call external callback if provided
+            if self.external_callback:
+                try:
+                    self.external_callback(percentage)
+                except Exception:
+                    pass  # Don't let callback errors affect upload
 
 
 # Example usage
