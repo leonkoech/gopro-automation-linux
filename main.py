@@ -24,6 +24,7 @@ from media_service import get_media_service
 from logging_service import get_logging_service, get_logger
 from firebase_service import get_firebase_service
 from uball_client import get_uball_client
+from video_processing import VideoProcessor, process_game_videos
 
 # Initialize logging service first
 logging_service = get_logging_service()
@@ -78,6 +79,10 @@ if uball_client:
     print("✓ Uball Backend client initialized")
 else:
     print("⚠ Uball Backend client not available - game sync will not work")
+
+# Initialize Video Processor
+video_processor = VideoProcessor(VIDEO_STORAGE_DIR, SEGMENTS_DIR)
+print(f"✓ Video processor initialized (output: {video_processor.output_dir})")
 
 # Global state
 recording_processes = {}
@@ -1407,6 +1412,201 @@ def list_uball_teams():
             'teams': teams
         })
     except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+
+# ==================== Game Video Processing Endpoints ====================
+
+@app.route('/api/games/process-videos', methods=['POST'])
+def process_game_videos_endpoint():
+    """
+    Extract game portions from continuous recordings and upload to S3.
+
+    Request Body:
+    {
+        "firebase_game_id": "abc123",
+        "game_number": 1,           // Game number for the day
+        "location": "court-a"       // Optional, defaults to UPLOAD_LOCATION
+    }
+
+    Flow:
+    1. Fetch game from Firebase → get start/end times
+    2. Find matching recording sessions that overlap with game time
+    3. For each relevant session:
+       a. Find chapter files that contain game time range
+       b. Use FFmpeg to extract game portion
+       c. Upload to S3: {location}/{date}/game{N}/{date}_game{N}_{angle}.mp4
+    4. Update recording-sessions with processed game info
+
+    Returns:
+        {
+            success: true,
+            firebase_game_id: "...",
+            game_number: 1,
+            processed_videos: [...],
+            errors: [...]
+        }
+    """
+    if not firebase_service:
+        return jsonify({
+            'success': False,
+            'error': 'Firebase service not configured'
+        }), 503
+
+    try:
+        data = request.get_json()
+        if not data:
+            return jsonify({'success': False, 'error': 'Request body required'}), 400
+
+        firebase_game_id = data.get('firebase_game_id')
+        game_number = data.get('game_number', 1)
+        location = data.get('location', UPLOAD_LOCATION)
+
+        if not firebase_game_id:
+            return jsonify({'success': False, 'error': 'firebase_game_id required'}), 400
+
+        if not isinstance(game_number, int) or game_number < 1:
+            return jsonify({'success': False, 'error': 'game_number must be a positive integer'}), 400
+
+        logger.info(f"[VideoProcessing] Starting processing for game {firebase_game_id}, number {game_number}")
+
+        # Process the game videos
+        results = process_game_videos(
+            firebase_game_id=firebase_game_id,
+            game_number=game_number,
+            firebase_service=firebase_service,
+            upload_service=upload_service,
+            video_processor=video_processor,
+            location=location
+        )
+
+        if results['success']:
+            return jsonify(results)
+        else:
+            return jsonify(results), 500
+
+    except Exception as e:
+        logger.error(f"[VideoProcessing] Error: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+
+@app.route('/api/games/<game_id>/preview-extraction', methods=['GET'])
+def preview_game_extraction(game_id):
+    """
+    Preview what would be extracted for a game without actually extracting.
+
+    Returns information about:
+    - Game time range
+    - Overlapping recording sessions
+    - Chapter files that would be used
+    - Estimated extraction parameters
+
+    Returns:
+        {
+            success: true,
+            game: {...},
+            sessions: [{
+                session_id: "...",
+                angle: "FL",
+                chapters: [...],
+                extraction_params: {...}
+            }]
+        }
+    """
+    if not firebase_service:
+        return jsonify({
+            'success': False,
+            'error': 'Firebase service not configured'
+        }), 503
+
+    try:
+        # Get game from Firebase
+        game = firebase_service.get_game(game_id)
+        if not game:
+            return jsonify({
+                'success': False,
+                'error': 'Game not found'
+            }), 404
+
+        created_at = game.get('createdAt')
+        ended_at = game.get('endedAt')
+
+        if not created_at:
+            return jsonify({
+                'success': False,
+                'error': 'Game has no start time'
+            }), 400
+
+        # Parse timestamps
+        game_start = datetime.fromisoformat(created_at.replace('Z', '+00:00'))
+        game_end = datetime.fromisoformat(ended_at.replace('Z', '+00:00')) if ended_at else datetime.now(game_start.tzinfo)
+        game_duration = (game_end - game_start).total_seconds()
+
+        # Find overlapping sessions
+        all_sessions = firebase_service.get_recording_sessions(limit=100)
+        session_previews = []
+
+        for session in all_sessions:
+            session_start_str = session.get('startedAt')
+            session_end_str = session.get('endedAt')
+
+            if not session_start_str:
+                continue
+
+            s_start = datetime.fromisoformat(session_start_str.replace('Z', '+00:00'))
+            s_end = datetime.fromisoformat(session_end_str.replace('Z', '+00:00')) if session_end_str else datetime.now(s_start.tzinfo)
+
+            # Check overlap
+            if s_start < game_end and s_end > game_start:
+                session_name = session.get('segmentSession', '')
+                angle_code = session.get('angleCode', 'UNKNOWN')
+
+                # Get chapters
+                chapters = video_processor.get_session_chapters(session_name)
+
+                # Calculate extraction params
+                if chapters:
+                    params = video_processor.calculate_extraction_params(
+                        game_start, game_end, s_start, chapters
+                    )
+                else:
+                    params = {'error': 'No chapters found'}
+
+                session_previews.append({
+                    'session_id': session.get('id'),
+                    'segment_session': session_name,
+                    'angle': angle_code,
+                    'session_start': session_start_str,
+                    'session_end': session_end_str,
+                    'chapters_count': len(chapters),
+                    'chapters': chapters,
+                    'extraction_params': params
+                })
+
+        return jsonify({
+            'success': True,
+            'game': {
+                'id': game_id,
+                'start': created_at,
+                'end': ended_at,
+                'duration_minutes': round(game_duration / 60, 1)
+            },
+            'overlapping_sessions': len(session_previews),
+            'sessions': session_previews
+        })
+
+    except Exception as e:
+        logger.error(f"[VideoProcessing] Preview error: {e}")
+        import traceback
+        traceback.print_exc()
         return jsonify({
             'success': False,
             'error': str(e)

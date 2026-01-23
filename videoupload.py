@@ -514,6 +514,76 @@ class VideoUploadService:
             logger.error(f"Error listing dates: {e}")
             raise
 
+    def upload_video_with_key(
+        self,
+        video_path: str,
+        s3_key: str,
+        progress_callback=None
+    ) -> str:
+        """
+        Upload a video to S3 with a specific key (no compression).
+
+        This method is used for game video uploads where the key format
+        is: {location}/{date}/game{N}/{date}_game{N}_{angle}.mp4
+
+        Args:
+            video_path: Path to the video file
+            s3_key: Full S3 key to use
+            progress_callback: Optional callback function(percent) for progress updates
+
+        Returns:
+            S3 URI of the uploaded video
+        """
+        if not os.path.exists(video_path):
+            raise FileNotFoundError(f"Video not found: {video_path}")
+
+        try:
+            file_size = os.path.getsize(video_path)
+            logger.info(f"Uploading {video_path} ({file_size / 1024 / 1024:.2f} MB) to s3://{self.bucket_name}/{s3_key}")
+
+            # Create progress callback
+            callback = ProgressCallback(file_size, progress_callback) if file_size > 10 * 1024 * 1024 else None
+
+            # Retry logic for SSL errors on ARM/Jetson devices
+            max_retries = 3
+            last_error = None
+            for attempt in range(max_retries):
+                try:
+                    if callback:
+                        callback.uploaded = 0
+                        callback.last_percentage = 0
+
+                    self.s3_client.upload_file(
+                        video_path,
+                        self.bucket_name,
+                        s3_key,
+                        Callback=callback,
+                        ExtraArgs={'ContentType': 'video/mp4'},
+                        Config=self.transfer_config
+                    )
+                    break
+                except Exception as e:
+                    last_error = e
+                    error_str = str(e).lower()
+                    if 'ssl' in error_str or 'eof' in error_str or 'protocol' in error_str:
+                        logger.warning(f"SSL error on attempt {attempt + 1}/{max_retries}: {e}")
+                        if attempt < max_retries - 1:
+                            import time
+                            time.sleep(2 ** attempt)
+                            continue
+                    raise
+            else:
+                if last_error:
+                    raise last_error
+
+            s3_uri = f"s3://{self.bucket_name}/{s3_key}"
+            logger.info(f"Upload complete: {s3_uri}")
+            return s3_uri
+
+        except ClientError as e:
+            logger.error(f"Error uploading video: {e}")
+            raise
+
 
 class ProgressCallback:
     """Callback class to track upload progress."""
