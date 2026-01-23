@@ -163,7 +163,7 @@ class UballClient:
                 payload["team2_score"] = game_data["team2_score"]
 
             response = requests.post(
-                f"{self.backend_url}/api/games",
+                f"{self.backend_url}/api/games/",
                 json=payload,
                 headers=self._get_headers(),
                 timeout=15
@@ -199,7 +199,7 @@ class UballClient:
 
         try:
             response = requests.get(
-                f"{self.backend_url}/api/games",
+                f"{self.backend_url}/api/games/",
                 params={"firebase_game_id": firebase_game_id},
                 headers=self._get_headers(),
                 timeout=10
@@ -230,7 +230,7 @@ class UballClient:
 
         try:
             response = requests.get(
-                f"{self.backend_url}/api/teams",
+                f"{self.backend_url}/api/teams/",
                 headers=self._get_headers(),
                 timeout=10
             )
@@ -270,7 +270,7 @@ class UballClient:
             payload = {"name": name}
 
             response = requests.post(
-                f"{self.backend_url}/api/teams",
+                f"{self.backend_url}/api/teams/",
                 json=payload,
                 headers=self._get_headers(),
                 timeout=10
@@ -385,7 +385,7 @@ class UballClient:
                 payload["file_size"] = file_size
 
             response = requests.post(
-                f"{self.backend_url}/api/videos",
+                f"{self.backend_url}/api/videos/",
                 json=payload,
                 headers=self._get_headers(),
                 timeout=15
