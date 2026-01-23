@@ -2,7 +2,7 @@
 Uball Backend API Client for game synchronization.
 
 This module provides functionality to:
-- Authenticate with Uball Backend (Supabase-based)
+- Authenticate with Uball Backend
 - Create games with Firebase game ID linkage
 - Register videos for games
 
@@ -61,7 +61,9 @@ class UballClient:
 
     def _authenticate(self) -> bool:
         """
-        Authenticate with Uball Backend and obtain access token.
+        Authenticate with Uball Backend to obtain access token.
+
+        Uses Backend Auth API: POST /api/v1/auth/login
 
         Returns:
             True if authentication successful, False otherwise
@@ -69,6 +71,9 @@ class UballClient:
         try:
             response = requests.post(
                 f"{self.backend_url}/api/v1/auth/login",
+                headers={
+                    "Content-Type": "application/json"
+                },
                 json={
                     "email": self.email,
                     "password": self.password
@@ -83,20 +88,15 @@ class UballClient:
             data = response.json()
 
             # Extract tokens from response
-            # Supabase returns session with access_token, refresh_token, expires_in
-            session = data.get('session', data)
-            self._access_token = session.get('access_token')
-            self._refresh_token = session.get('refresh_token')
+            self._access_token = data.get('access_token')
+            self._refresh_token = data.get('refresh_token')
+            self._user_id = data.get('user_id')
 
             # Calculate expiry time
-            expires_in = session.get('expires_in', 3600)  # Default 1 hour
+            expires_in = data.get('expires_in', 3600)  # Default 1 hour
             self._token_expires_at = datetime.now() + timedelta(seconds=expires_in)
 
-            # Get user ID
-            user = data.get('user', {})
-            self._user_id = user.get('id')
-
-            logger.info(f"[UballClient] Authenticated successfully (user: {self._user_id})")
+            logger.info(f"[UballClient] Authenticated (user: {self._user_id})")
             return True
 
         except requests.exceptions.RequestException as e:
