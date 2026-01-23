@@ -22,6 +22,7 @@ import re
 from videoupload import VideoUploadService
 from media_service import get_media_service
 from logging_service import get_logging_service, get_logger
+from firebase_service import get_firebase_service
 
 # Initialize logging service first
 logging_service = get_logging_service()
@@ -62,6 +63,13 @@ if UPLOAD_ENABLED:
             print(f"⚠ Failed to initialize upload service: {e}")
     else:
         print("⚠ Upload enabled but AWS credentials not found in environment")
+
+# Initialize Firebase service
+firebase_service = get_firebase_service()
+if firebase_service:
+    print(f"✓ Firebase service initialized (Jetson ID: {firebase_service.jetson_id})")
+else:
+    print("⚠ Firebase service not available - recording sessions will not be registered")
 
 # Global state
 recording_processes = {}
@@ -457,6 +465,20 @@ def start_recording(gopro_id):
         session_dir = os.path.join(SEGMENTS_DIR, session_id)
         os.makedirs(session_dir, exist_ok=True)
 
+        # Register recording session in Firebase
+        firebase_session_id = None
+        if firebase_service:
+            try:
+                session_data = {
+                    'camera_name': camera_name,
+                    'segment_session': session_id,
+                    'interface_id': gopro_id
+                }
+                firebase_session_id = firebase_service.register_recording_start(session_data)
+                logger.info(f"[{gopro_id}] Registered recording in Firebase: {firebase_session_id}")
+            except Exception as e:
+                logger.warning(f"[{gopro_id}] Failed to register in Firebase (continuing anyway): {e}")
+
         # Store recording state (video_path and video_filename will be generated at stop time)
         with recording_lock:
             recording_processes[gopro_id] = {
@@ -472,6 +494,7 @@ def start_recording(gopro_id):
                 'video_filename': None,  # Will be set at stop time
                 'session_id': session_id,
                 'session_dir': session_dir,
+                'firebase_session_id': firebase_session_id,  # Firebase document ID
                 'error': None,
                 'stage': 'recording',
                 'stage_message': 'Recording...'
@@ -483,7 +506,8 @@ def start_recording(gopro_id):
             'gopro_id': gopro_id,
             'gopro_ip': gopro_ip,
             'camera_name': camera_name,
-            'session_id': session_id
+            'session_id': session_id,
+            'firebase_session_id': firebase_session_id
         })
 
     except requests.exceptions.Timeout:
@@ -522,6 +546,7 @@ def stop_recording(gopro_id):
         pre_record_files = recording_info.get('pre_record_files', set())
         camera_name = recording_info.get('camera_name', f'GoPro-{gopro_id[-4:]}')
         start_datetime = recording_info.get('start_datetime', datetime.now())
+        firebase_session_id = recording_info.get('firebase_session_id')
 
         # Generate filename with format: YYYYMMDD HHMMSS - HHMMSS camera_name.mp4
         stop_datetime = datetime.now()
@@ -653,12 +678,33 @@ def stop_recording(gopro_id):
 
                 logger.info(f"[{gopro_id}] Total download size: {total_size_gb:.2f} GB")
 
+                # Update Firebase with recording stop info
+                if firebase_service and firebase_session_id:
+                    try:
+                        stop_data = {
+                            'total_chapters': len(new_chapters),
+                            'total_size_bytes': total_size_bytes
+                        }
+                        firebase_service.register_recording_stop(firebase_session_id, stop_data)
+                        logger.info(f"[{gopro_id}] Updated Firebase session: {firebase_session_id}")
+                    except Exception as e:
+                        logger.warning(f"[{gopro_id}] Failed to update Firebase (continuing anyway): {e}")
+
                 logger.info(f"[{gopro_id}] Found {len(new_chapters)} new chapters to download")
                 for ch in new_chapters:
                     logger.info(f"[{gopro_id}]   - {ch['filename']} ({ch['size']} bytes)")
 
                 if not new_chapters:
                     logger.warning(f"[{gopro_id}] No new chapters found")
+                    # Still update Firebase even if no chapters (edge case)
+                    if firebase_service and firebase_session_id:
+                        try:
+                            firebase_service.register_recording_stop(firebase_session_id, {
+                                'total_chapters': 0,
+                                'total_size_bytes': 0
+                            })
+                        except Exception as e:
+                            logger.warning(f"[{gopro_id}] Failed to update Firebase: {e}")
                     with recording_lock:
                         if gopro_id in recording_processes:
                             del recording_processes[gopro_id]
@@ -750,6 +796,14 @@ def stop_recording(gopro_id):
                                 )
                                 logger.info(f"[{gopro_id}] Video uploaded to: {s3_uri}")
 
+                                # Update Firebase session status to 'uploaded'
+                                if firebase_service and firebase_session_id:
+                                    try:
+                                        firebase_service.update_session_status(firebase_session_id, 'uploaded')
+                                        logger.info(f"[{gopro_id}] Firebase session marked as uploaded")
+                                    except Exception as e:
+                                        logger.warning(f"[{gopro_id}] Failed to update Firebase status: {e}")
+
                                 # Update stage: done
                                 with recording_lock:
                                     if gopro_id in recording_processes:
@@ -836,6 +890,171 @@ def recording_status(gopro_id):
             'stage_message': info.get('stage_message', 'Recording...'),
             'error': info.get('error')
         })
+
+
+# ==================== Recording Session Registration ====================
+
+@app.route('/api/recording/register', methods=['POST'])
+def register_recording_session():
+    """
+    Register a recording session in Firebase.
+    Can be called manually or is called automatically when recording starts/stops.
+
+    Request Body:
+    {
+        "gopro_id": "enxd43260ef4d38",
+        "camera_name": "GoPro FL",
+        "segment_session": "enxd43260ef4d38_20250120_140530",
+        "action": "start" | "stop",
+        "total_chapters": 3,      // Only for stop
+        "total_size_bytes": 12345678  // Only for stop
+    }
+
+    Returns:
+        For start: { success: true, firebase_session_id: "..." }
+        For stop: { success: true, message: "Session updated" }
+    """
+    if not firebase_service:
+        return jsonify({
+            'success': False,
+            'error': 'Firebase service not configured'
+        }), 503
+
+    try:
+        data = request.get_json()
+        if not data:
+            return jsonify({'success': False, 'error': 'Request body required'}), 400
+
+        action = data.get('action')
+        if action not in ['start', 'stop']:
+            return jsonify({'success': False, 'error': 'action must be "start" or "stop"'}), 400
+
+        gopro_id = data.get('gopro_id', '')
+        camera_name = data.get('camera_name', '')
+        segment_session = data.get('segment_session', '')
+
+        if action == 'start':
+            # Register new recording session
+            session_data = {
+                'camera_name': camera_name,
+                'segment_session': segment_session,
+                'interface_id': gopro_id
+            }
+
+            firebase_session_id = firebase_service.register_recording_start(session_data)
+            logger.info(f"[Firebase] Registered recording start: {firebase_session_id}")
+
+            return jsonify({
+                'success': True,
+                'firebase_session_id': firebase_session_id,
+                'message': 'Recording session registered'
+            })
+
+        else:  # action == 'stop'
+            # Find the session by segment_session name
+            session = firebase_service.find_session_by_segment(segment_session)
+
+            if not session:
+                return jsonify({
+                    'success': False,
+                    'error': f'Session not found for segment: {segment_session}'
+                }), 404
+
+            stop_data = {
+                'total_chapters': data.get('total_chapters', 0),
+                'total_size_bytes': data.get('total_size_bytes', 0)
+            }
+
+            firebase_service.register_recording_stop(session['id'], stop_data)
+            logger.info(f"[Firebase] Registered recording stop: {session['id']}")
+
+            return jsonify({
+                'success': True,
+                'firebase_session_id': session['id'],
+                'message': 'Recording session updated'
+            })
+
+    except Exception as e:
+        logger.error(f"[Firebase] Error registering recording session: {e}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+
+@app.route('/api/recording/sessions', methods=['GET'])
+def list_recording_sessions():
+    """
+    List recording sessions from Firebase.
+
+    Query params:
+        jetson_id: Optional filter by Jetson ID
+        limit: Maximum number of sessions to return (default 50)
+
+    Returns:
+        { success: true, sessions: [...] }
+    """
+    if not firebase_service:
+        return jsonify({
+            'success': False,
+            'error': 'Firebase service not configured'
+        }), 503
+
+    try:
+        jetson_id = request.args.get('jetson_id')
+        limit = request.args.get('limit', 50, type=int)
+
+        sessions = firebase_service.get_recording_sessions(jetson_id=jetson_id, limit=limit)
+
+        return jsonify({
+            'success': True,
+            'count': len(sessions),
+            'sessions': sessions
+        })
+
+    except Exception as e:
+        logger.error(f"[Firebase] Error listing recording sessions: {e}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+
+@app.route('/api/recording/sessions/<session_id>', methods=['GET'])
+def get_recording_session(session_id):
+    """
+    Get a specific recording session from Firebase.
+
+    Returns:
+        { success: true, session: {...} }
+    """
+    if not firebase_service:
+        return jsonify({
+            'success': False,
+            'error': 'Firebase service not configured'
+        }), 503
+
+    try:
+        session = firebase_service.get_recording_session(session_id)
+
+        if not session:
+            return jsonify({
+                'success': False,
+                'error': 'Session not found'
+            }), 404
+
+        return jsonify({
+            'success': True,
+            'session': session
+        })
+
+    except Exception as e:
+        logger.error(f"[Firebase] Error getting recording session: {e}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
 
 @app.route('/api/videos', methods=['GET'])
 def list_videos():
