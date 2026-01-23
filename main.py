@@ -1283,9 +1283,15 @@ def sync_game_to_uball():
             'source': 'firebase'
         }
 
-        # Add scores if available (from leftTeam/rightTeam finalScore)
+        # Add scores and video_name from leftTeam/rightTeam
         left_team = firebase_game.get('leftTeam', {})
         right_team = firebase_game.get('rightTeam', {})
+
+        # Set video_name as "TEAM1 vs TEAM2"
+        team1_name = left_team.get('name', 'Team 1')
+        team2_name = right_team.get('name', 'Team 2')
+        uball_game_data['video_name'] = f"{team1_name} vs {team2_name}"
+
         if left_team.get('finalScore') is not None:
             uball_game_data['team1_score'] = left_team['finalScore']
         if right_team.get('finalScore') is not None:
