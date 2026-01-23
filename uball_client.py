@@ -63,14 +63,14 @@ class UballClient:
         """
         Authenticate with Uball Backend to obtain access token.
 
-        Uses Backend Auth API: POST /api/v1/auth/login
+        Uses Backend Auth API: POST /api/auth/login
 
         Returns:
             True if authentication successful, False otherwise
         """
         try:
             response = requests.post(
-                f"{self.backend_url}/api/v1/auth/login",
+                f"{self.backend_url}/api/auth/login",
                 headers={
                     "Content-Type": "application/json"
                 },
@@ -163,7 +163,7 @@ class UballClient:
                 payload["team2_score"] = game_data["team2_score"]
 
             response = requests.post(
-                f"{self.backend_url}/api/v1/games",
+                f"{self.backend_url}/api/games",
                 json=payload,
                 headers=self._get_headers(),
                 timeout=15
@@ -199,7 +199,7 @@ class UballClient:
 
         try:
             response = requests.get(
-                f"{self.backend_url}/api/v1/games",
+                f"{self.backend_url}/api/games",
                 params={"firebase_game_id": firebase_game_id},
                 headers=self._get_headers(),
                 timeout=10
@@ -230,7 +230,7 @@ class UballClient:
 
         try:
             response = requests.get(
-                f"{self.backend_url}/api/v1/teams",
+                f"{self.backend_url}/api/teams",
                 headers=self._get_headers(),
                 timeout=10
             )
@@ -343,7 +343,7 @@ class UballClient:
                 payload["file_size"] = file_size
 
             response = requests.post(
-                f"{self.backend_url}/api/v1/videos",
+                f"{self.backend_url}/api/videos",
                 json=payload,
                 headers=self._get_headers(),
                 timeout=15
@@ -379,7 +379,7 @@ class UballClient:
 
         try:
             response = requests.get(
-                f"{self.backend_url}/api/v1/games/{game_id}/videos",
+                f"{self.backend_url}/api/games/{game_id}/videos",
                 headers=self._get_headers(),
                 timeout=10
             )
