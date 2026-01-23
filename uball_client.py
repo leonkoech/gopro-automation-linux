@@ -272,6 +272,188 @@ class UballClient:
             logger.error(f"[UballClient] Health check failed: {e}")
             return False
 
+    # ==================== Video Registration Methods ====================
+
+    @staticmethod
+    def angle_code_to_uball_angle(angle_code: str) -> Optional[str]:
+        """
+        Convert GoPro angle code to Uball angle name.
+
+        Only FL and FR are registered in Uball Backend.
+        NL and NR are uploaded to S3 but not registered.
+
+        Args:
+            angle_code: GoPro angle code (FL, FR, NL, NR)
+
+        Returns:
+            Uball angle name (LEFT, RIGHT) or None if not applicable
+        """
+        mapping = {
+            'FL': 'LEFT',   # Far Left -> LEFT
+            'FR': 'RIGHT',  # Far Right -> RIGHT
+        }
+        return mapping.get(angle_code.upper())
+
+    def register_video(
+        self,
+        game_id: str,
+        s3_key: str,
+        angle: str,
+        filename: str,
+        duration: Optional[float] = None,
+        file_size: Optional[int] = None,
+        s3_bucket: str = 'jetson-videos-uball'
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Register a video in Uball Backend's video_metadata.
+
+        Args:
+            game_id: Uball game UUID
+            s3_key: S3 object key for the video
+            angle: Uball angle name (LEFT or RIGHT)
+            filename: Video filename
+            duration: Video duration in seconds
+            file_size: Video file size in bytes
+            s3_bucket: S3 bucket name
+
+        Returns:
+            Created video metadata or None on failure
+        """
+        if not self._ensure_authenticated():
+            logger.error("[UballClient] Failed to authenticate for video registration")
+            return None
+
+        if angle not in ['LEFT', 'RIGHT']:
+            logger.warning(f"[UballClient] Invalid angle '{angle}' - only LEFT/RIGHT supported")
+            return None
+
+        try:
+            payload = {
+                "game_id": game_id,
+                "s3_key": s3_key,
+                "s3_bucket": s3_bucket,
+                "angle": angle,
+                "filename": filename,
+                "status": "uploaded"
+            }
+
+            if duration is not None:
+                payload["duration"] = duration
+            if file_size is not None:
+                payload["file_size"] = file_size
+
+            response = requests.post(
+                f"{self.backend_url}/api/v1/videos",
+                json=payload,
+                headers=self._get_headers(),
+                timeout=15
+            )
+
+            if response.status_code in [200, 201]:
+                result = response.json()
+                logger.info(f"[UballClient] Video registered: {result.get('id')} for game {game_id}")
+                return result
+            else:
+                logger.error(f"[UballClient] Register video failed: {response.status_code} - {response.text}")
+                return None
+
+        except requests.exceptions.RequestException as e:
+            logger.error(f"[UballClient] Register video request failed: {e}")
+            return None
+        except Exception as e:
+            logger.error(f"[UballClient] Register video error: {e}")
+            return None
+
+    def get_videos_for_game(self, game_id: str) -> List[Dict[str, Any]]:
+        """
+        Get all registered videos for a game.
+
+        Args:
+            game_id: Uball game UUID
+
+        Returns:
+            List of video metadata objects
+        """
+        if not self._ensure_authenticated():
+            return []
+
+        try:
+            response = requests.get(
+                f"{self.backend_url}/api/v1/games/{game_id}/videos",
+                headers=self._get_headers(),
+                timeout=10
+            )
+
+            if response.status_code == 200:
+                data = response.json()
+                if isinstance(data, list):
+                    return data
+                elif isinstance(data, dict) and 'videos' in data:
+                    return data['videos']
+            return []
+
+        except Exception as e:
+            logger.error(f"[UballClient] Get videos for game failed: {e}")
+            return []
+
+    def register_game_video(
+        self,
+        firebase_game_id: str,
+        s3_key: str,
+        angle_code: str,
+        filename: str,
+        duration: Optional[float] = None,
+        file_size: Optional[int] = None,
+        s3_bucket: str = 'jetson-videos-uball'
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Register a video for a game, looking up game by Firebase ID.
+
+        This is a convenience method that:
+        1. Converts angle code (FL/FR) to Uball angle (LEFT/RIGHT)
+        2. Looks up the Uball game ID from Firebase game ID
+        3. Registers the video
+
+        Args:
+            firebase_game_id: Firebase game document ID
+            s3_key: S3 object key
+            angle_code: GoPro angle code (FL, FR)
+            filename: Video filename
+            duration: Video duration in seconds
+            file_size: Video file size in bytes
+            s3_bucket: S3 bucket name
+
+        Returns:
+            Created video metadata or None on failure
+        """
+        # Convert angle code
+        uball_angle = self.angle_code_to_uball_angle(angle_code)
+        if not uball_angle:
+            logger.info(f"[UballClient] Angle {angle_code} not registered in Uball (only FL/FR)")
+            return None
+
+        # Look up Uball game ID
+        game = self.get_game_by_firebase_id(firebase_game_id)
+        if not game:
+            logger.error(f"[UballClient] Game not found for Firebase ID: {firebase_game_id}")
+            return None
+
+        uball_game_id = str(game.get('id', ''))
+        if not uball_game_id:
+            logger.error(f"[UballClient] Game has no ID")
+            return None
+
+        # Register the video
+        return self.register_video(
+            game_id=uball_game_id,
+            s3_key=s3_key,
+            angle=uball_angle,
+            filename=filename,
+            duration=duration,
+            file_size=file_size,
+            s3_bucket=s3_bucket
+        )
+
 
 # Singleton instance
 _uball_client: Optional[UballClient] = None

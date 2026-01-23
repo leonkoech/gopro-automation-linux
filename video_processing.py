@@ -395,7 +395,9 @@ def process_game_videos(
     firebase_service,
     upload_service,
     video_processor: VideoProcessor,
-    location: str = 'default-location'
+    location: str = 'default-location',
+    uball_client=None,
+    s3_bucket: str = 'jetson-videos-uball'
 ) -> Dict[str, Any]:
     """
     Process videos for a specific game.
@@ -409,6 +411,8 @@ def process_game_videos(
         upload_service: Video upload service instance
         video_processor: VideoProcessor instance
         location: Location name for S3 path
+        uball_client: Optional Uball client for registering FL/FR videos
+        s3_bucket: S3 bucket name for Uball registration
 
     Returns:
         Dict with processing results
@@ -418,6 +422,7 @@ def process_game_videos(
         'game_number': game_number,
         'success': False,
         'processed_videos': [],
+        'registered_videos': [],  # Videos registered in Uball (FL/FR only)
         'errors': []
     }
 
@@ -541,15 +546,46 @@ def process_game_videos(
                         's3_key': s3_key
                     })
 
-                    results['processed_videos'].append({
+                    video_result = {
                         'angle': angle_code,
                         'session_id': session['id'],
                         'filename': output_filename,
                         's3_key': s3_key,
                         's3_uri': s3_uri,
                         'duration': video_info.get('duration'),
+                        'size_bytes': video_info.get('size_bytes', 0),
                         'size_mb': round(video_info.get('size_bytes', 0) / (1024 * 1024), 2)
-                    })
+                    }
+
+                    results['processed_videos'].append(video_result)
+
+                    # 5. Register FL/FR videos in Uball Backend
+                    if uball_client and angle_code in ['FL', 'FR']:
+                        try:
+                            uball_result = uball_client.register_game_video(
+                                firebase_game_id=firebase_game_id,
+                                s3_key=s3_key,
+                                angle_code=angle_code,
+                                filename=output_filename,
+                                duration=video_info.get('duration'),
+                                file_size=video_info.get('size_bytes'),
+                                s3_bucket=s3_bucket
+                            )
+
+                            if uball_result:
+                                logger.info(f"Registered {angle_code} video in Uball: {uball_result.get('id')}")
+                                results['registered_videos'].append({
+                                    'angle': angle_code,
+                                    'uball_video_id': uball_result.get('id'),
+                                    's3_key': s3_key
+                                })
+                            else:
+                                logger.warning(f"Failed to register {angle_code} video in Uball")
+                                results['errors'].append(f"Uball registration failed for {angle_code}")
+
+                        except Exception as e:
+                            logger.error(f"Uball registration error for {angle_code}: {e}")
+                            results['errors'].append(f"Uball registration error for {angle_code}: {str(e)}")
 
                     # Clean up local file after upload
                     try:

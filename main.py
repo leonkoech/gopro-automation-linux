@@ -1473,14 +1473,16 @@ def process_game_videos_endpoint():
 
         logger.info(f"[VideoProcessing] Starting processing for game {firebase_game_id}, number {game_number}")
 
-        # Process the game videos
+        # Process the game videos (uball_client will auto-register FL/FR videos)
         results = process_game_videos(
             firebase_game_id=firebase_game_id,
             game_number=game_number,
             firebase_service=firebase_service,
             upload_service=upload_service,
             video_processor=video_processor,
-            location=location
+            location=location,
+            uball_client=uball_client,
+            s3_bucket=UPLOAD_BUCKET
         )
 
         if results['success']:
@@ -1607,6 +1609,134 @@ def preview_game_extraction(game_id):
         logger.error(f"[VideoProcessing] Preview error: {e}")
         import traceback
         traceback.print_exc()
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+
+@app.route('/api/games/register-video', methods=['POST'])
+def register_video_in_uball():
+    """
+    Manually register a video in Uball Backend.
+
+    Use this endpoint to register videos that were uploaded outside of
+    the normal processing flow, or to retry failed registrations.
+
+    Request Body:
+    {
+        "firebase_game_id": "abc123",
+        "s3_key": "court-a/2025-01-20/game1/2025-01-20_game1_FL.mp4",
+        "angle_code": "FL",           // FL or FR only
+        "filename": "2025-01-20_game1_FL.mp4",
+        "duration": 3600.5,           // Optional, seconds
+        "file_size": 1234567890       // Optional, bytes
+    }
+
+    Returns:
+        { success: true, video: {...} }
+    """
+    if not uball_client:
+        return jsonify({
+            'success': False,
+            'error': 'Uball Backend client not configured'
+        }), 503
+
+    try:
+        data = request.get_json()
+        if not data:
+            return jsonify({'success': False, 'error': 'Request body required'}), 400
+
+        firebase_game_id = data.get('firebase_game_id')
+        s3_key = data.get('s3_key')
+        angle_code = data.get('angle_code', '').upper()
+        filename = data.get('filename')
+        duration = data.get('duration')
+        file_size = data.get('file_size')
+
+        if not firebase_game_id:
+            return jsonify({'success': False, 'error': 'firebase_game_id required'}), 400
+        if not s3_key:
+            return jsonify({'success': False, 'error': 's3_key required'}), 400
+        if not filename:
+            return jsonify({'success': False, 'error': 'filename required'}), 400
+        if angle_code not in ['FL', 'FR']:
+            return jsonify({
+                'success': False,
+                'error': 'angle_code must be FL or FR (only these angles are registered in Uball)'
+            }), 400
+
+        # Register the video
+        result = uball_client.register_game_video(
+            firebase_game_id=firebase_game_id,
+            s3_key=s3_key,
+            angle_code=angle_code,
+            filename=filename,
+            duration=duration,
+            file_size=file_size,
+            s3_bucket=UPLOAD_BUCKET
+        )
+
+        if result:
+            return jsonify({
+                'success': True,
+                'video': result
+            })
+        else:
+            return jsonify({
+                'success': False,
+                'error': 'Failed to register video in Uball'
+            }), 500
+
+    except Exception as e:
+        logger.error(f"[VideoRegistration] Error: {e}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+
+@app.route('/api/games/<game_id>/videos', methods=['GET'])
+def get_game_videos_from_uball(game_id):
+    """
+    Get all registered videos for a game from Uball Backend.
+
+    Args:
+        game_id: Firebase game ID
+
+    Returns:
+        { success: true, videos: [...] }
+    """
+    if not uball_client:
+        return jsonify({
+            'success': False,
+            'error': 'Uball Backend client not configured'
+        }), 503
+
+    try:
+        # First get the Uball game ID from Firebase game ID
+        game = uball_client.get_game_by_firebase_id(game_id)
+        if not game:
+            return jsonify({
+                'success': False,
+                'error': f'Game not found for Firebase ID: {game_id}'
+            }), 404
+
+        uball_game_id = str(game.get('id', ''))
+
+        # Get videos for this game
+        videos = uball_client.get_videos_for_game(uball_game_id)
+
+        return jsonify({
+            'success': True,
+            'firebase_game_id': game_id,
+            'uball_game_id': uball_game_id,
+            'count': len(videos),
+            'videos': videos
+        })
+
+    except Exception as e:
+        logger.error(f"[VideoRegistration] Error getting videos: {e}")
         return jsonify({
             'success': False,
             'error': str(e)
