@@ -249,6 +249,48 @@ class UballClient:
             logger.error(f"[UballClient] List teams failed: {e}")
             return []
 
+    def create_team(self, name: str) -> Optional[Dict[str, Any]]:
+        """
+        Create a new team in Uball Backend.
+
+        Always creates a new team - even if same name exists,
+        because different games can have different rosters.
+
+        Args:
+            name: Team name
+
+        Returns:
+            Created team data with UUID, or None on failure
+        """
+        if not self._ensure_authenticated():
+            logger.error("[UballClient] Failed to authenticate for team creation")
+            return None
+
+        try:
+            payload = {"name": name}
+
+            response = requests.post(
+                f"{self.backend_url}/api/teams",
+                json=payload,
+                headers=self._get_headers(),
+                timeout=10
+            )
+
+            if response.status_code in [200, 201]:
+                result = response.json()
+                logger.info(f"[UballClient] Team created: {result.get('id')} ({name})")
+                return result
+            else:
+                logger.error(f"[UballClient] Create team failed: {response.status_code} - {response.text}")
+                return None
+
+        except requests.exceptions.RequestException as e:
+            logger.error(f"[UballClient] Create team request failed: {e}")
+            return None
+        except Exception as e:
+            logger.error(f"[UballClient] Create team error: {e}")
+            return None
+
     def health_check(self) -> bool:
         """
         Check if Uball Backend is reachable and authentication works.

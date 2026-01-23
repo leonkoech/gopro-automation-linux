@@ -1160,20 +1160,23 @@ def sync_game_to_uball():
     Request Body:
     {
         "firebase_game_id": "abc123",
-        "team1_id": "uuid-of-team1",  // Uball team UUID
-        "team2_id": "uuid-of-team2"   // Uball team UUID
+        "team1_id": "uuid-of-team1",  // Optional - Uball team UUID
+        "team2_id": "uuid-of-team2"   // Optional - Uball team UUID
     }
+
+    If team IDs not provided, teams are auto-created from Firebase game data.
+    Each game creates NEW teams (even if same name exists) because rosters differ.
 
     Flow:
     1. Fetch game from Firebase (basketball-games collection)
     2. Extract: createdAt, endedAt, teams, scores
-    3. Authenticate with Uball Backend
+    3. Auto-create teams in Uball Backend if not provided
     4. Create game in Supabase with firebase_game_id linkage
     5. Mark game as synced in Firebase
     6. Return Uball game_id
 
     Returns:
-        { success: true, uball_game_id: "...", firebase_game_id: "..." }
+        { success: true, uball_game_id: "...", firebase_game_id: "...", teams_created: [...] }
     """
     if not firebase_service:
         return jsonify({
@@ -1198,8 +1201,6 @@ def sync_game_to_uball():
 
         if not firebase_game_id:
             return jsonify({'success': False, 'error': 'firebase_game_id required'}), 400
-        if not team1_id or not team2_id:
-            return jsonify({'success': False, 'error': 'team1_id and team2_id required'}), 400
 
         # 1. Fetch game from Firebase
         firebase_game = firebase_service.get_game(firebase_game_id)
@@ -1230,7 +1231,42 @@ def sync_game_to_uball():
                 'firebase_game_id': firebase_game_id
             })
 
-        # 3. Prepare game data for Uball Backend
+        # 3. Auto-create teams if not provided
+        teams_created = []
+
+        if not team1_id:
+            # Extract team1 name from Firebase (leftTeam)
+            left_team = firebase_game.get('leftTeam', {})
+            team1_name = left_team.get('name', 'Team 1')
+
+            created_team1 = uball_client.create_team(team1_name)
+            if not created_team1:
+                return jsonify({
+                    'success': False,
+                    'error': f'Failed to create team: {team1_name}'
+                }), 500
+
+            team1_id = str(created_team1.get('id'))
+            teams_created.append({'name': team1_name, 'id': team1_id, 'side': 'left'})
+            logger.info(f"[GameSync] Auto-created team1: {team1_name} -> {team1_id}")
+
+        if not team2_id:
+            # Extract team2 name from Firebase (rightTeam)
+            right_team = firebase_game.get('rightTeam', {})
+            team2_name = right_team.get('name', 'Team 2')
+
+            created_team2 = uball_client.create_team(team2_name)
+            if not created_team2:
+                return jsonify({
+                    'success': False,
+                    'error': f'Failed to create team: {team2_name}'
+                }), 500
+
+            team2_id = str(created_team2.get('id'))
+            teams_created.append({'name': team2_name, 'id': team2_id, 'side': 'right'})
+            logger.info(f"[GameSync] Auto-created team2: {team2_name} -> {team2_id}")
+
+        # 4. Prepare game data for Uball Backend
         created_at = firebase_game.get('createdAt', '')
         ended_at = firebase_game.get('endedAt')
 
@@ -1247,14 +1283,22 @@ def sync_game_to_uball():
             'source': 'firebase'
         }
 
-        # Add scores if available
+        # Add scores if available (from leftTeam/rightTeam finalScore)
+        left_team = firebase_game.get('leftTeam', {})
+        right_team = firebase_game.get('rightTeam', {})
+        if left_team.get('finalScore') is not None:
+            uball_game_data['team1_score'] = left_team['finalScore']
+        if right_team.get('finalScore') is not None:
+            uball_game_data['team2_score'] = right_team['finalScore']
+
+        # Legacy score format support
         if firebase_game.get('score'):
             score = firebase_game['score']
             if isinstance(score, dict):
                 uball_game_data['team1_score'] = score.get('home', score.get('team1'))
                 uball_game_data['team2_score'] = score.get('away', score.get('team2'))
 
-        # 4. Create game in Uball Backend
+        # 5. Create game in Uball Backend
         logger.info(f"[GameSync] Creating game in Uball: {firebase_game_id}")
         uball_game = uball_client.create_game(uball_game_data)
 
@@ -1266,17 +1310,23 @@ def sync_game_to_uball():
 
         uball_game_id = str(uball_game.get('id', ''))
 
-        # 5. Mark game as synced in Firebase
+        # 6. Mark game as synced in Firebase
         firebase_service.mark_game_synced(firebase_game_id, uball_game_id)
         logger.info(f"[GameSync] Game synced: Firebase {firebase_game_id} -> Uball {uball_game_id}")
 
-        return jsonify({
+        response_data = {
             'success': True,
             'message': 'Game synced successfully',
             'uball_game_id': uball_game_id,
             'firebase_game_id': firebase_game_id,
             'game': uball_game
-        })
+        }
+
+        # Include teams created info if any
+        if teams_created:
+            response_data['teams_created'] = teams_created
+
+        return jsonify(response_data)
 
     except Exception as e:
         logger.error(f"[GameSync] Error syncing game: {e}")
