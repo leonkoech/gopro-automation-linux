@@ -897,6 +897,114 @@ def system_info():
             'error': str(e)
         }), 500
 
+
+@app.route('/api/system/ntp', methods=['GET'])
+def get_ntp_status():
+    """
+    Check NTP synchronization status using chronyc.
+
+    Returns:
+        JSON with NTP sync info:
+        - synced: Whether the system is synchronized
+        - offset_ms: Time offset from NTP server in milliseconds
+        - stratum: Stratum level (1 = primary server, 2+ = derived)
+        - source: Current NTP source
+        - warning: Present if offset > 500ms
+    """
+    try:
+        result = subprocess.run(
+            ['chronyc', 'tracking'],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+
+        if result.returncode != 0:
+            # chronyc not available or failed
+            return jsonify({
+                'success': True,
+                'synced': False,
+                'error': 'chronyc command failed or not available',
+                'stderr': result.stderr
+            })
+
+        output = result.stdout
+        response = {
+            'success': True,
+            'synced': False,
+            'offset_ms': None,
+            'stratum': None,
+            'source': None,
+            'raw_output': output
+        }
+
+        # Parse chronyc tracking output
+        for line in output.split('\n'):
+            line = line.strip()
+
+            # Reference ID line: "Reference ID    : 203.0.113.1 (time.example.com)"
+            if line.startswith('Reference ID'):
+                parts = line.split(':', 1)
+                if len(parts) > 1:
+                    source_part = parts[1].strip()
+                    # Extract the hostname/IP from parentheses if present
+                    if '(' in source_part and ')' in source_part:
+                        response['source'] = source_part.split('(')[1].split(')')[0]
+                    else:
+                        response['source'] = source_part.split()[0] if source_part else None
+
+            # Stratum line: "Stratum         : 2"
+            elif line.startswith('Stratum'):
+                parts = line.split(':', 1)
+                if len(parts) > 1:
+                    try:
+                        response['stratum'] = int(parts[1].strip())
+                    except ValueError:
+                        pass
+
+            # System time line: "System time     : 0.000012345 seconds fast of NTP time"
+            elif line.startswith('System time'):
+                parts = line.split(':', 1)
+                if len(parts) > 1:
+                    time_part = parts[1].strip()
+                    # Extract the seconds value
+                    try:
+                        seconds_str = time_part.split()[0]
+                        offset_seconds = float(seconds_str)
+                        response['offset_ms'] = round(offset_seconds * 1000, 3)
+                    except (ValueError, IndexError):
+                        pass
+
+            # Leap status line: "Leap status     : Normal"
+            elif line.startswith('Leap status'):
+                parts = line.split(':', 1)
+                if len(parts) > 1:
+                    leap_status = parts[1].strip()
+                    response['synced'] = leap_status.lower() == 'normal'
+
+        # Add warning if offset is too high
+        if response['offset_ms'] is not None and abs(response['offset_ms']) > 500:
+            response['warning'] = f"Time offset ({response['offset_ms']}ms) exceeds 500ms threshold"
+
+        return jsonify(response)
+
+    except subprocess.TimeoutExpired:
+        return jsonify({
+            'success': False,
+            'error': 'chronyc command timed out'
+        }), 500
+    except FileNotFoundError:
+        return jsonify({
+            'success': True,
+            'synced': False,
+            'error': 'chronyc not installed. Install chrony for NTP sync.'
+        })
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
 @app.route('/api/videos/<filename>/download', methods=['GET'])
 def download_video(filename):
     """Download a specific video file"""
