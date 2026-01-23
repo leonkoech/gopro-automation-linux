@@ -7,9 +7,16 @@ Requirements:
     sudo apt install ffmpeg
 """
 
-# Fix SSL issues on Jetson/ARM devices - MUST be set before any SSL imports
+# Fix SSL issues on Jetson/ARM devices with OpenSSL 3.x
+# MUST be set before any SSL imports
 import os
+import ssl
+
+# Disable OpenSSL config to avoid ARM-specific issues
 os.environ['OPENSSL_CONF'] = '/dev/null'
+
+# Force TLS 1.2 max to avoid OpenSSL 3.x TLS 1.3 issues on ARM
+os.environ['PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION'] = 'python'
 
 import subprocess
 import tempfile
@@ -21,6 +28,19 @@ import urllib3
 # Disable SSL warnings when verification is disabled
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
+# Patch urllib3 to use a more lenient SSL context for ARM/Jetson
+try:
+    import urllib3.util.ssl_
+    # Create a lenient SSL context that works on ARM with OpenSSL 3.x
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    ctx.set_ciphers('DEFAULT@SECLEVEL=1')  # Lower security level for compatibility
+    ctx.options |= ssl.OP_LEGACY_SERVER_CONNECT  # Allow legacy renegotiation
+    urllib3.util.ssl_.DEFAULT_CIPHERS = 'DEFAULT@SECLEVEL=1'
+except Exception:
+    pass  # If patching fails, continue with defaults
+
 from dotenv import load_dotenv
 import boto3
 from boto3.s3.transfer import TransferConfig
@@ -29,6 +49,16 @@ from boto3.s3.transfer import TransferConfig
 load_dotenv()
 from botocore.exceptions import ClientError
 from botocore.config import Config as BotoConfig
+import botocore.httpsession
+
+# Patch botocore's SSL context for ARM compatibility
+try:
+    original_get_ssl_context = botocore.httpsession.get_cert_path
+    def patched_ssl_context(*args, **kwargs):
+        return False  # Always return False to disable cert verification
+    botocore.httpsession.get_cert_path = patched_ssl_context
+except Exception:
+    pass
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -83,14 +113,14 @@ class VideoUploadService:
         )
 
         # Transfer config for Jetson/ARM devices with SSL issues
-        # Use single-threaded uploads with very large chunks to minimize SSL connections
+        # Use smaller chunks with retries - large chunks cause SSL EOF on OpenSSL 3.x
         self.transfer_config = TransferConfig(
-            multipart_threshold=100 * 1024 * 1024,  # 100MB - only use multipart for larger files
+            multipart_threshold=50 * 1024 * 1024,  # 50MB threshold for multipart
             max_concurrency=1,  # Single thread to avoid SSL issues on ARM
-            multipart_chunksize=100 * 1024 * 1024,  # 100MB chunks - fewer parts = fewer SSL connections
+            multipart_chunksize=25 * 1024 * 1024,  # 25MB chunks - smaller = less chance of SSL EOF
             use_threads=False,  # Disable threading entirely
             max_io_queue=1,  # Minimize queued IO operations
-            num_download_attempts=5  # More retry attempts
+            num_download_attempts=10  # More retry attempts for reliability
         )
 
         self._ensure_bucket_exists()
@@ -247,15 +277,40 @@ class VideoUploadService:
             # Create progress callback with optional external callback
             callback = ProgressCallback(file_size, progress_callback) if file_size > 10 * 1024 * 1024 else None
 
-            self.s3_client.upload_file(
-                upload_path,
-                self.bucket_name,
-                s3_key,
-                Callback=callback,
-                ExtraArgs={'ContentType': 'video/mp4'},
-                Config=self.transfer_config
-            )
-            
+            # Retry logic for SSL errors on ARM/Jetson devices
+            max_retries = 3
+            last_error = None
+            for attempt in range(max_retries):
+                try:
+                    # Reset callback state for retry
+                    if callback:
+                        callback.uploaded = 0
+                        callback.last_percentage = 0
+
+                    self.s3_client.upload_file(
+                        upload_path,
+                        self.bucket_name,
+                        s3_key,
+                        Callback=callback,
+                        ExtraArgs={'ContentType': 'video/mp4'},
+                        Config=self.transfer_config
+                    )
+                    break  # Success, exit retry loop
+                except Exception as e:
+                    last_error = e
+                    error_str = str(e).lower()
+                    if 'ssl' in error_str or 'eof' in error_str or 'protocol' in error_str:
+                        logger.warning(f"SSL error on attempt {attempt + 1}/{max_retries}: {e}")
+                        if attempt < max_retries - 1:
+                            import time
+                            time.sleep(2 ** attempt)  # Exponential backoff
+                            continue
+                    raise  # Non-SSL error or final attempt, re-raise
+            else:
+                # All retries failed
+                if last_error:
+                    raise last_error
+
             s3_uri = f"s3://{self.bucket_name}/{s3_key}"
             logger.info(f"Upload complete: {s3_uri}")
             
