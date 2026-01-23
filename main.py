@@ -23,6 +23,7 @@ from videoupload import VideoUploadService
 from media_service import get_media_service
 from logging_service import get_logging_service, get_logger
 from firebase_service import get_firebase_service
+from uball_client import get_uball_client
 
 # Initialize logging service first
 logging_service = get_logging_service()
@@ -70,6 +71,13 @@ if firebase_service:
     print(f"✓ Firebase service initialized (Jetson ID: {firebase_service.jetson_id})")
 else:
     print("⚠ Firebase service not available - recording sessions will not be registered")
+
+# Initialize Uball Backend client
+uball_client = get_uball_client()
+if uball_client:
+    print("✓ Uball Backend client initialized")
+else:
+    print("⚠ Uball Backend client not available - game sync will not work")
 
 # Global state
 recording_processes = {}
@@ -1050,6 +1058,355 @@ def get_recording_session(session_id):
 
     except Exception as e:
         logger.error(f"[Firebase] Error getting recording session: {e}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+
+# ==================== Game Sync Endpoints ====================
+
+@app.route('/api/games/list', methods=['GET'])
+def list_games():
+    """
+    List basketball games from Firebase.
+
+    Query params:
+        limit: Maximum number of games (default 50)
+        status: Filter by status (e.g., "ended", "active")
+        date: Filter by date (YYYY-MM-DD)
+        sync_ready: If true, only show games ready for sync
+
+    Returns:
+        { success: true, games: [...] }
+    """
+    if not firebase_service:
+        return jsonify({
+            'success': False,
+            'error': 'Firebase service not configured'
+        }), 503
+
+    try:
+        limit = request.args.get('limit', 50, type=int)
+        status = request.args.get('status')
+        date = request.args.get('date')
+        sync_ready = request.args.get('sync_ready', 'false').lower() == 'true'
+
+        if sync_ready:
+            games = firebase_service.get_games_for_sync(limit=limit)
+        else:
+            games = firebase_service.list_games(limit=limit, status=status, date=date)
+
+        return jsonify({
+            'success': True,
+            'count': len(games),
+            'games': games
+        })
+
+    except Exception as e:
+        logger.error(f"[Games] Error listing games: {e}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+
+@app.route('/api/games/<game_id>', methods=['GET'])
+def get_game(game_id):
+    """
+    Get a specific basketball game from Firebase.
+
+    Returns:
+        { success: true, game: {...} }
+    """
+    if not firebase_service:
+        return jsonify({
+            'success': False,
+            'error': 'Firebase service not configured'
+        }), 503
+
+    try:
+        game = firebase_service.get_game(game_id)
+
+        if not game:
+            return jsonify({
+                'success': False,
+                'error': 'Game not found'
+            }), 404
+
+        return jsonify({
+            'success': True,
+            'game': game
+        })
+
+    except Exception as e:
+        logger.error(f"[Games] Error getting game: {e}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+
+@app.route('/api/games/sync', methods=['POST'])
+def sync_game_to_uball():
+    """
+    Sync a completed game from Firebase to Uball Backend.
+
+    Request Body:
+    {
+        "firebase_game_id": "abc123",
+        "team1_id": "uuid-of-team1",  // Uball team UUID
+        "team2_id": "uuid-of-team2"   // Uball team UUID
+    }
+
+    Flow:
+    1. Fetch game from Firebase (basketball-games collection)
+    2. Extract: createdAt, endedAt, teams, scores
+    3. Authenticate with Uball Backend
+    4. Create game in Supabase with firebase_game_id linkage
+    5. Mark game as synced in Firebase
+    6. Return Uball game_id
+
+    Returns:
+        { success: true, uball_game_id: "...", firebase_game_id: "..." }
+    """
+    if not firebase_service:
+        return jsonify({
+            'success': False,
+            'error': 'Firebase service not configured'
+        }), 503
+
+    if not uball_client:
+        return jsonify({
+            'success': False,
+            'error': 'Uball Backend client not configured'
+        }), 503
+
+    try:
+        data = request.get_json()
+        if not data:
+            return jsonify({'success': False, 'error': 'Request body required'}), 400
+
+        firebase_game_id = data.get('firebase_game_id')
+        team1_id = data.get('team1_id')
+        team2_id = data.get('team2_id')
+
+        if not firebase_game_id:
+            return jsonify({'success': False, 'error': 'firebase_game_id required'}), 400
+        if not team1_id or not team2_id:
+            return jsonify({'success': False, 'error': 'team1_id and team2_id required'}), 400
+
+        # 1. Fetch game from Firebase
+        firebase_game = firebase_service.get_game(firebase_game_id)
+        if not firebase_game:
+            return jsonify({
+                'success': False,
+                'error': f'Game not found in Firebase: {firebase_game_id}'
+            }), 404
+
+        # Check if already synced
+        if firebase_game.get('uballGameId'):
+            return jsonify({
+                'success': True,
+                'message': 'Game already synced',
+                'uball_game_id': firebase_game['uballGameId'],
+                'firebase_game_id': firebase_game_id
+            })
+
+        # 2. Check if game already exists in Uball by firebase_game_id
+        existing_game = uball_client.get_game_by_firebase_id(firebase_game_id)
+        if existing_game:
+            # Mark as synced in Firebase
+            firebase_service.mark_game_synced(firebase_game_id, existing_game['id'])
+            return jsonify({
+                'success': True,
+                'message': 'Game already exists in Uball, marked as synced',
+                'uball_game_id': str(existing_game['id']),
+                'firebase_game_id': firebase_game_id
+            })
+
+        # 3. Prepare game data for Uball Backend
+        created_at = firebase_game.get('createdAt', '')
+        ended_at = firebase_game.get('endedAt')
+
+        # Extract date from createdAt (format: 2025-01-20T14:30:00Z)
+        game_date = created_at[:10] if created_at else datetime.now().strftime('%Y-%m-%d')
+
+        uball_game_data = {
+            'firebase_game_id': firebase_game_id,
+            'date': game_date,
+            'team1_id': team1_id,
+            'team2_id': team2_id,
+            'start_time': created_at if created_at else None,
+            'end_time': ended_at if ended_at else None,
+            'source': 'firebase'
+        }
+
+        # Add scores if available
+        if firebase_game.get('score'):
+            score = firebase_game['score']
+            if isinstance(score, dict):
+                uball_game_data['team1_score'] = score.get('home', score.get('team1'))
+                uball_game_data['team2_score'] = score.get('away', score.get('team2'))
+
+        # 4. Create game in Uball Backend
+        logger.info(f"[GameSync] Creating game in Uball: {firebase_game_id}")
+        uball_game = uball_client.create_game(uball_game_data)
+
+        if not uball_game:
+            return jsonify({
+                'success': False,
+                'error': 'Failed to create game in Uball Backend'
+            }), 500
+
+        uball_game_id = str(uball_game.get('id', ''))
+
+        # 5. Mark game as synced in Firebase
+        firebase_service.mark_game_synced(firebase_game_id, uball_game_id)
+        logger.info(f"[GameSync] Game synced: Firebase {firebase_game_id} -> Uball {uball_game_id}")
+
+        return jsonify({
+            'success': True,
+            'message': 'Game synced successfully',
+            'uball_game_id': uball_game_id,
+            'firebase_game_id': firebase_game_id,
+            'game': uball_game
+        })
+
+    except Exception as e:
+        logger.error(f"[GameSync] Error syncing game: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+
+@app.route('/api/games/<game_id>/recordings', methods=['GET'])
+def get_game_recordings(game_id):
+    """
+    Get recording sessions that overlap with a specific game's time range.
+
+    Returns:
+        { success: true, recordings: [...] }
+    """
+    if not firebase_service:
+        return jsonify({
+            'success': False,
+            'error': 'Firebase service not configured'
+        }), 503
+
+    try:
+        # Get game from Firebase
+        game = firebase_service.get_game(game_id)
+        if not game:
+            return jsonify({
+                'success': False,
+                'error': 'Game not found'
+            }), 404
+
+        created_at = game.get('createdAt')
+        ended_at = game.get('endedAt')
+
+        if not created_at:
+            return jsonify({
+                'success': False,
+                'error': 'Game has no start time'
+            }), 400
+
+        # Parse timestamps
+        from datetime import datetime
+        start = datetime.fromisoformat(created_at.replace('Z', '+00:00'))
+
+        if ended_at:
+            end = datetime.fromisoformat(ended_at.replace('Z', '+00:00'))
+        else:
+            # Game still in progress, use current time
+            end = datetime.now()
+
+        # Find overlapping recording sessions
+        recordings = firebase_service.get_games_in_timerange(start, end)
+
+        # Actually we need recording sessions, not games
+        # Let's get all recording sessions and filter by time overlap
+        all_sessions = firebase_service.get_recording_sessions(limit=100)
+
+        overlapping_sessions = []
+        for session in all_sessions:
+            session_start = session.get('startedAt')
+            session_end = session.get('endedAt')
+
+            if not session_start:
+                continue
+
+            # Check for overlap
+            s_start = datetime.fromisoformat(session_start.replace('Z', '+00:00'))
+            s_end = datetime.fromisoformat(session_end.replace('Z', '+00:00')) if session_end else datetime.now()
+
+            # Overlap if: session_start < game_end AND session_end > game_start
+            if s_start < end and s_end > start:
+                overlapping_sessions.append(session)
+
+        return jsonify({
+            'success': True,
+            'game_id': game_id,
+            'game_start': created_at,
+            'game_end': ended_at,
+            'count': len(overlapping_sessions),
+            'recordings': overlapping_sessions
+        })
+
+    except Exception as e:
+        logger.error(f"[Games] Error getting game recordings: {e}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+
+@app.route('/api/uball/status', methods=['GET'])
+def uball_status():
+    """Check Uball Backend connection status."""
+    if not uball_client:
+        return jsonify({
+            'success': True,
+            'configured': False,
+            'message': 'Uball Backend client not configured'
+        })
+
+    try:
+        healthy = uball_client.health_check()
+        return jsonify({
+            'success': True,
+            'configured': True,
+            'healthy': healthy,
+            'backend_url': uball_client.backend_url
+        })
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+
+@app.route('/api/uball/teams', methods=['GET'])
+def list_uball_teams():
+    """List teams from Uball Backend (for team ID mapping)."""
+    if not uball_client:
+        return jsonify({
+            'success': False,
+            'error': 'Uball Backend client not configured'
+        }), 503
+
+    try:
+        teams = uball_client.list_teams()
+        return jsonify({
+            'success': True,
+            'count': len(teams),
+            'teams': teams
+        })
+    except Exception as e:
         return jsonify({
             'success': False,
             'error': str(e)

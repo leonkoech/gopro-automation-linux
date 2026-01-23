@@ -303,6 +303,125 @@ class FirebaseService:
 
         return None
 
+    # ==================== Basketball Games Methods ====================
+
+    def get_game(self, game_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Get a specific basketball game by ID.
+
+        Args:
+            game_id: Firebase document ID of the game
+
+        Returns:
+            Game document or None if not found
+        """
+        doc_ref = self.db.collection(self.BASKETBALL_GAMES_COLLECTION).document(game_id)
+        doc = doc_ref.get()
+
+        if doc.exists:
+            data = doc.to_dict()
+            data['id'] = doc.id
+            return data
+
+        return None
+
+    def list_games(
+        self,
+        limit: int = 50,
+        status: Optional[str] = None,
+        date: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        """
+        List basketball games from Firebase.
+
+        Args:
+            limit: Maximum number of games to return
+            status: Optional filter by status (e.g., "ended", "active")
+            date: Optional filter by date (YYYY-MM-DD format)
+
+        Returns:
+            List of game documents
+        """
+        games_ref = self.db.collection(self.BASKETBALL_GAMES_COLLECTION)
+
+        # Start with ordering by createdAt descending
+        query = games_ref.order_by('createdAt', direction=firestore.Query.DESCENDING)
+
+        if status:
+            query = query.where('status', '==', status)
+
+        query = query.limit(limit)
+
+        games = []
+        for doc in query.stream():
+            game_data = doc.to_dict()
+            game_data['id'] = doc.id
+
+            # Filter by date if specified (done in Python since Firestore doesn't support date extraction)
+            if date:
+                created_at = game_data.get('createdAt', '')
+                if not created_at.startswith(date):
+                    continue
+
+            games.append(game_data)
+
+        return games
+
+    def get_games_for_sync(self, limit: int = 20) -> List[Dict[str, Any]]:
+        """
+        Get games that are ready to be synced to Uball Backend.
+
+        Returns games that:
+        - Have ended (have endedAt timestamp)
+        - Are not yet synced (no uballGameId field)
+
+        Args:
+            limit: Maximum number of games to return
+
+        Returns:
+            List of game documents ready for sync
+        """
+        games_ref = self.db.collection(self.BASKETBALL_GAMES_COLLECTION)
+
+        # Query for games that have ended
+        # Note: Firestore doesn't support "field does not exist" queries well,
+        # so we'll filter in Python
+        query = games_ref.order_by('endedAt', direction=firestore.Query.DESCENDING).limit(limit * 2)
+
+        games = []
+        for doc in query.stream():
+            game_data = doc.to_dict()
+
+            # Skip if endedAt is missing or null
+            if not game_data.get('endedAt'):
+                continue
+
+            # Skip if already synced to Uball
+            if game_data.get('uballGameId'):
+                continue
+
+            game_data['id'] = doc.id
+            games.append(game_data)
+
+            if len(games) >= limit:
+                break
+
+        return games
+
+    def mark_game_synced(self, game_id: str, uball_game_id: str) -> None:
+        """
+        Mark a game as synced to Uball Backend.
+
+        Args:
+            game_id: Firebase game document ID
+            uball_game_id: The game ID in Uball Backend (Supabase)
+        """
+        doc_ref = self.db.collection(self.BASKETBALL_GAMES_COLLECTION).document(game_id)
+        doc_ref.update({
+            'uballGameId': uball_game_id,
+            'syncedAt': datetime.utcnow().isoformat() + 'Z'
+        })
+
 
 # Singleton instance
 _firebase_service: Optional[FirebaseService] = None
