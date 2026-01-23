@@ -161,6 +161,8 @@ class UballClient:
                 payload["team1_score"] = game_data["team1_score"]
             if game_data.get("team2_score") is not None:
                 payload["team2_score"] = game_data["team2_score"]
+            if game_data.get("video_name"):
+                payload["video_name"] = game_data["video_name"]
 
             response = requests.post(
                 f"{self.backend_url}/api/games/",
