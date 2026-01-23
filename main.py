@@ -1524,16 +1524,26 @@ def get_segment_upload_status(upload_id):
 
 @app.route('/api/media/segments/upload/jobs', methods=['GET'])
 def list_segment_upload_jobs():
-    """List all segment upload jobs"""
+    """List all segment upload jobs (supports both batch and single session formats)"""
     with segment_upload_lock:
         jobs = []
         for upload_id, status in segment_upload_status.items():
-            jobs.append({
+            # Handle both batch uploads (total/completed) and single session uploads (total_files/files_completed)
+            total = status.get('total', status.get('total_files', 0))
+            completed = status.get('completed', status.get('files_completed', 0))
+
+            job_info = {
                 'upload_id': upload_id,
                 'status': status['status'],
-                'total': status['total'],
-                'completed': status['completed']
-            })
+                'total': total,
+                'completed': completed
+            }
+
+            # Include session_name for single session uploads
+            if 'session_name' in status:
+                job_info['session_name'] = status['session_name']
+
+            jobs.append(job_info)
 
     return jsonify({
         'success': True,
