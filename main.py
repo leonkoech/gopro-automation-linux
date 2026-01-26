@@ -1202,7 +1202,10 @@ def sync_game_to_uball():
         if not firebase_game_id:
             return jsonify({'success': False, 'error': 'firebase_game_id required'}), 400
 
+        logger.info(f"[GameSync] === Starting sync for Firebase game: {firebase_game_id} ===")
+
         # 1. Fetch game from Firebase
+        logger.info(f"[GameSync] Step 1: Fetching game from Firebase...")
         firebase_game = firebase_service.get_game(firebase_game_id)
         if not firebase_game:
             return jsonify({
@@ -1210,16 +1213,21 @@ def sync_game_to_uball():
                 'error': f'Game not found in Firebase: {firebase_game_id}'
             }), 404
 
+        logger.info(f"[GameSync] Step 1: Game found. Teams: {firebase_game.get('leftTeam', {}).get('name')} vs {firebase_game.get('rightTeam', {}).get('name')}")
+
         # Check if already synced
         if firebase_game.get('uballGameId'):
+            logger.info(f"[GameSync] Game already synced to Uball: {firebase_game['uballGameId']}")
             return jsonify({
                 'success': True,
                 'message': 'Game already synced',
                 'uball_game_id': firebase_game['uballGameId'],
-                'firebase_game_id': firebase_game_id
+                'firebase_game_id': firebase_game_id,
+                'video_name': f"{firebase_game.get('leftTeam', {}).get('name', 'Team 1')} vs {firebase_game.get('rightTeam', {}).get('name', 'Team 2')}"
             })
 
         # 2. Check if game already exists in Uball by firebase_game_id
+        logger.info(f"[GameSync] Step 2: Checking if game exists in Uball Backend...")
         existing_game = uball_client.get_game_by_firebase_id(firebase_game_id)
         if existing_game:
             # Mark as synced in Firebase
@@ -1232,6 +1240,7 @@ def sync_game_to_uball():
             })
 
         # 3. Auto-create teams if not provided
+        logger.info(f"[GameSync] Step 3: Creating teams in Uball Backend...")
         teams_created = []
 
         if not team1_id:
@@ -1267,6 +1276,7 @@ def sync_game_to_uball():
             logger.info(f"[GameSync] Auto-created team2: {team2_name} -> {team2_id}")
 
         # 4. Prepare game data for Uball Backend
+        logger.info(f"[GameSync] Step 4: Preparing game data for Uball Backend...")
         created_at = firebase_game.get('createdAt', '')
         ended_at = firebase_game.get('endedAt')
 
@@ -1305,7 +1315,8 @@ def sync_game_to_uball():
                 uball_game_data['team2_score'] = score.get('away', score.get('team2'))
 
         # 5. Create game in Uball Backend
-        logger.info(f"[GameSync] Creating game in Uball: {firebase_game_id}")
+        logger.info(f"[GameSync] Step 5: Creating game in Uball Backend...")
+        logger.info(f"[GameSync] Payload: team1={team1_id}, team2={team2_id}, date={game_date}, video_name={uball_game_data.get('video_name')}")
         uball_game = uball_client.create_game(uball_game_data)
 
         if not uball_game:
@@ -1317,14 +1328,18 @@ def sync_game_to_uball():
         uball_game_id = str(uball_game.get('id', ''))
 
         # 6. Mark game as synced in Firebase
+        logger.info(f"[GameSync] Step 6: Marking game as synced in Firebase...")
         firebase_service.mark_game_synced(firebase_game_id, uball_game_id)
-        logger.info(f"[GameSync] Game synced: Firebase {firebase_game_id} -> Uball {uball_game_id}")
+        logger.info(f"[GameSync] === SUCCESS: Firebase {firebase_game_id} -> Uball {uball_game_id} ===")
+
+        video_name = uball_game_data.get('video_name', f"{team1_name} vs {team2_name}")
 
         response_data = {
             'success': True,
             'message': 'Game synced successfully',
             'uball_game_id': uball_game_id,
             'firebase_game_id': firebase_game_id,
+            'video_name': video_name,
             'game': uball_game
         }
 

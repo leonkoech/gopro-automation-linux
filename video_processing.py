@@ -7,10 +7,17 @@ This module provides functionality to:
 - Use FFmpeg for video extraction and concatenation
 
 S3 Key Format for game videos:
-    {location}/{date}/game{N}/{date}_game{N}_{angle}.mp4
+    {location}/{date}/game{N}-{UUID}/{date}_game{N}_{angle}.mp4
+
+Where:
+- {location} = court identifier (e.g., "court-a")
+- {date} = game date YYYY-MM-DD
+- {N} = game number for that day (1, 2, 3...)
+- {UUID} = first 4 segments of Uball game UUID (for uniqueness)
+- {angle} = camera angle code (FL, FR, NL, NR)
 
 Example:
-    court-a/2025-01-20/game1/2025-01-20_game1_FL.mp4
+    court-a/2026-01-20/game1-95efaeaa-8475-4db4/2026-01-20_game1_FL.mp4
 """
 
 import os
@@ -341,16 +348,31 @@ class VideoProcessor:
         location: str,
         date: str,
         game_number: int,
-        angle_code: str
+        angle_code: str,
+        uball_game_id: str = None
     ) -> str:
         """
         Generate S3 key for game video.
 
-        Format: {location}/{date}/game{N}/{date}_game{N}_{angle}.mp4
-        Example: court-a/2025-01-20/game1/2025-01-20_game1_FL.mp4
+        Format: {location}/{date}/game{N}-{UUID}/{date}_game{N}_{angle}.mp4
+        Example: court-a/2026-01-20/game1-95efaeaa-8475-4db4/2026-01-20_game1_FL.mp4
+
+        Args:
+            location: Court/location identifier
+            date: Game date (YYYY-MM-DD)
+            game_number: Game number for the day
+            angle_code: Camera angle (FL, FR, NL, NR)
+            uball_game_id: Uball game UUID for unique folder name
         """
         filename = self.generate_game_filename(date, game_number, angle_code)
-        return f"{location}/{date}/game{game_number}/{filename}"
+        if uball_game_id:
+            # Use first 4 segments of UUID for shorter but still unique folder name
+            uuid_parts = uball_game_id.split('-')[:4]
+            uuid_short = '-'.join(uuid_parts)
+            folder = f"game{game_number}-{uuid_short}"
+        else:
+            folder = f"game{game_number}"
+        return f"{location}/{date}/{folder}/{filename}"
 
     def get_video_info(self, filepath: str) -> Dict[str, Any]:
         """Get detailed video information using ffprobe."""
@@ -423,8 +445,21 @@ def process_game_videos(
         'success': False,
         'processed_videos': [],
         'registered_videos': [],  # Videos registered in Uball (FL/FR only)
-        'errors': []
+        'errors': [],
+        'uball_game_id': None
     }
+
+    # Get Uball game ID for S3 folder structure
+    uball_game_id = None
+    if uball_client:
+        uball_game = uball_client.get_game_by_firebase_id(firebase_game_id)
+        if uball_game:
+            uball_game_id = str(uball_game.get('id', ''))
+            results['uball_game_id'] = uball_game_id
+            logger.info(f"Found Uball game: {uball_game_id}")
+        else:
+            logger.warning(f"Uball game not found for Firebase ID: {firebase_game_id}")
+            results['errors'].append("Game not synced to Uball - sync first before processing")
 
     try:
         # 1. Get game from Firebase
@@ -527,7 +562,7 @@ def process_game_videos(
             if upload_service:
                 try:
                     s3_key = video_processor.generate_s3_key(
-                        location, game_date, game_number, angle_code
+                        location, game_date, game_number, angle_code, uball_game_id
                     )
 
                     # Upload using the service
