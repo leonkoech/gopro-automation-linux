@@ -1664,16 +1664,53 @@ def preview_game_extraction(game_id):
                     'extraction_params': params
                 })
 
+        # Build response matching frontend ExtractionPreviewResponse type
+        issues = []
+        if not ended_at:
+            issues.append('Game has no end time - using current time')
+        if len(session_previews) == 0:
+            issues.append('No overlapping recording sessions found')
+
+        # Reshape session data to match ExtractionPreviewSession type
+        formatted_sessions = []
+        for sp in session_previews:
+            extraction_params = sp.get('extraction_params', {})
+            chapters_raw = sp.get('chapters', [])
+            formatted_chapters = []
+            for ch in chapters_raw:
+                if isinstance(ch, dict):
+                    formatted_chapters.append(ch)
+                elif isinstance(ch, str):
+                    formatted_chapters.append({
+                        'filename': ch,
+                        'size_mb': 0,
+                        'duration_str': 'unknown'
+                    })
+
+            formatted_sessions.append({
+                'session_id': sp.get('session_id', ''),
+                'session_name': sp.get('segment_session', ''),
+                'angle_code': sp.get('angle', 'UNKNOWN'),
+                'recording_start': sp.get('session_start', ''),
+                'recording_end': sp.get('session_end', ''),
+                'chapters': formatted_chapters,
+                'extraction_params': {
+                    'offset_str': extraction_params.get('offset_str', '00:00:00'),
+                    'duration_str': extraction_params.get('duration_str', '00:00:00'),
+                    'chapters_to_process': extraction_params.get('chapters_to_process', 0),
+                    'total_chapters': sp.get('chapters_count', len(chapters_raw)),
+                }
+            })
+
         return jsonify({
             'success': True,
-            'game': {
-                'id': game_id,
-                'start': created_at,
-                'end': ended_at,
-                'duration_minutes': round(game_duration / 60, 1)
-            },
-            'overlapping_sessions': len(session_previews),
-            'sessions': session_previews
+            'firebase_game_id': game_id,
+            'game_start': created_at,
+            'game_end': ended_at or '',
+            'game_duration_minutes': round(game_duration / 60, 1),
+            'overlapping_sessions': formatted_sessions,
+            'ready_for_extraction': len(formatted_sessions) > 0,
+            'issues': issues if issues else None
         })
 
     except Exception as e:
