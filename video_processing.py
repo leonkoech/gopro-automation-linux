@@ -419,7 +419,8 @@ def process_game_videos(
     video_processor: VideoProcessor,
     location: str = 'default-location',
     uball_client=None,
-    s3_bucket: str = 'jetson-videos-uball'
+    s3_bucket: str = 'jetson-videos-uball',
+    progress_callback=None
 ) -> Dict[str, Any]:
     """
     Process videos for a specific game.
@@ -435,10 +436,19 @@ def process_game_videos(
         location: Location name for S3 path
         uball_client: Optional Uball client for registering FL/FR videos
         s3_bucket: S3 bucket name for Uball registration
+        progress_callback: Optional callback(stage, detail, progress, current_angle)
 
     Returns:
         Dict with processing results
     """
+    def report_progress(stage: str, detail: str = '', progress: float = 0, current_angle: str = ''):
+        """Helper to report progress if callback is provided."""
+        if progress_callback:
+            try:
+                progress_callback(stage, detail, progress, current_angle)
+            except Exception as e:
+                logger.warning(f"Progress callback error: {e}")
+
     results = {
         'firebase_game_id': firebase_game_id,
         'game_number': game_number,
@@ -448,6 +458,8 @@ def process_game_videos(
         'errors': [],
         'uball_game_id': None
     }
+
+    report_progress('initializing', 'Loading game data...', 5)
 
     # Get Uball game ID for S3 folder structure
     uball_game_id = None
@@ -484,6 +496,8 @@ def process_game_videos(
         logger.info(f"  Start: {game_start}, End: {game_end}")
         logger.info(f"  Duration: {(game_end - game_start).total_seconds() / 60:.1f} minutes")
 
+        report_progress('finding_sessions', 'Finding overlapping recording sessions...', 10)
+
         # 2. Find overlapping recording sessions
         all_sessions = firebase_service.get_recording_sessions(limit=100)
         overlapping_sessions = []
@@ -508,15 +522,23 @@ def process_game_videos(
 
         if not overlapping_sessions:
             results['errors'].append("No overlapping recording sessions found")
+            report_progress('error', 'No overlapping recording sessions found', 0)
             return results
 
+        report_progress('processing', f'Processing {len(overlapping_sessions)} video angles...', 15)
+
         # 3. Process each session
-        for session in overlapping_sessions:
+        total_sessions = len(overlapping_sessions)
+        for session_idx, session in enumerate(overlapping_sessions):
             session_name = session.get('segmentSession', '')
             angle_code = session.get('angleCode', 'UNKNOWN')
             recording_start = session['parsed_start']
 
+            # Calculate progress for this session (15-90% range for processing)
+            session_base_progress = 15 + (session_idx * 75 // total_sessions)
+
             logger.info(f"Processing session: {session_name} (angle: {angle_code})")
+            report_progress('extracting', f'Extracting {angle_code} video...', session_base_progress, angle_code)
 
             # Get chapter files
             chapters = video_processor.get_session_chapters(session_name)
@@ -561,6 +583,9 @@ def process_game_videos(
             # 4. Upload to S3
             if upload_service:
                 try:
+                    upload_progress = session_base_progress + 25
+                    report_progress('uploading', f'Uploading {angle_code} to S3...', upload_progress, angle_code)
+
                     s3_key = video_processor.generate_s3_key(
                         location, game_date, game_number, angle_code, uball_game_id
                     )
@@ -572,6 +597,7 @@ def process_game_videos(
                     )
 
                     logger.info(f"Uploaded to S3: {s3_uri}")
+                    report_progress('uploaded', f'{angle_code} uploaded successfully', upload_progress + 10, angle_code)
 
                     # Update recording session with processed game info
                     firebase_service.add_processed_game(session['id'], {
@@ -596,6 +622,7 @@ def process_game_videos(
 
                     # 5. Register FL/FR videos in Uball Backend
                     if uball_client and angle_code in ['FL', 'FR']:
+                        report_progress('registering', f'Registering {angle_code} in Uball...', upload_progress + 15, angle_code)
                         try:
                             uball_result = uball_client.register_game_video(
                                 firebase_game_id=firebase_game_id,
@@ -643,6 +670,10 @@ def process_game_videos(
                 })
 
         results['success'] = len(results['processed_videos']) > 0
+        if results['success']:
+            report_progress('completed', f"Processed {len(results['processed_videos'])} videos successfully", 100)
+        else:
+            report_progress('failed', 'No videos were processed', 0)
         return results
 
     except Exception as e:

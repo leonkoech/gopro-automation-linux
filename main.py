@@ -89,6 +89,11 @@ recording_processes = {}
 recording_lock = threading.Lock()
 gopro_ip_cache = {}
 
+# Video processing jobs (async)
+import uuid
+video_processing_jobs = {}  # job_id -> job_state
+video_processing_lock = threading.Lock()
+
 def discover_gopro_ip_for_interface(interface, our_ip):
     """Discover the GoPro's IP address on a specific interface"""
     try:
@@ -1569,6 +1574,216 @@ def process_game_videos_endpoint():
             'success': False,
             'error': str(e)
         }), 500
+
+
+def _run_video_processing_job(job_id: str, firebase_game_id: str, game_number: int, location: str):
+    """Background worker for async video processing."""
+    def update_progress(stage: str, detail: str = '', progress: float = 0, current_angle: str = ''):
+        with video_processing_lock:
+            if job_id in video_processing_jobs:
+                video_processing_jobs[job_id]['stage'] = stage
+                video_processing_jobs[job_id]['detail'] = detail
+                video_processing_jobs[job_id]['progress'] = progress
+                video_processing_jobs[job_id]['current_angle'] = current_angle
+                video_processing_jobs[job_id]['updated_at'] = datetime.now().isoformat()
+
+    try:
+        update_progress('starting', 'Initializing video processing...', 0)
+
+        # Run the actual processing with progress callback
+        results = process_game_videos(
+            firebase_game_id=firebase_game_id,
+            game_number=game_number,
+            firebase_service=firebase_service,
+            upload_service=upload_service,
+            video_processor=video_processor,
+            location=location,
+            uball_client=uball_client,
+            s3_bucket=UPLOAD_BUCKET,
+            progress_callback=update_progress
+        )
+
+        with video_processing_lock:
+            if job_id in video_processing_jobs:
+                video_processing_jobs[job_id]['status'] = 'completed' if results['success'] else 'failed'
+                video_processing_jobs[job_id]['result'] = results
+                video_processing_jobs[job_id]['stage'] = 'completed' if results['success'] else 'failed'
+                video_processing_jobs[job_id]['detail'] = 'Processing complete' if results['success'] else 'Processing failed'
+                video_processing_jobs[job_id]['progress'] = 100 if results['success'] else 0
+                video_processing_jobs[job_id]['completed_at'] = datetime.now().isoformat()
+
+    except Exception as e:
+        logger.error(f"[VideoProcessing] Job {job_id} failed: {e}")
+        import traceback
+        traceback.print_exc()
+        with video_processing_lock:
+            if job_id in video_processing_jobs:
+                video_processing_jobs[job_id]['status'] = 'failed'
+                video_processing_jobs[job_id]['stage'] = 'error'
+                video_processing_jobs[job_id]['detail'] = str(e)
+                video_processing_jobs[job_id]['error'] = str(e)
+                video_processing_jobs[job_id]['completed_at'] = datetime.now().isoformat()
+
+
+@app.route('/api/games/process-videos/async', methods=['POST'])
+def process_game_videos_async():
+    """
+    Start async video processing and return job ID immediately.
+
+    Request Body:
+    {
+        "firebase_game_id": "abc123",
+        "game_number": 1,
+        "location": "court-a"
+    }
+
+    Returns immediately:
+    {
+        "success": true,
+        "job_id": "uuid",
+        "message": "Processing started"
+    }
+
+    Use GET /api/games/process-videos/<job_id>/status to check progress.
+    """
+    if not firebase_service:
+        return jsonify({
+            'success': False,
+            'error': 'Firebase service not configured'
+        }), 503
+
+    try:
+        data = request.get_json()
+        if not data:
+            return jsonify({'success': False, 'error': 'Request body required'}), 400
+
+        firebase_game_id = data.get('firebase_game_id')
+        game_number = data.get('game_number', 1)
+        location = data.get('location', UPLOAD_LOCATION)
+
+        if not firebase_game_id:
+            return jsonify({'success': False, 'error': 'firebase_game_id required'}), 400
+
+        if not isinstance(game_number, int) or game_number < 1:
+            return jsonify({'success': False, 'error': 'game_number must be a positive integer'}), 400
+
+        # Create job
+        job_id = str(uuid.uuid4())
+
+        with video_processing_lock:
+            video_processing_jobs[job_id] = {
+                'job_id': job_id,
+                'firebase_game_id': firebase_game_id,
+                'game_number': game_number,
+                'location': location,
+                'status': 'running',
+                'stage': 'queued',
+                'detail': 'Job queued',
+                'progress': 0,
+                'current_angle': '',
+                'created_at': datetime.now().isoformat(),
+                'updated_at': datetime.now().isoformat(),
+                'result': None,
+                'error': None
+            }
+
+        # Start background thread
+        thread = threading.Thread(
+            target=_run_video_processing_job,
+            args=(job_id, firebase_game_id, game_number, location),
+            daemon=True
+        )
+        thread.start()
+
+        logger.info(f"[VideoProcessing] Started async job {job_id} for game {firebase_game_id}")
+
+        return jsonify({
+            'success': True,
+            'job_id': job_id,
+            'message': 'Video processing started'
+        })
+
+    except Exception as e:
+        logger.error(f"[VideoProcessing] Error starting async job: {e}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+
+@app.route('/api/games/process-videos/<job_id>/status', methods=['GET'])
+def get_video_processing_status(job_id):
+    """
+    Get status of an async video processing job.
+
+    Returns:
+    {
+        "success": true,
+        "job_id": "uuid",
+        "status": "running|completed|failed",
+        "stage": "extracting|uploading|registering|completed|error",
+        "detail": "Extracting NR video...",
+        "progress": 45,
+        "current_angle": "NR",
+        "result": {...}  // Only when completed
+    }
+    """
+    with video_processing_lock:
+        job = video_processing_jobs.get(job_id)
+
+    if not job:
+        return jsonify({
+            'success': False,
+            'error': 'Job not found'
+        }), 404
+
+    response = {
+        'success': True,
+        'job_id': job['job_id'],
+        'firebase_game_id': job['firebase_game_id'],
+        'game_number': job['game_number'],
+        'status': job['status'],
+        'stage': job['stage'],
+        'detail': job['detail'],
+        'progress': job['progress'],
+        'current_angle': job.get('current_angle', ''),
+        'created_at': job['created_at'],
+        'updated_at': job['updated_at']
+    }
+
+    if job['status'] == 'completed':
+        response['result'] = job['result']
+        response['completed_at'] = job.get('completed_at')
+    elif job['status'] == 'failed':
+        response['error'] = job.get('error')
+        response['result'] = job.get('result')
+        response['completed_at'] = job.get('completed_at')
+
+    return jsonify(response)
+
+
+@app.route('/api/games/process-videos/jobs', methods=['GET'])
+def list_video_processing_jobs():
+    """List all video processing jobs."""
+    with video_processing_lock:
+        jobs = list(video_processing_jobs.values())
+
+    # Sort by created_at descending
+    jobs.sort(key=lambda j: j['created_at'], reverse=True)
+
+    return jsonify({
+        'success': True,
+        'count': len(jobs),
+        'jobs': [{
+            'job_id': j['job_id'],
+            'firebase_game_id': j['firebase_game_id'],
+            'game_number': j['game_number'],
+            'status': j['status'],
+            'stage': j['stage'],
+            'progress': j['progress'],
+            'created_at': j['created_at']
+        } for j in jobs[:20]]  # Last 20 jobs
+    })
 
 
 @app.route('/api/games/<game_id>/preview-extraction', methods=['GET'])
