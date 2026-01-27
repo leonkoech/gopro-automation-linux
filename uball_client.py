@@ -374,6 +374,7 @@ class UballClient:
             return None
 
         try:
+            import time
             # Use confirm-upload endpoint which registers the video after direct S3 upload
             payload = {
                 "game_id": game_id,
@@ -382,11 +383,14 @@ class UballClient:
                 "file_size": file_size or 0,
                 "file_hash": file_hash or f"direct-upload-{filename}",  # Placeholder if no hash
                 "content_type": "video/mp4",
-                "s3_key": s3_key
+                "s3_key": s3_key,
+                "last_modified": int(time.time() * 1000)  # Current time in milliseconds
             }
 
             if duration is not None:
                 payload["duration"] = duration
+
+            logger.info(f"[UballClient] Registering video with payload: {payload}")
 
             response = requests.post(
                 f"{self.backend_url}/api/videos/confirm-upload",
