@@ -507,7 +507,12 @@ def process_game_videos(
         report_progress('finding_sessions', 'Finding overlapping recording sessions...', 10)
 
         # 2. Find overlapping recording sessions
-        all_sessions = firebase_service.get_recording_sessions(limit=100)
+        # IMPORTANT: Only query sessions for THIS Jetson to avoid processing sessions
+        # that don't have local chapter files (sessions are stored on the Jetson that recorded them)
+        jetson_id = os.getenv('JETSON_ID', 'unknown')
+        logger.info(f"[ProcessGame] Filtering sessions for jetson_id: {jetson_id}")
+        all_sessions = firebase_service.get_recording_sessions(jetson_id=jetson_id, limit=100)
+        logger.info(f"[ProcessGame] Found {len(all_sessions)} sessions for {jetson_id}")
         overlapping_sessions = []
 
         for session in all_sessions:

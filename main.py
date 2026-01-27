@@ -245,6 +245,34 @@ def sanitize_filename(name):
         name = name.replace(char, '_')
     return name.strip()
 
+
+def _get_angle_code_from_camera_name(camera_name: str) -> str:
+    """
+    Extract angle code from camera name or CAMERA_ANGLE_MAP env var.
+
+    Args:
+        camera_name: GoPro camera name (e.g., "GoPro FL")
+
+    Returns:
+        Angle code (FL, FR, NL, NR) or 'UNK' if unknown
+    """
+    # Try CAMERA_ANGLE_MAP env var first
+    angle_map_str = os.getenv('CAMERA_ANGLE_MAP', '{}')
+    try:
+        angle_map = json.loads(angle_map_str)
+        if camera_name in angle_map:
+            return angle_map[camera_name]
+    except json.JSONDecodeError:
+        pass
+
+    # Fallback: extract from camera name like "GoPro FL"
+    if camera_name:
+        for code in ['FL', 'FR', 'NL', 'NR']:
+            if code in camera_name.upper():
+                return code
+
+    return 'UNK'  # Unknown angle
+
 def get_video_list():
     """Get list of all recorded videos"""
     videos = []
@@ -476,10 +504,15 @@ def start_recording(gopro_id):
             camera_name = f"GoPro-{gopro_id[-4:]}"
             print(f"Using fallback camera name: {camera_name}")
 
+        # Get angle code from camera name for segment folder naming
+        angle_code = _get_angle_code_from_camera_name(camera_name)
+        print(f"Camera angle code: {angle_code} (from {camera_name})")
+
         # Prepare session info - store start datetime for filename generation at stop time
+        # Include angle code in session_id for easier identification: {interface}_{angle}_{timestamp}
         start_datetime = datetime.now()
         timestamp = start_datetime.strftime('%Y%m%d_%H%M%S')
-        session_id = f"{gopro_id}_{timestamp}"
+        session_id = f"{gopro_id}_{angle_code}_{timestamp}"
         session_dir = os.path.join(SEGMENTS_DIR, session_id)
         os.makedirs(session_dir, exist_ok=True)
 
