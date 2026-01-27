@@ -7,17 +7,16 @@ This module provides functionality to:
 - Use FFmpeg for video extraction and concatenation
 
 S3 Key Format for game videos:
-    {location}/{date}/game{N}-{UUID}/{date}_game{N}_{angle}.mp4
+    {location}/{date}/{game_uuid}/{date}_{angle}.mp4
 
 Where:
 - {location} = court identifier (e.g., "court-a")
 - {date} = game date YYYY-MM-DD
-- {N} = game number for that day (1, 2, 3...)
-- {UUID} = first 4 segments of Uball game UUID (for uniqueness)
+- {game_uuid} = shortened Uball game UUID (first 4 segments for uniqueness)
 - {angle} = camera angle code (FL, FR, NL, NR)
 
 Example:
-    court-a/2026-01-20/game1-95efaeaa-8475-4db4/2026-01-20_game1_FL.mp4
+    court-a/2026-01-20/95efaeaa-8475-4db4-8967/2026-01-20_FL.mp4
 """
 
 import os
@@ -332,46 +331,48 @@ class VideoProcessor:
     def generate_game_filename(
         self,
         date: str,
-        game_number: int,
-        angle_code: str
+        angle_code: str,
+        game_number: int = None  # Deprecated, kept for backwards compatibility
     ) -> str:
         """
         Generate filename for game video.
 
-        Format: {date}_game{N}_{angle}.mp4
-        Example: 2025-01-20_game1_FL.mp4
+        Format: {date}_{angle}.mp4
+        Example: 2026-01-20_FL.mp4
+
+        Note: game_number parameter is deprecated - game identity is in folder path.
         """
-        return f"{date}_game{game_number}_{angle_code}.mp4"
+        return f"{date}_{angle_code}.mp4"
 
     def generate_s3_key(
         self,
         location: str,
         date: str,
-        game_number: int,
         angle_code: str,
-        uball_game_id: str = None
+        uball_game_id: str = None,
+        game_number: int = None  # Deprecated, kept for backwards compatibility
     ) -> str:
         """
         Generate S3 key for game video.
 
-        Format: {location}/{date}/game{N}-{UUID}/{date}_game{N}_{angle}.mp4
-        Example: court-a/2026-01-20/game1-95efaeaa-8475-4db4/2026-01-20_game1_FL.mp4
+        Format: {location}/{date}/{game_uuid}/{date}_{angle}.mp4
+        Example: court-a/2026-01-20/95efaeaa-8475-4db4-8967/2026-01-20_FL.mp4
 
         Args:
             location: Court/location identifier
             date: Game date (YYYY-MM-DD)
-            game_number: Game number for the day
             angle_code: Camera angle (FL, FR, NL, NR)
             uball_game_id: Uball game UUID for unique folder name
+            game_number: Deprecated - no longer used in path
         """
-        filename = self.generate_game_filename(date, game_number, angle_code)
+        filename = self.generate_game_filename(date, angle_code)
         if uball_game_id:
             # Use first 4 segments of UUID for shorter but still unique folder name
             uuid_parts = uball_game_id.split('-')[:4]
-            uuid_short = '-'.join(uuid_parts)
-            folder = f"game{game_number}-{uuid_short}"
+            folder = '-'.join(uuid_parts)
         else:
-            folder = f"game{game_number}"
+            # Fallback if no game ID (shouldn't happen in normal flow)
+            folder = f"unknown-{date}"
         return f"{location}/{date}/{folder}/{filename}"
 
     def get_video_info(self, filepath: str) -> Dict[str, Any]:
@@ -561,7 +562,7 @@ def process_game_videos(
 
             # Generate output filename
             output_filename = video_processor.generate_game_filename(
-                game_date, game_number, angle_code
+                game_date, angle_code
             )
 
             # Extract the clip
@@ -587,7 +588,7 @@ def process_game_videos(
                     report_progress('uploading', f'Uploading {angle_code} to S3...', upload_progress, angle_code)
 
                     s3_key = video_processor.generate_s3_key(
-                        location, game_date, game_number, angle_code, uball_game_id
+                        location, game_date, angle_code, uball_game_id
                     )
 
                     # Upload using the service

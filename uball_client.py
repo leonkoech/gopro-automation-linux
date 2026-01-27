@@ -346,10 +346,11 @@ class UballClient:
         filename: str,
         duration: Optional[float] = None,
         file_size: Optional[int] = None,
+        file_hash: Optional[str] = None,
         s3_bucket: str = 'jetson-videos-uball'
     ) -> Optional[Dict[str, Any]]:
         """
-        Register a video in Uball Backend's video_metadata.
+        Register a video in Uball Backend using confirm-upload endpoint.
 
         Args:
             game_id: Uball game UUID
@@ -358,6 +359,7 @@ class UballClient:
             filename: Video filename
             duration: Video duration in seconds
             file_size: Video file size in bytes
+            file_hash: MD5 hash of the file (optional, will use placeholder if not provided)
             s3_bucket: S3 bucket name
 
         Returns:
@@ -372,22 +374,22 @@ class UballClient:
             return None
 
         try:
+            # Use confirm-upload endpoint which registers the video after direct S3 upload
             payload = {
                 "game_id": game_id,
-                "s3_key": s3_key,
-                "s3_bucket": s3_bucket,
                 "angle": angle,
                 "filename": filename,
-                "status": "uploaded"
+                "file_size": file_size or 0,
+                "file_hash": file_hash or f"direct-upload-{filename}",  # Placeholder if no hash
+                "content_type": "video/mp4",
+                "s3_key": s3_key
             }
 
             if duration is not None:
                 payload["duration"] = duration
-            if file_size is not None:
-                payload["file_size"] = file_size
 
             response = requests.post(
-                f"{self.backend_url}/api/videos/",
+                f"{self.backend_url}/api/videos/confirm-upload",
                 json=payload,
                 headers=self._get_headers(),
                 timeout=15
