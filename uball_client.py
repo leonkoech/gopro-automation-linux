@@ -347,7 +347,7 @@ class UballClient:
         duration: Optional[float] = None,
         file_size: Optional[int] = None,
         file_hash: Optional[str] = None,
-        s3_bucket: str = 'jetson-videos-uball'
+        s3_bucket: str = 'uball-videos-production'
     ) -> Optional[Dict[str, Any]]:
         """
         Register a video in Uball Backend using confirm-upload endpoint.
@@ -454,7 +454,7 @@ class UballClient:
         filename: str,
         duration: Optional[float] = None,
         file_size: Optional[int] = None,
-        s3_bucket: str = 'jetson-videos-uball'
+        s3_bucket: str = 'uball-videos-production'
     ) -> Optional[Dict[str, Any]]:
         """
         Register a video for a game, looking up game by Firebase ID.

@@ -427,7 +427,7 @@ def process_game_videos(
     video_processor: VideoProcessor,
     location: str = 'default-location',
     uball_client=None,
-    s3_bucket: str = 'jetson-videos-uball',
+    s3_bucket: str = 'uball-videos-production',
     progress_callback=None
 ) -> Dict[str, Any]:
     """
