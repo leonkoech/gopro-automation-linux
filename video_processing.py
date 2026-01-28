@@ -149,8 +149,8 @@ class VideoProcessor:
         chapters_needed = []
 
         for i, chapter in enumerate(chapters):
-            chapter_duration = chapter.get('duration_seconds', 0)
-            if chapter_duration <= 0:
+            chapter_duration = chapter.get('duration_seconds') or 0
+            if not chapter_duration or chapter_duration <= 0:
                 # Estimate ~15 min per 4GB chapter
                 chapter_duration = 900  # 15 minutes
 
