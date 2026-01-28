@@ -2220,14 +2220,23 @@ def debug_env():
     except:
         angle_map = None
 
-    # Test the actual function
-    test_result = _get_angle_code_from_camera_name('Backbone 1')
+    # Test the actual function from main.py
+    test_result_main = _get_angle_code_from_camera_name('Backbone 1')
+
+    # Test firebase_service's angle code function
+    firebase_angle_map = None
+    firebase_test_result = None
+    if firebase_service:
+        firebase_angle_map = firebase_service.camera_angle_map
+        firebase_test_result = firebase_service._get_angle_code('Backbone 1')
 
     return jsonify({
         'CAMERA_ANGLE_MAP_raw': angle_map_str,
         'CAMERA_ANGLE_MAP_parsed': angle_map,
         'JETSON_ID': os.getenv('JETSON_ID'),
-        'test_backbone_1_result': test_result,
+        'test_main_backbone_1': test_result_main,
+        'firebase_camera_angle_map': firebase_angle_map,
+        'test_firebase_backbone_1': firebase_test_result,
         'dotenv_loaded': True
     })
 
