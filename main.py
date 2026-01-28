@@ -1640,8 +1640,15 @@ def _run_video_processing_job(job_id: str, firebase_game_id: str, game_number: i
             if job_id in video_processing_jobs:
                 video_processing_jobs[job_id]['status'] = 'completed' if results['success'] else 'failed'
                 video_processing_jobs[job_id]['result'] = results
-                video_processing_jobs[job_id]['stage'] = 'completed' if results['success'] else 'failed'
-                video_processing_jobs[job_id]['detail'] = 'Processing complete' if results['success'] else 'Processing failed'
+
+                # Handle skipped case (no videos found but not an error)
+                if results.get('skipped'):
+                    video_processing_jobs[job_id]['stage'] = 'skipped'
+                    video_processing_jobs[job_id]['detail'] = results.get('skip_reason', 'No videos to process')
+                else:
+                    video_processing_jobs[job_id]['stage'] = 'completed' if results['success'] else 'failed'
+                    video_processing_jobs[job_id]['detail'] = 'Processing complete' if results['success'] else 'Processing failed'
+
                 video_processing_jobs[job_id]['progress'] = 100 if results['success'] else 0
                 video_processing_jobs[job_id]['completed_at'] = datetime.now().isoformat()
 

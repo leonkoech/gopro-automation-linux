@@ -534,8 +534,14 @@ def process_game_videos(
         logger.info(f"Found {len(overlapping_sessions)} overlapping recording sessions")
 
         if not overlapping_sessions:
-            results['errors'].append("No overlapping recording sessions found")
-            report_progress('error', 'No overlapping recording sessions found', 0)
+            # No overlapping sessions on this Jetson is not an error - it just means this Jetson
+            # doesn't have videos for this game timeframe. Mark as completed with "skipped" status.
+            jetson_id = os.getenv('JETSON_ID', 'unknown')
+            logger.info(f"No overlapping sessions found on {jetson_id} for game timeframe - skipping")
+            results['success'] = True  # Not a failure, just no files to process
+            results['skipped'] = True
+            results['skip_reason'] = f"No recording sessions overlap with game timeframe on {jetson_id}"
+            report_progress('completed', f'No videos found on {jetson_id} for this game timeframe (skipped)', 100)
             return results
 
         report_progress('processing', f'Processing {len(overlapping_sessions)} video angles...', 15)
