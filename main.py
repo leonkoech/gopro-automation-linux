@@ -2209,6 +2209,23 @@ def get_ntp_status():
             'error': str(e)
         }), 500
 
+
+@app.route('/api/debug/env', methods=['GET'])
+def debug_env():
+    """Debug endpoint to check environment variables."""
+    angle_map_str = os.getenv('CAMERA_ANGLE_MAP', '{}')
+    try:
+        angle_map = json.loads(angle_map_str)
+    except:
+        angle_map = None
+    return jsonify({
+        'CAMERA_ANGLE_MAP_raw': angle_map_str,
+        'CAMERA_ANGLE_MAP_parsed': angle_map,
+        'JETSON_ID': os.getenv('JETSON_ID'),
+        'dotenv_loaded': True  # If we get here, dotenv was loaded
+    })
+
+
 @app.route('/api/videos/<filename>/download', methods=['GET'])
 def download_video(filename):
     """Download a specific video file"""
