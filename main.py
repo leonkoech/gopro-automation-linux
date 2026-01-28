@@ -795,93 +795,17 @@ def stop_recording(gopro_id):
                     except Exception as e:
                         logger.error(f"[{gopro_id}] Error downloading chapter {chapter['filename']}: {e}")
 
-                # Merge all chapters
+                # Keep chapters in segments directory (no merging needed)
+                # Game extraction will use individual chapter files directly
                 if downloaded_files:
-                    # Update stage: merging
+                    total_size_mb = sum(os.path.getsize(f) for f in downloaded_files) / (1024 * 1024)
+                    logger.info(f"[{gopro_id}] Downloaded {len(downloaded_files)} chapters ({total_size_mb:.1f} MB) to {session_dir}")
+
+                    # Mark as done - chapters are kept in segments directory
                     with recording_lock:
                         if gopro_id in recording_processes:
-                            recording_processes[gopro_id]['stage'] = 'merging'
-                            recording_processes[gopro_id]['stage_message'] = 'Merging video chapters...'
-
-                    logger.info(f"[{gopro_id}] Merging {len(downloaded_files)} chapters into {video_path}...")
-
-                    if merge_videos_ffmpeg(downloaded_files, video_path):
-                        final_size_mb = os.path.getsize(video_path) / (1024 * 1024)
-                        logger.info(f"[{gopro_id}] Merged video saved: {video_path} ({final_size_mb:.1f} MB)")
-
-                        # Cleanup chapter files
-                        try:
-                            for f in downloaded_files:
-                                os.remove(f)
-                            os.rmdir(session_dir)
-                            logger.info(f"[{gopro_id}] Cleaned up {len(downloaded_files)} chapter files")
-                        except Exception as e:
-                            logger.warning(f"[{gopro_id}] Cleanup error: {e}")
-
-                        # Upload to S3 if enabled
-                        if upload_service:
-                            # Update stage: uploading
-                            with recording_lock:
-                                if gopro_id in recording_processes:
-                                    recording_processes[gopro_id]['stage'] = 'uploading'
-                                    recording_processes[gopro_id]['stage_message'] = 'Uploading to cloud...'
-
-                            try:
-                                logger.info(f"[{gopro_id}] Starting upload of {video_filename} to S3...")
-                                upload_date = datetime.now().strftime('%Y-%m-%d')
-
-                                # Get camera name from GoPro API, fallback to interface-based name
-                                camera_name = get_gopro_camera_name(gopro_ip)
-                                if not camera_name:
-                                    camera_name = f"GoPro-{gopro_id[-4:]}"
-                                    logger.info(f"[{gopro_id}] Using fallback camera name: {camera_name}")
-
-                                s3_uri = upload_service.upload_video(
-                                    video_path=video_path,
-                                    location=UPLOAD_LOCATION,
-                                    date=upload_date,
-                                    device_name=UPLOAD_DEVICE_NAME,
-                                    camera_name=camera_name,
-                                    compress=True,
-                                    delete_compressed_after_upload=True
-                                )
-                                logger.info(f"[{gopro_id}] Video uploaded to: {s3_uri}")
-
-                                # Update Firebase session status to 'uploaded'
-                                if firebase_service and firebase_session_id:
-                                    try:
-                                        firebase_service.update_session_status(firebase_session_id, 'uploaded')
-                                        logger.info(f"[{gopro_id}] Firebase session marked as uploaded")
-                                    except Exception as e:
-                                        logger.warning(f"[{gopro_id}] Failed to update Firebase status: {e}")
-
-                                # Update stage: done
-                                with recording_lock:
-                                    if gopro_id in recording_processes:
-                                        recording_processes[gopro_id]['stage'] = 'done'
-                                        recording_processes[gopro_id]['stage_message'] = 'Done!'
-
-                                # Optionally delete local file after upload
-                                if DELETE_AFTER_UPLOAD:
-                                    try:
-                                        os.remove(video_path)
-                                        logger.info(f"[{gopro_id}] Local file deleted after upload: {video_filename}")
-                                    except Exception as e:
-                                        logger.warning(f"[{gopro_id}] Failed to delete local file: {e}")
-                            except Exception as e:
-                                logger.error(f"[{gopro_id}] Upload failed: {e}")
-                                with recording_lock:
-                                    if gopro_id in recording_processes:
-                                        recording_processes[gopro_id]['stage'] = 'done'
-                                        recording_processes[gopro_id]['stage_message'] = 'Done (upload failed)'
-                        else:
-                            # No upload service, mark as done
-                            with recording_lock:
-                                if gopro_id in recording_processes:
-                                    recording_processes[gopro_id]['stage'] = 'done'
-                                    recording_processes[gopro_id]['stage_message'] = 'Done!'
-                    else:
-                        logger.error(f"[{gopro_id}] Failed to merge chapters - keeping individual files in {session_dir}")
+                            recording_processes[gopro_id]['stage'] = 'done'
+                            recording_processes[gopro_id]['stage_message'] = f'Done! {len(downloaded_files)} chapters saved'
                 else:
                     logger.warning(f"[{gopro_id}] No chapters downloaded")
 
