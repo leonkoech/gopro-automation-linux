@@ -262,12 +262,19 @@ def _get_angle_code_from_camera_name(camera_name: str) -> str:
     """
     # Try CAMERA_ANGLE_MAP env var first
     angle_map_str = os.getenv('CAMERA_ANGLE_MAP', '{}')
+    print(f"[DEBUG] CAMERA_ANGLE_MAP env: {angle_map_str}")
+    print(f"[DEBUG] Looking up camera_name: '{camera_name}'")
     try:
         angle_map = json.loads(angle_map_str)
+        print(f"[DEBUG] Parsed angle_map: {angle_map}")
         if camera_name in angle_map:
-            return angle_map[camera_name]
-    except json.JSONDecodeError:
-        pass
+            result = angle_map[camera_name]
+            print(f"[DEBUG] Found mapping: {camera_name} -> {result}")
+            return result
+        else:
+            print(f"[DEBUG] Camera '{camera_name}' not in angle_map keys: {list(angle_map.keys())}")
+    except json.JSONDecodeError as e:
+        print(f"[DEBUG] JSON decode error: {e}")
 
     # Fallback: extract from camera name like "GoPro FL"
     if camera_name:
