@@ -2218,11 +2218,16 @@ def debug_env():
         angle_map = json.loads(angle_map_str)
     except:
         angle_map = None
+
+    # Test the actual function
+    test_result = _get_angle_code_from_camera_name('Backbone 1')
+
     return jsonify({
         'CAMERA_ANGLE_MAP_raw': angle_map_str,
         'CAMERA_ANGLE_MAP_parsed': angle_map,
         'JETSON_ID': os.getenv('JETSON_ID'),
-        'dotenv_loaded': True  # If we get here, dotenv was loaded
+        'test_backbone_1_result': test_result,
+        'dotenv_loaded': True
     })
 
 
