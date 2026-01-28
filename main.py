@@ -517,7 +517,7 @@ def start_recording(gopro_id):
 
         # Get angle code from camera name for segment folder naming
         angle_code = _get_angle_code_from_camera_name(camera_name)
-        print(f"Camera angle code: {angle_code} (from {camera_name})")
+        logger.info(f"[{gopro_id}] Camera angle code: {angle_code} (from camera_name='{camera_name}')")
 
         # Prepare session info - store start datetime for filename generation at stop time
         # Include angle code in session_id for easier identification: {interface}_{angle}_{timestamp}
@@ -568,6 +568,7 @@ def start_recording(gopro_id):
             'gopro_id': gopro_id,
             'gopro_ip': gopro_ip,
             'camera_name': camera_name,
+            'angle_code': angle_code,
             'session_id': session_id,
             'firebase_session_id': firebase_session_id
         })
