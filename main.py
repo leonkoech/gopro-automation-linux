@@ -1730,10 +1730,20 @@ def get_video_processing_status(job_id):
     if job['status'] == 'completed':
         response['result'] = job['result']
         response['completed_at'] = job.get('completed_at')
+        # Extract status details from result
+        if job.get('result'):
+            response['status_message'] = job['result'].get('status_message')
+            response['result_status'] = job['result'].get('status')  # success, partial, corrupted, failed
+            response['corrupted_sessions'] = job['result'].get('corrupted_sessions', [])
     elif job['status'] == 'failed':
         response['error'] = job.get('error')
         response['result'] = job.get('result')
         response['completed_at'] = job.get('completed_at')
+        # Extract status details from result even on failure
+        if job.get('result'):
+            response['status_message'] = job['result'].get('status_message')
+            response['result_status'] = job['result'].get('status')
+            response['corrupted_sessions'] = job['result'].get('corrupted_sessions', [])
 
     return jsonify(response)
 

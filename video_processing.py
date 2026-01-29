@@ -47,15 +47,16 @@ class VideoProcessor:
         self.output_dir = os.path.join(storage_dir, 'game_extracts')
         os.makedirs(self.output_dir, exist_ok=True)
 
-    def get_session_chapters(self, session_name: str) -> List[Dict[str, Any]]:
+    def get_session_chapters(self, session_name: str, check_corruption: bool = False) -> List[Dict[str, Any]]:
         """
         Get list of chapter files for a recording session.
 
         Args:
             session_name: Name of the segment session folder
+            check_corruption: If True, check each file for corruption (slower)
 
         Returns:
-            List of chapter info dicts with path, filename, size, duration
+            List of chapter info dicts with path, filename, size, duration, corruption status
         """
         session_path = os.path.join(self.segments_dir, session_name)
         if not os.path.exists(session_path):
@@ -71,14 +72,26 @@ class VideoProcessor:
                 # Get video duration using ffprobe
                 duration = self._get_video_duration(filepath)
 
-                chapters.append({
+                chapter_info = {
                     'filename': filename,
                     'path': filepath,
                     'size_bytes': stat.st_size,
                     'size_mb': round(stat.st_size / (1024 * 1024), 2),
                     'duration_seconds': duration,
-                    'duration_str': self._format_duration(duration) if duration else 'unknown'
-                })
+                    'duration_str': self._format_duration(duration) if duration else 'unknown',
+                    'is_corrupted': False,
+                    'corruption_error': None
+                }
+
+                # Check for corruption if duration is None or if explicitly requested
+                if duration is None or check_corruption:
+                    is_corrupted, error_msg = self._is_video_corrupted(filepath)
+                    chapter_info['is_corrupted'] = is_corrupted
+                    chapter_info['corruption_error'] = error_msg if is_corrupted else None
+                    if is_corrupted:
+                        logger.error(f"Corrupted chapter detected: {filename} - {error_msg}")
+
+                chapters.append(chapter_info)
 
         return chapters
 
@@ -95,8 +108,44 @@ class VideoProcessor:
 
             if result.returncode == 0 and result.stdout.strip():
                 return float(result.stdout.strip())
+
+            # Check for corruption errors in stderr
+            if 'moov atom not found' in result.stderr:
+                logger.error(f"Video file corrupted (moov atom not found): {filepath}")
         except Exception as e:
             logger.warning(f"Could not get duration for {filepath}: {e}")
+
+    def _is_video_corrupted(self, filepath: str) -> Tuple[bool, str]:
+        """
+        Check if a video file is corrupted.
+
+        Returns:
+            Tuple of (is_corrupted, error_message)
+        """
+        try:
+            result = subprocess.run([
+                'ffprobe',
+                '-v', 'error',
+                '-show_entries', 'format=duration',
+                '-of', 'default=noprint_wrappers=1:nokey=1',
+                filepath
+            ], capture_output=True, text=True, timeout=30)
+
+            if result.returncode != 0:
+                if 'moov atom not found' in result.stderr:
+                    return True, 'Video file corrupted: moov atom not found (incomplete recording)'
+                elif 'Invalid data' in result.stderr:
+                    return True, 'Video file corrupted: invalid data'
+                else:
+                    return True, f'Video file error: {result.stderr.strip()}'
+
+            # Check if duration was returned
+            if not result.stdout.strip():
+                return True, 'Video file corrupted: no duration metadata'
+
+            return False, ''
+        except Exception as e:
+            return True, f'Error checking video: {str(e)}'
         return None
 
     def _get_video_height(self, filepath: str) -> Optional[int]:
@@ -653,11 +702,27 @@ def process_game_videos(
             logger.info(f"Processing session: {session_name} (angle: {angle_code})")
             report_progress('extracting', f'Extracting {angle_code} video...', session_base_progress, angle_code)
 
-            # Get chapter files
-            chapters = video_processor.get_session_chapters(session_name)
+            # Get chapter files (with corruption check)
+            chapters = video_processor.get_session_chapters(session_name, check_corruption=True)
             if not chapters:
                 logger.warning(f"No chapters found for session {session_name}")
                 results['errors'].append(f"No chapters for session {session_name}")
+                continue
+
+            # Check for corrupted chapters
+            corrupted_chapters = [ch for ch in chapters if ch.get('is_corrupted')]
+            if corrupted_chapters:
+                corruption_msg = corrupted_chapters[0].get('corruption_error', 'Unknown corruption')
+                logger.error(f"Corrupted video files for {angle_code}: {corruption_msg}")
+                results['errors'].append(f"CORRUPTED: {angle_code} video files are corrupted ({corruption_msg})")
+                # Mark this specifically as a corruption error for the frontend
+                if 'corrupted_sessions' not in results:
+                    results['corrupted_sessions'] = []
+                results['corrupted_sessions'].append({
+                    'angle': angle_code,
+                    'session': session_name,
+                    'error': corruption_msg
+                })
                 continue
 
             # Calculate extraction parameters
@@ -783,10 +848,34 @@ def process_game_videos(
                 })
 
         results['success'] = len(results['processed_videos']) > 0
+
+        # Build detailed status message
+        processed_count = len(results['processed_videos'])
+        corrupted_count = len(results.get('corrupted_sessions', []))
+        error_count = len(results.get('errors', []))
+
         if results['success']:
-            report_progress('completed', f"Processed {len(results['processed_videos'])} videos successfully", 100)
+            if corrupted_count > 0:
+                # Partial success with some corrupted files
+                corrupted_angles = ', '.join([c['angle'] for c in results['corrupted_sessions']])
+                status_msg = f"Processed {processed_count} video(s). {corrupted_count} corrupted ({corrupted_angles})"
+                results['status'] = 'partial'
+                report_progress('completed', status_msg, 100)
+            else:
+                status_msg = f"Processed {processed_count} video(s) successfully"
+                results['status'] = 'success'
+                report_progress('completed', status_msg, 100)
         else:
-            report_progress('failed', 'No videos were processed', 0)
+            if corrupted_count > 0:
+                corrupted_angles = ', '.join([c['angle'] for c in results['corrupted_sessions']])
+                status_msg = f"Failed: All video files corrupted ({corrupted_angles})"
+                results['status'] = 'corrupted'
+            else:
+                status_msg = 'No videos were processed'
+                results['status'] = 'failed'
+            report_progress('failed', status_msg, 0)
+
+        results['status_message'] = status_msg
         return results
 
     except Exception as e:
