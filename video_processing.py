@@ -152,27 +152,28 @@ class VideoProcessor:
 
         Returns:
             Dict with:
-                - offset_seconds: Seek position from start of recording
+                - offset_seconds: Seek position RELATIVE to first needed chapter
                 - duration_seconds: Length of game clip
                 - chapters_needed: List of chapter files needed
                 - start_chapter_index: Index of first chapter
                 - end_chapter_index: Index of last chapter
         """
         # Calculate offset from recording start to game start
-        offset = (game_start - recording_start).total_seconds()
-        if offset < 0:
+        offset_from_recording_start = (game_start - recording_start).total_seconds()
+        if offset_from_recording_start < 0:
             # Game started before recording - adjust
-            offset = 0
+            offset_from_recording_start = 0
             game_start = recording_start
 
         # Calculate game duration
         duration = (game_end - game_start).total_seconds()
 
-        # Find which chapters we need
+        # Find which chapters we need and calculate offset relative to first needed chapter
         current_time = 0
         start_chapter_idx = None
         end_chapter_idx = None
         chapters_needed = []
+        first_chapter_start_time = 0  # When the first needed chapter starts in recording time
 
         for i, chapter in enumerate(chapters):
             chapter_duration = chapter.get('duration_seconds') or 0
@@ -183,29 +184,42 @@ class VideoProcessor:
             chapter_end_time = current_time + chapter_duration
 
             # Check if this chapter contains any part of our game
-            game_start_in_recording = offset
-            game_end_in_recording = offset + duration
+            game_start_in_recording = offset_from_recording_start
+            game_end_in_recording = offset_from_recording_start + duration
 
             # Chapter overlaps with game if:
             # chapter_start < game_end AND chapter_end > game_start
             if current_time < game_end_in_recording and chapter_end_time > game_start_in_recording:
                 if start_chapter_idx is None:
                     start_chapter_idx = i
+                    first_chapter_start_time = current_time
                 end_chapter_idx = i
                 chapters_needed.append(chapter)
 
             current_time = chapter_end_time
 
+        # Calculate offset relative to the first needed chapter (not recording start)
+        # This is the seek position within the concatenated needed chapters
+        offset_relative_to_chapters = offset_from_recording_start - first_chapter_start_time
+        if offset_relative_to_chapters < 0:
+            offset_relative_to_chapters = 0
+
+        logger.info(f"  Offset from recording start: {self._format_duration(offset_from_recording_start)}")
+        logger.info(f"  First needed chapter starts at: {self._format_duration(first_chapter_start_time)}")
+        logger.info(f"  Offset relative to chapters: {self._format_duration(offset_relative_to_chapters)}")
+
         return {
-            'offset_seconds': offset,
+            'offset_seconds': offset_relative_to_chapters,  # FIXED: Use relative offset
             'duration_seconds': duration,
-            'offset_str': self._format_duration(offset),
+            'offset_str': self._format_duration(offset_relative_to_chapters),
             'duration_str': self._format_duration(duration),
             'chapters_needed': chapters_needed,
             'start_chapter_index': start_chapter_idx,
             'end_chapter_index': end_chapter_idx,
             'total_chapters': len(chapters),
-            'chapters_to_process': len(chapters_needed)
+            'chapters_to_process': len(chapters_needed),
+            'offset_from_recording_start': offset_from_recording_start,  # Keep for reference
+            'first_chapter_start_time': first_chapter_start_time  # For debugging
         }
 
     def extract_game_clip(
