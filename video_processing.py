@@ -345,7 +345,7 @@ class VideoProcessor:
         Extract clip from a single video file.
 
         If compress_if_needed is True and source is >1080p, will compress to 1080p
-        using high-quality settings (libx264, CRF 18, slow preset).
+        using Jetson hardware encoder (h264_v4l2m2m) for fast encoding.
         """
         logger.info(f"Extracting from single file: {input_path}")
         logger.info(f"  Offset: {self._format_duration(offset)}, Duration: {self._format_duration(duration)}")
@@ -362,13 +362,13 @@ class VideoProcessor:
         ]
 
         if needs_compress:
-            # Compress to 1080p with high-quality settings
-            logger.info(f"  Compressing to 1080p (CRF 18, slow preset)")
+            # Compress to 1080p using hardware encoder (Jetson Orin Nano)
+            # h264_v4l2m2m is ~30-50x faster than libx264 software encoding
+            logger.info(f"  Compressing to 1080p (hardware encoder h264_v4l2m2m, 8Mbps)")
             cmd.extend([
                 '-vf', 'scale=-2:1080',  # Scale to 1080p, maintain aspect ratio
-                '-c:v', 'libx264',
-                '-preset', 'slow',
-                '-crf', '18',  # Visually lossless
+                '-c:v', 'h264_v4l2m2m',  # Hardware encoder on Jetson
+                '-b:v', '8M',  # 8 Mbps for high quality
                 '-c:a', 'aac', '-b:a', '192k',
                 '-movflags', '+faststart',
             ])
@@ -378,8 +378,8 @@ class VideoProcessor:
 
         cmd.extend(['-avoid_negative_ts', 'make_zero', output_path])
 
-        # Use longer timeout for compression (can take a while)
-        timeout = 3600 if needs_compress else 600
+        # Hardware encoding is fast, but still allow reasonable timeout
+        timeout = 1800 if needs_compress else 600  # 30 min for HW encode, 10 min for copy
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
 
         if result.returncode != 0:
@@ -433,13 +433,13 @@ class VideoProcessor:
             ]
 
             if needs_compress:
-                # Compress to 1080p with high-quality settings
-                logger.info(f"  Compressing to 1080p (CRF 18, slow preset)")
+                # Compress to 1080p using hardware encoder (Jetson Orin Nano)
+                # h264_v4l2m2m is ~30-50x faster than libx264 software encoding
+                logger.info(f"  Compressing to 1080p (hardware encoder h264_v4l2m2m, 8Mbps)")
                 cmd.extend([
                     '-vf', 'scale=-2:1080',  # Scale to 1080p, maintain aspect ratio
-                    '-c:v', 'libx264',
-                    '-preset', 'slow',
-                    '-crf', '18',  # Visually lossless
+                    '-c:v', 'h264_v4l2m2m',  # Hardware encoder on Jetson
+                    '-b:v', '8M',  # 8 Mbps for high quality
                     '-c:a', 'aac', '-b:a', '192k',
                     '-movflags', '+faststart',
                 ])
