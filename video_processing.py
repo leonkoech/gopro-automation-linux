@@ -166,6 +166,43 @@ class VideoProcessor:
             logger.warning(f"Could not get height for {filepath}: {e}")
         return None
 
+    def _get_video_codec(self, filepath: str) -> Optional[str]:
+        """Get video codec name (e.g., 'hevc', 'h264') using ffprobe."""
+        try:
+            result = subprocess.run([
+                'ffprobe',
+                '-v', 'error',
+                '-select_streams', 'v:0',
+                '-show_entries', 'stream=codec_name',
+                '-of', 'csv=p=0',
+                filepath
+            ], capture_output=True, text=True, timeout=30)
+
+            if result.returncode == 0 and result.stdout.strip():
+                return result.stdout.strip().lower()
+        except Exception as e:
+            logger.warning(f"Could not get codec for {filepath}: {e}")
+        return None
+
+    def _get_hw_decoder(self, filepath: str) -> Optional[str]:
+        """Get the appropriate Jetson hardware decoder for the input file's codec.
+
+        Jetson Orin Nano has NVDEC hardware decoder but NO NVENC encoder.
+        Using HW decode frees CPU cores for libx264 software encoding.
+        """
+        codec = self._get_video_codec(filepath)
+        hw_decoders = {
+            'hevc': 'hevc_nvv4l2dec',
+            'h265': 'hevc_nvv4l2dec',
+            'h264': 'h264_nvv4l2dec',
+        }
+        decoder = hw_decoders.get(codec)
+        if decoder:
+            logger.info(f"  Using HW decoder {decoder} for {codec} input")
+        else:
+            logger.info(f"  No HW decoder for codec '{codec}', using software decode")
+        return decoder
+
     def _needs_compression(self, filepath: str, target_height: int = 1080) -> bool:
         """Check if video needs compression (resolution > target_height)."""
         height = self._get_video_height(filepath)
@@ -278,7 +315,9 @@ class VideoProcessor:
         duration_seconds: float,
         output_filename: str,
         add_buffer: float = 30.0,
-        compress_if_needed: bool = True
+        compress_if_needed: bool = True,
+        s3_upload_service=None,
+        s3_key: str = None
     ) -> Optional[str]:
         """
         Extract a game clip from chapter files using FFmpeg.
@@ -290,9 +329,12 @@ class VideoProcessor:
             output_filename: Name for output file
             add_buffer: Extra seconds to add before/after game (default 30s)
             compress_if_needed: If True, compress to 1080p if source is >1080p (default True)
+            s3_upload_service: If provided, pipe FFmpeg output directly to S3
+            s3_key: S3 key for direct upload (required if s3_upload_service is set)
 
         Returns:
-            Path to extracted video file, or None on failure
+            Path to extracted video file, or None on failure.
+            When streaming to S3, returns output_path for compatibility but file is in S3.
         """
         if not chapters:
             logger.error("No chapters provided for extraction")
@@ -304,27 +346,28 @@ class VideoProcessor:
         buffered_offset = max(0, offset_seconds - add_buffer)
         buffered_duration = duration_seconds + (2 * add_buffer)
 
-        # Adjust offset since we're starting earlier
         actual_offset = buffered_offset
 
         try:
             if len(chapters) == 1:
-                # Single chapter - direct extraction
                 return self._extract_from_single_file(
                     chapters[0]['path'],
                     actual_offset,
                     buffered_duration,
                     output_path,
-                    compress_if_needed=compress_if_needed
+                    compress_if_needed=compress_if_needed,
+                    s3_upload_service=s3_upload_service,
+                    s3_key=s3_key
                 )
             else:
-                # Multiple chapters - concat then extract
                 return self._extract_from_multiple_files(
                     [ch['path'] for ch in chapters],
                     actual_offset,
                     buffered_duration,
                     output_path,
-                    compress_if_needed=compress_if_needed
+                    compress_if_needed=compress_if_needed,
+                    s3_upload_service=s3_upload_service,
+                    s3_key=s3_key
                 )
 
         except Exception as e:
@@ -339,13 +382,18 @@ class VideoProcessor:
         offset: float,
         duration: float,
         output_path: str,
-        compress_if_needed: bool = True
+        compress_if_needed: bool = True,
+        s3_upload_service=None,
+        s3_key: str = None
     ) -> Optional[str]:
         """
         Extract clip from a single video file.
 
         If compress_if_needed is True and source is >1080p, will compress to 1080p
-        using Jetson hardware encoder (h264_v4l2m2m) for fast encoding.
+        using HW decode (hevc_nvv4l2dec) + libx264 ultrafast on Jetson Orin Nano.
+
+        If s3_upload_service and s3_key are provided, pipes FFmpeg output directly
+        to S3 via multipart upload (no temp file on disk).
         """
         logger.info(f"Extracting from single file: {input_path}")
         logger.info(f"  Offset: {self._format_duration(offset)}, Duration: {self._format_duration(duration)}")
@@ -353,104 +401,49 @@ class VideoProcessor:
         # Check if compression is needed
         needs_compress = compress_if_needed and self._needs_compression(input_path)
 
-        cmd = [
-            'ffmpeg',
-            '-y',  # Overwrite output
-            '-ss', str(offset),  # Seek position (before -i for fast seek)
-            '-i', input_path,
-            '-t', str(duration),  # Duration
-        ]
+        # Build FFmpeg command with input-level seeking (-ss before -i)
+        cmd = ['ffmpeg', '-y']
+
+        # Input-level -ss for fast keyframe seeking (skips decoding unwanted frames)
+        cmd.extend(['-ss', str(offset)])
+
+        # Use hardware decoder if available (Jetson NVDEC)
+        if needs_compress:
+            hw_decoder = self._get_hw_decoder(input_path)
+            if hw_decoder:
+                cmd.extend(['-c:v', hw_decoder])
+
+        cmd.extend(['-i', input_path])
+        cmd.extend(['-t', str(duration)])
 
         if needs_compress:
-            # Compress to 1080p using hardware encoder (Jetson Orin Nano)
-            # h264_v4l2m2m is ~30-50x faster than libx264 software encoding
-            logger.info(f"  Compressing to 1080p (hardware encoder h264_v4l2m2m, 8Mbps)")
+            # Jetson Orin Nano has NO hardware encoder (NVENC).
+            # Use libx264 ultrafast + HW decoder for best performance.
+            logger.info(f"  Compressing to 1080p (HW decode + libx264 ultrafast, CRF 23)")
             cmd.extend([
-                '-vf', 'scale=-2:1080',  # Scale to 1080p, maintain aspect ratio
-                '-c:v', 'h264_v4l2m2m',  # Hardware encoder on Jetson
-                '-b:v', '8M',  # 8 Mbps for high quality
-                '-c:a', 'aac', '-b:a', '192k',
-                '-movflags', '+faststart',
+                '-vf', 'scale=-2:1080',
+                '-c:v', 'libx264',
+                '-preset', 'ultrafast',
+                '-crf', '23',
+                '-c:a', 'aac', '-b:a', '128k',
             ])
+
+            if s3_upload_service and s3_key:
+                # Fragmented MP4 for pipe-compatible output (no seeking needed)
+                cmd.extend(['-movflags', 'frag_keyframe+empty_moov'])
+            else:
+                cmd.extend(['-movflags', '+faststart'])
         else:
             # Stream copy (fast, no re-encoding)
             cmd.extend(['-c', 'copy'])
 
-        cmd.extend(['-avoid_negative_ts', 'make_zero', output_path])
-
-        # Hardware encoding is fast, but still allow reasonable timeout
-        timeout = 1800 if needs_compress else 600  # 30 min for HW encode, 10 min for copy
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-
-        if result.returncode != 0:
-            logger.error(f"FFmpeg error: {result.stderr}")
-            return None
-
-        if os.path.exists(output_path):
-            size_mb = os.path.getsize(output_path) / (1024 * 1024)
-            logger.info(f"Extracted: {output_path} ({size_mb:.1f} MB)")
-            return output_path
-
-        return None
-
-    def _extract_from_multiple_files(
-        self,
-        input_paths: List[str],
-        offset: float,
-        duration: float,
-        output_path: str,
-        compress_if_needed: bool = True
-    ) -> Optional[str]:
-        """
-        Extract clip from multiple concatenated video files.
-
-        If compress_if_needed is True and source is >1080p, will compress to 1080p
-        using high-quality settings (libx264, CRF 18, slow preset).
-        """
-        logger.info(f"Extracting from {len(input_paths)} files")
-        logger.info(f"  Offset: {self._format_duration(offset)}, Duration: {self._format_duration(duration)}")
-
-        # Check first file to determine if compression is needed (all chapters same resolution)
-        needs_compress = compress_if_needed and input_paths and self._needs_compression(input_paths[0])
-
-        # Create concat file
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
-            concat_file = f.name
-            for path in sorted(input_paths):
-                # Escape single quotes in paths
-                escaped_path = path.replace("'", "'\\''")
-                f.write(f"file '{escaped_path}'\n")
-
-        try:
-            cmd = [
-                'ffmpeg',
-                '-y',
-                '-f', 'concat',
-                '-safe', '0',
-                '-i', concat_file,
-                '-ss', str(offset),
-                '-t', str(duration),
-            ]
-
-            if needs_compress:
-                # Compress to 1080p using hardware encoder (Jetson Orin Nano)
-                # h264_v4l2m2m is ~30-50x faster than libx264 software encoding
-                logger.info(f"  Compressing to 1080p (hardware encoder h264_v4l2m2m, 8Mbps)")
-                cmd.extend([
-                    '-vf', 'scale=-2:1080',  # Scale to 1080p, maintain aspect ratio
-                    '-c:v', 'h264_v4l2m2m',  # Hardware encoder on Jetson
-                    '-b:v', '8M',  # 8 Mbps for high quality
-                    '-c:a', 'aac', '-b:a', '192k',
-                    '-movflags', '+faststart',
-                ])
-            else:
-                # Stream copy (fast, no re-encoding)
-                cmd.extend(['-c', 'copy'])
-
+        # Pipe to S3 or write to disk
+        if s3_upload_service and s3_key:
+            cmd.extend(['-f', 'mp4', 'pipe:1'])
+            return self._stream_ffmpeg_to_s3(cmd, s3_upload_service, s3_key, output_path, needs_compress)
+        else:
             cmd.extend(['-avoid_negative_ts', 'make_zero', output_path])
-
-            # Use longer timeout for compression (can take a while)
-            timeout = 7200 if needs_compress else 1200
+            timeout = 7200 if needs_compress else 600
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
 
             if result.returncode != 0:
@@ -464,12 +457,237 @@ class VideoProcessor:
 
             return None
 
+    def _extract_from_multiple_files(
+        self,
+        input_paths: List[str],
+        offset: float,
+        duration: float,
+        output_path: str,
+        compress_if_needed: bool = True,
+        s3_upload_service=None,
+        s3_key: str = None
+    ) -> Optional[str]:
+        """
+        Extract clip from multiple concatenated video files.
+
+        If compress_if_needed is True and source is >1080p, will compress to 1080p
+        using HW decode (hevc_nvv4l2dec) + libx264 ultrafast on Jetson Orin Nano.
+
+        If s3_upload_service and s3_key are provided, pipes FFmpeg output directly
+        to S3 via multipart upload (no temp file on disk).
+        """
+        logger.info(f"Extracting from {len(input_paths)} files")
+        logger.info(f"  Offset: {self._format_duration(offset)}, Duration: {self._format_duration(duration)}")
+
+        # Check first file to determine if compression is needed (all chapters same resolution)
+        needs_compress = compress_if_needed and input_paths and self._needs_compression(input_paths[0])
+
+        # Create concat file
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
+            concat_file = f.name
+            for path in sorted(input_paths):
+                escaped_path = path.replace("'", "'\\''")
+                f.write(f"file '{escaped_path}'\n")
+
+        try:
+            cmd = ['ffmpeg', '-y']
+
+            # Input-level -ss for fast keyframe seeking (before -i)
+            cmd.extend(['-ss', str(offset)])
+
+            cmd.extend(['-f', 'concat', '-safe', '0', '-i', concat_file])
+            cmd.extend(['-t', str(duration)])
+
+            if needs_compress:
+                # Jetson Orin Nano has NO hardware encoder (NVENC).
+                # Use libx264 ultrafast + HW decoder for best performance.
+                # NOTE: HW decoder (-c:v hevc_nvv4l2dec) cannot be used with
+                # concat demuxer — ffmpeg applies -c:v to concat input, not individual files.
+                # The software decoder handles this automatically.
+                logger.info(f"  Compressing to 1080p (libx264 ultrafast, CRF 23)")
+                cmd.extend([
+                    '-vf', 'scale=-2:1080',
+                    '-c:v', 'libx264',
+                    '-preset', 'ultrafast',
+                    '-crf', '23',
+                    '-c:a', 'aac', '-b:a', '128k',
+                ])
+
+                if s3_upload_service and s3_key:
+                    cmd.extend(['-movflags', 'frag_keyframe+empty_moov'])
+                else:
+                    cmd.extend(['-movflags', '+faststart'])
+            else:
+                cmd.extend(['-c', 'copy'])
+
+            # Pipe to S3 or write to disk
+            if s3_upload_service and s3_key:
+                cmd.extend(['-f', 'mp4', 'pipe:1'])
+                return self._stream_ffmpeg_to_s3(cmd, s3_upload_service, s3_key, output_path, needs_compress)
+            else:
+                cmd.extend(['-avoid_negative_ts', 'make_zero', output_path])
+                timeout = 7200 if needs_compress else 1200
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+
+                if result.returncode != 0:
+                    logger.error(f"FFmpeg error: {result.stderr}")
+                    return None
+
+                if os.path.exists(output_path):
+                    size_mb = os.path.getsize(output_path) / (1024 * 1024)
+                    logger.info(f"Extracted: {output_path} ({size_mb:.1f} MB)")
+                    return output_path
+
+                return None
+
         finally:
-            # Clean up concat file
             try:
                 os.unlink(concat_file)
             except:
                 pass
+
+    def _stream_ffmpeg_to_s3(
+        self,
+        cmd: List[str],
+        upload_service,
+        s3_key: str,
+        output_path: str,
+        needs_compress: bool
+    ) -> Optional[str]:
+        """
+        Run FFmpeg and pipe stdout directly to S3 via boto3 multipart upload.
+
+        This avoids writing large temp files to disk and overlaps encoding
+        with uploading for better throughput.
+
+        Returns the output_path string on success (for compatibility with callers),
+        even though the file is streamed to S3 and not saved locally.
+        """
+        import io
+        import threading
+
+        logger.info(f"  Streaming FFmpeg output directly to S3: {s3_key}")
+        logger.info(f"  FFmpeg cmd: {' '.join(cmd)}")
+
+        s3_client = upload_service.s3_client
+        bucket = upload_service.bucket_name
+
+        # Start multipart upload
+        mpu = s3_client.create_multipart_upload(
+            Bucket=bucket,
+            Key=s3_key,
+            ContentType='video/mp4'
+        )
+        upload_id = mpu['UploadId']
+        parts = []
+        part_number = 1
+        # 25 MB part size (matches existing transfer config)
+        PART_SIZE = 25 * 1024 * 1024
+        total_bytes = 0
+
+        try:
+            # Start FFmpeg with stdout pipe
+            process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                bufsize=PART_SIZE
+            )
+
+            # Read stderr in background thread to prevent blocking
+            stderr_output = []
+            def read_stderr():
+                stderr_output.append(process.stderr.read().decode('utf-8', errors='replace'))
+            stderr_thread = threading.Thread(target=read_stderr, daemon=True)
+            stderr_thread.start()
+
+            buffer = b''
+            while True:
+                chunk = process.stdout.read(PART_SIZE - len(buffer))
+                if not chunk:
+                    break
+                buffer += chunk
+
+                if len(buffer) >= PART_SIZE:
+                    # Upload this part
+                    response = s3_client.upload_part(
+                        Bucket=bucket,
+                        Key=s3_key,
+                        PartNumber=part_number,
+                        UploadId=upload_id,
+                        Body=buffer
+                    )
+                    parts.append({
+                        'ETag': response['ETag'],
+                        'PartNumber': part_number
+                    })
+                    total_bytes += len(buffer)
+                    logger.info(f"  Uploaded part {part_number} ({total_bytes / (1024*1024):.0f} MB streamed)")
+                    part_number += 1
+                    buffer = b''
+
+            # Upload remaining buffer (final part, can be < 5MB)
+            if buffer:
+                response = s3_client.upload_part(
+                    Bucket=bucket,
+                    Key=s3_key,
+                    PartNumber=part_number,
+                    UploadId=upload_id,
+                    Body=buffer
+                )
+                parts.append({
+                    'ETag': response['ETag'],
+                    'PartNumber': part_number
+                })
+                total_bytes += len(buffer)
+                logger.info(f"  Uploaded final part {part_number} ({total_bytes / (1024*1024):.0f} MB total)")
+
+            # Wait for FFmpeg to finish
+            process.stdout.close()
+            return_code = process.wait(timeout=60)
+            stderr_thread.join(timeout=10)
+
+            if return_code != 0:
+                stderr_text = stderr_output[0] if stderr_output else 'unknown error'
+                logger.error(f"FFmpeg failed (exit {return_code}): {stderr_text[-500:]}")
+                # Abort multipart upload
+                s3_client.abort_multipart_upload(
+                    Bucket=bucket, Key=s3_key, UploadId=upload_id
+                )
+                return None
+
+            if not parts:
+                logger.error("FFmpeg produced no output")
+                s3_client.abort_multipart_upload(
+                    Bucket=bucket, Key=s3_key, UploadId=upload_id
+                )
+                return None
+
+            # Complete multipart upload
+            s3_client.complete_multipart_upload(
+                Bucket=bucket,
+                Key=s3_key,
+                UploadId=upload_id,
+                MultipartUpload={'Parts': parts}
+            )
+
+            logger.info(f"  Streamed to S3: s3://{bucket}/{s3_key} ({total_bytes / (1024*1024):.1f} MB)")
+            return output_path  # Return path for compatibility (file is in S3, not local)
+
+        except Exception as e:
+            logger.error(f"Stream-to-S3 failed: {e}")
+            try:
+                s3_client.abort_multipart_upload(
+                    Bucket=bucket, Key=s3_key, UploadId=upload_id
+                )
+            except:
+                pass
+            # Kill ffmpeg if still running
+            try:
+                process.kill()
+            except:
+                pass
+            return None
 
     def generate_game_filename(
         self,
@@ -737,44 +955,67 @@ def process_game_videos(
                 logger.warning(f"No chapters needed for this game timeframe")
                 continue
 
-            # Generate output filename
+            # Generate output filename and S3 key upfront
             output_filename = video_processor.generate_game_filename(
                 game_date, angle_code, uball_game_id
             )
 
-            # Extract the clip
+            s3_key = video_processor.generate_s3_key(
+                location, game_date, angle_code, uball_game_id
+            ) if upload_service else None
+
+            # Extract the clip — streams directly to S3 if upload_service is available
+            report_progress('extracting', f'Encoding & streaming {angle_code} to S3...', session_base_progress, angle_code)
+
             extracted_path = video_processor.extract_game_clip(
                 params['chapters_needed'],
                 params['offset_seconds'],
                 params['duration_seconds'],
                 output_filename,
-                add_buffer=30.0  # 30 second buffer
+                add_buffer=30.0,
+                s3_upload_service=upload_service,
+                s3_key=s3_key
             )
 
             if not extracted_path:
                 results['errors'].append(f"Extraction failed for {angle_code}")
                 continue
 
-            # Get video info
-            video_info = video_processor.get_video_info(extracted_path)
+            # When streamed to S3, file is not on disk — get info from S3 instead
+            streamed_to_s3 = upload_service and s3_key
+            if streamed_to_s3:
+                # Get file size from S3
+                try:
+                    s3_head = upload_service.s3_client.head_object(
+                        Bucket=upload_service.bucket_name, Key=s3_key
+                    )
+                    video_info = {
+                        'size_bytes': s3_head.get('ContentLength', 0),
+                        'duration': params['duration_seconds'],
+                    }
+                except Exception as e:
+                    logger.warning(f"Could not get S3 object info: {e}")
+                    video_info = {'size_bytes': 0, 'duration': params['duration_seconds']}
 
-            # 4. Upload to S3
+                s3_uri = f"s3://{upload_service.bucket_name}/{s3_key}"
+                logger.info(f"Streamed to S3: {s3_uri}")
+            else:
+                video_info = video_processor.get_video_info(extracted_path)
+
+            # 4. Upload to S3 (only if NOT already streamed)
             if upload_service:
                 try:
                     upload_progress = session_base_progress + 25
-                    report_progress('uploading', f'Uploading {angle_code} to S3...', upload_progress, angle_code)
 
-                    s3_key = video_processor.generate_s3_key(
-                        location, game_date, angle_code, uball_game_id
-                    )
+                    if not streamed_to_s3:
+                        # Fallback: separate upload (only if streaming was not used)
+                        report_progress('uploading', f'Uploading {angle_code} to S3...', upload_progress, angle_code)
+                        s3_uri = upload_service.upload_video_with_key(
+                            video_path=extracted_path,
+                            s3_key=s3_key
+                        )
+                        logger.info(f"Uploaded to S3: {s3_uri}")
 
-                    # Upload using the service
-                    s3_uri = upload_service.upload_video_with_key(
-                        video_path=extracted_path,
-                        s3_key=s3_key
-                    )
-
-                    logger.info(f"Uploaded to S3: {s3_uri}")
                     report_progress('uploaded', f'{angle_code} uploaded successfully', upload_progress + 10, angle_code)
 
                     # Update recording session with processed game info
@@ -827,11 +1068,12 @@ def process_game_videos(
                             logger.error(f"Uball registration error for {angle_code}: {e}")
                             results['errors'].append(f"Uball registration error for {angle_code}: {str(e)}")
 
-                    # Clean up local file after upload
-                    try:
-                        os.remove(extracted_path)
-                    except:
-                        pass
+                    # Clean up local file after upload (skip if streamed to S3)
+                    if not streamed_to_s3:
+                        try:
+                            os.remove(extracted_path)
+                        except:
+                            pass
 
                 except Exception as e:
                     logger.error(f"Upload failed for {angle_code}: {e}")
