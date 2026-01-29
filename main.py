@@ -1814,8 +1814,12 @@ def preview_game_extraction(game_id):
         game_end = datetime.fromisoformat(ended_at.replace('Z', '+00:00')) if ended_at else datetime.now(game_start.tzinfo)
         game_duration = (game_end - game_start).total_seconds()
 
-        # Find overlapping sessions
-        all_sessions = firebase_service.get_recording_sessions(limit=100)
+        # Find overlapping sessions - get ALL sessions (from all Jetsons) for preview
+        # Processing will filter by jetson_id, but preview shows the full picture
+        this_jetson_id = os.getenv('JETSON_ID', 'unknown')
+        logger.info(f"[VideoProcessing] Preview for game {game_id} (this Jetson: {this_jetson_id})")
+        all_sessions = firebase_service.get_recording_sessions(limit=100)  # No jetson_id filter for preview
+        logger.info(f"[VideoProcessing] Found {len(all_sessions)} total sessions across all Jetsons")
         session_previews = []
 
         for session in all_sessions:
@@ -1832,9 +1836,11 @@ def preview_game_extraction(game_id):
             if s_start < game_end and s_end > game_start:
                 session_name = session.get('segmentSession', '')
                 angle_code = session.get('angleCode', 'UNKNOWN')
+                session_jetson_id = session.get('jetsonId', 'unknown')
+                is_local = (session_jetson_id == this_jetson_id)
 
-                # Get chapters
-                chapters = video_processor.get_session_chapters(session_name)
+                # Get chapters (only available if session is on this Jetson)
+                chapters = video_processor.get_session_chapters(session_name) if is_local else []
 
                 # Calculate extraction params
                 if chapters:
@@ -1842,12 +1848,17 @@ def preview_game_extraction(game_id):
                         game_start, game_end, s_start, chapters
                     )
                 else:
-                    params = {'error': 'No chapters found'}
+                    if is_local:
+                        params = {'error': 'No chapters found locally'}
+                    else:
+                        params = {'error': f'Session on {session_jetson_id} (process from that Jetson)'}
 
                 session_previews.append({
                     'session_id': session.get('id'),
                     'segment_session': session_name,
                     'angle': angle_code,
+                    'jetson_id': session_jetson_id,
+                    'is_local': is_local,
                     'session_start': session_start_str,
                     'session_end': session_end_str,
                     'chapters_count': len(chapters),
@@ -1882,6 +1893,8 @@ def preview_game_extraction(game_id):
                 'session_id': sp.get('session_id', ''),
                 'session_name': sp.get('segment_session', ''),
                 'angle_code': sp.get('angle', 'UNKNOWN'),
+                'jetson_id': sp.get('jetson_id', 'unknown'),
+                'is_local': sp.get('is_local', False),
                 'recording_start': sp.get('session_start', ''),
                 'recording_end': sp.get('session_end', ''),
                 'chapters': formatted_chapters,
@@ -1893,14 +1906,19 @@ def preview_game_extraction(game_id):
                 }
             })
 
+        # Count sessions that have local chapters (ready to process on THIS Jetson)
+        local_sessions_with_chapters = [s for s in formatted_sessions if s['is_local'] and s['extraction_params']['chapters_to_process'] > 0]
+
         return jsonify({
             'success': True,
             'firebase_game_id': game_id,
             'game_start': created_at,
             'game_end': ended_at or '',
             'game_duration_minutes': round(game_duration / 60, 1),
+            'this_jetson_id': this_jetson_id,
             'overlapping_sessions': formatted_sessions,
-            'ready_for_extraction': len(formatted_sessions) > 0,
+            'local_sessions_ready': len(local_sessions_with_chapters),
+            'ready_for_extraction': len(local_sessions_with_chapters) > 0,
             'issues': issues if issues else None
         })
 

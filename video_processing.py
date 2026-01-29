@@ -99,6 +99,32 @@ class VideoProcessor:
             logger.warning(f"Could not get duration for {filepath}: {e}")
         return None
 
+    def _get_video_height(self, filepath: str) -> Optional[int]:
+        """Get video height (vertical resolution) in pixels using ffprobe."""
+        try:
+            result = subprocess.run([
+                'ffprobe',
+                '-v', 'error',
+                '-select_streams', 'v:0',
+                '-show_entries', 'stream=height',
+                '-of', 'csv=p=0',
+                filepath
+            ], capture_output=True, text=True, timeout=30)
+
+            if result.returncode == 0 and result.stdout.strip():
+                return int(result.stdout.strip())
+        except Exception as e:
+            logger.warning(f"Could not get height for {filepath}: {e}")
+        return None
+
+    def _needs_compression(self, filepath: str, target_height: int = 1080) -> bool:
+        """Check if video needs compression (resolution > target_height)."""
+        height = self._get_video_height(filepath)
+        if height and height > target_height:
+            logger.info(f"Video {filepath} is {height}p, needs compression to {target_height}p")
+            return True
+        return False
+
     def _format_duration(self, seconds: float) -> str:
         """Format duration in seconds to HH:MM:SS."""
         hours = int(seconds // 3600)
@@ -188,7 +214,8 @@ class VideoProcessor:
         offset_seconds: float,
         duration_seconds: float,
         output_filename: str,
-        add_buffer: float = 30.0
+        add_buffer: float = 30.0,
+        compress_if_needed: bool = True
     ) -> Optional[str]:
         """
         Extract a game clip from chapter files using FFmpeg.
@@ -199,6 +226,7 @@ class VideoProcessor:
             duration_seconds: Length of clip to extract
             output_filename: Name for output file
             add_buffer: Extra seconds to add before/after game (default 30s)
+            compress_if_needed: If True, compress to 1080p if source is >1080p (default True)
 
         Returns:
             Path to extracted video file, or None on failure
@@ -223,7 +251,8 @@ class VideoProcessor:
                     chapters[0]['path'],
                     actual_offset,
                     buffered_duration,
-                    output_path
+                    output_path,
+                    compress_if_needed=compress_if_needed
                 )
             else:
                 # Multiple chapters - concat then extract
@@ -231,7 +260,8 @@ class VideoProcessor:
                     [ch['path'] for ch in chapters],
                     actual_offset,
                     buffered_duration,
-                    output_path
+                    output_path,
+                    compress_if_needed=compress_if_needed
                 )
 
         except Exception as e:
@@ -245,11 +275,20 @@ class VideoProcessor:
         input_path: str,
         offset: float,
         duration: float,
-        output_path: str
+        output_path: str,
+        compress_if_needed: bool = True
     ) -> Optional[str]:
-        """Extract clip from a single video file."""
+        """
+        Extract clip from a single video file.
+
+        If compress_if_needed is True and source is >1080p, will compress to 1080p
+        using high-quality settings (libx264, CRF 18, slow preset).
+        """
         logger.info(f"Extracting from single file: {input_path}")
         logger.info(f"  Offset: {self._format_duration(offset)}, Duration: {self._format_duration(duration)}")
+
+        # Check if compression is needed
+        needs_compress = compress_if_needed and self._needs_compression(input_path)
 
         cmd = [
             'ffmpeg',
@@ -257,12 +296,28 @@ class VideoProcessor:
             '-ss', str(offset),  # Seek position (before -i for fast seek)
             '-i', input_path,
             '-t', str(duration),  # Duration
-            '-c', 'copy',  # Copy streams without re-encoding
-            '-avoid_negative_ts', 'make_zero',
-            output_path
         ]
 
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        if needs_compress:
+            # Compress to 1080p with high-quality settings
+            logger.info(f"  Compressing to 1080p (CRF 18, slow preset)")
+            cmd.extend([
+                '-vf', 'scale=-2:1080',  # Scale to 1080p, maintain aspect ratio
+                '-c:v', 'libx264',
+                '-preset', 'slow',
+                '-crf', '18',  # Visually lossless
+                '-c:a', 'aac', '-b:a', '192k',
+                '-movflags', '+faststart',
+            ])
+        else:
+            # Stream copy (fast, no re-encoding)
+            cmd.extend(['-c', 'copy'])
+
+        cmd.extend(['-avoid_negative_ts', 'make_zero', output_path])
+
+        # Use longer timeout for compression (can take a while)
+        timeout = 3600 if needs_compress else 600
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
 
         if result.returncode != 0:
             logger.error(f"FFmpeg error: {result.stderr}")
@@ -280,11 +335,20 @@ class VideoProcessor:
         input_paths: List[str],
         offset: float,
         duration: float,
-        output_path: str
+        output_path: str,
+        compress_if_needed: bool = True
     ) -> Optional[str]:
-        """Extract clip from multiple concatenated video files."""
+        """
+        Extract clip from multiple concatenated video files.
+
+        If compress_if_needed is True and source is >1080p, will compress to 1080p
+        using high-quality settings (libx264, CRF 18, slow preset).
+        """
         logger.info(f"Extracting from {len(input_paths)} files")
         logger.info(f"  Offset: {self._format_duration(offset)}, Duration: {self._format_duration(duration)}")
+
+        # Check first file to determine if compression is needed (all chapters same resolution)
+        needs_compress = compress_if_needed and input_paths and self._needs_compression(input_paths[0])
 
         # Create concat file
         with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
@@ -303,12 +367,28 @@ class VideoProcessor:
                 '-i', concat_file,
                 '-ss', str(offset),
                 '-t', str(duration),
-                '-c', 'copy',
-                '-avoid_negative_ts', 'make_zero',
-                output_path
             ]
 
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=1200)
+            if needs_compress:
+                # Compress to 1080p with high-quality settings
+                logger.info(f"  Compressing to 1080p (CRF 18, slow preset)")
+                cmd.extend([
+                    '-vf', 'scale=-2:1080',  # Scale to 1080p, maintain aspect ratio
+                    '-c:v', 'libx264',
+                    '-preset', 'slow',
+                    '-crf', '18',  # Visually lossless
+                    '-c:a', 'aac', '-b:a', '192k',
+                    '-movflags', '+faststart',
+                ])
+            else:
+                # Stream copy (fast, no re-encoding)
+                cmd.extend(['-c', 'copy'])
+
+            cmd.extend(['-avoid_negative_ts', 'make_zero', output_path])
+
+            # Use longer timeout for compression (can take a while)
+            timeout = 7200 if needs_compress else 1200
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
 
             if result.returncode != 0:
                 logger.error(f"FFmpeg error: {result.stderr}")
