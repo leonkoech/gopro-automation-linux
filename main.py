@@ -1755,8 +1755,10 @@ def get_video_processing_status(job_id):
         # Extract status details from result
         if job.get('result'):
             response['status_message'] = job['result'].get('status_message')
-            response['result_status'] = job['result'].get('status')  # success, partial, corrupted, failed
+            response['result_status'] = job['result'].get('status')  # success, partial, corrupted, failed, batch_submitted
             response['corrupted_sessions'] = job['result'].get('corrupted_sessions', [])
+            response['gpu_transcode_enabled'] = job['result'].get('gpu_transcode_enabled', False)
+            response['batch_jobs'] = job['result'].get('batch_jobs', [])
     elif job['status'] == 'failed':
         response['error'] = job.get('error')
         response['result'] = job.get('result')
@@ -1766,6 +1768,8 @@ def get_video_processing_status(job_id):
             response['status_message'] = job['result'].get('status_message')
             response['result_status'] = job['result'].get('status')
             response['corrupted_sessions'] = job['result'].get('corrupted_sessions', [])
+            response['gpu_transcode_enabled'] = job['result'].get('gpu_transcode_enabled', False)
+            response['batch_jobs'] = job['result'].get('batch_jobs', [])
 
     return jsonify(response)
 
@@ -3395,6 +3399,279 @@ def search_logs():
     })
 
 
+# ==================== AWS Batch GPU Transcode Endpoints ====================
+
+# Track batch transcode jobs (job_id -> job_state)
+batch_transcode_jobs = {}
+batch_transcode_lock = threading.Lock()
+
+
+@app.route('/api/batch/transcode/<job_id>/status', methods=['GET'])
+def get_batch_transcode_status(job_id):
+    """
+    Get status of an AWS Batch transcode job.
+
+    This endpoint polls AWS Batch for the current job status.
+
+    Args:
+        job_id: AWS Batch job ID
+
+    Returns:
+        {
+            "success": true,
+            "jobId": "job-uuid",
+            "status": "SUBMITTED|PENDING|RUNNABLE|STARTING|RUNNING|SUCCEEDED|FAILED",
+            "statusReason": "...",
+            "createdAt": timestamp,
+            "startedAt": timestamp,
+            "stoppedAt": timestamp
+        }
+    """
+    try:
+        from aws_batch_transcode import AWSBatchTranscoder, is_aws_gpu_transcode_enabled
+
+        if not is_aws_gpu_transcode_enabled():
+            return jsonify({
+                'success': False,
+                'error': 'AWS GPU transcoding is not enabled. Set USE_AWS_GPU_TRANSCODE=true'
+            }), 503
+
+        transcoder = AWSBatchTranscoder()
+        status = transcoder.get_job_status(job_id)
+
+        return jsonify({
+            'success': True,
+            **status
+        })
+
+    except Exception as e:
+        logger.error(f"[BatchTranscode] Error getting job status: {e}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+
+@app.route('/api/batch/transcode/<job_id>/complete', methods=['POST'])
+def complete_batch_transcode(job_id):
+    """
+    Finalize after a Batch transcode job completes successfully.
+
+    Actions:
+    1. Verify job succeeded
+    2. Delete raw 4K file from S3 raw/ prefix
+    3. Get output file info
+    4. Register FL/FR videos in Uball Backend
+
+    Request Body:
+    {
+        "raw_s3_key": "raw/court-a/2026-01-20/uuid/FL_4k.mp4",
+        "final_s3_key": "court-a/2026-01-20/uuid/2026-01-20_uuid_FL.mp4",
+        "angle": "FL",
+        "firebase_game_id": "abc123",
+        "filename": "2026-01-20_uuid_FL.mp4",
+        "duration": 3600  // seconds
+    }
+
+    Returns:
+        {
+            "success": true,
+            "raw_deleted": true,
+            "output_file": {...},
+            "uball_registered": true  // for FL/FR only
+        }
+    """
+    try:
+        from aws_batch_transcode import AWSBatchTranscoder, is_aws_gpu_transcode_enabled
+
+        if not is_aws_gpu_transcode_enabled():
+            return jsonify({
+                'success': False,
+                'error': 'AWS GPU transcoding is not enabled. Set USE_AWS_GPU_TRANSCODE=true'
+            }), 503
+
+        data = request.get_json()
+        if not data:
+            return jsonify({'success': False, 'error': 'Request body required'}), 400
+
+        raw_s3_key = data.get('raw_s3_key')
+        final_s3_key = data.get('final_s3_key')
+        angle = data.get('angle', '').upper()
+        firebase_game_id = data.get('firebase_game_id')
+        filename = data.get('filename')
+        duration = data.get('duration')
+
+        if not raw_s3_key or not final_s3_key:
+            return jsonify({'success': False, 'error': 'raw_s3_key and final_s3_key required'}), 400
+
+        transcoder = AWSBatchTranscoder()
+
+        # 1. Verify job succeeded
+        status = transcoder.get_job_status(job_id)
+        job_status = status.get('status', 'UNKNOWN')
+
+        if job_status != 'SUCCEEDED':
+            return jsonify({
+                'success': False,
+                'error': f'Job has not succeeded yet. Current status: {job_status}',
+                'job_status': status
+            }), 400
+
+        result = {
+            'success': True,
+            'job_id': job_id,
+            'job_status': job_status
+        }
+
+        # 2. Delete raw 4K file from S3
+        raw_deleted = transcoder.delete_raw_file(raw_s3_key)
+        result['raw_deleted'] = raw_deleted
+        if not raw_deleted:
+            logger.warning(f"[BatchTranscode] Could not delete raw file: {raw_s3_key}")
+
+        # 3. Get output file info
+        output_info = transcoder.get_output_file_info(final_s3_key)
+        result['output_file'] = output_info
+
+        # 4. Register FL/FR videos in Uball Backend
+        if uball_client and angle in ['FL', 'FR'] and firebase_game_id:
+            try:
+                uball_result = uball_client.register_game_video(
+                    firebase_game_id=firebase_game_id,
+                    s3_key=final_s3_key,
+                    angle_code=angle,
+                    filename=filename or final_s3_key.split('/')[-1],
+                    duration=duration,
+                    file_size=output_info.get('size_bytes'),
+                    s3_bucket=UPLOAD_BUCKET
+                )
+
+                if uball_result:
+                    logger.info(f"[BatchTranscode] Registered {angle} video in Uball: {uball_result.get('id')}")
+                    result['uball_registered'] = True
+                    result['uball_video_id'] = uball_result.get('id')
+                else:
+                    logger.warning(f"[BatchTranscode] Failed to register {angle} video in Uball")
+                    result['uball_registered'] = False
+                    result['uball_error'] = 'Registration returned null'
+
+            except Exception as e:
+                logger.error(f"[BatchTranscode] Uball registration error for {angle}: {e}")
+                result['uball_registered'] = False
+                result['uball_error'] = str(e)
+        else:
+            result['uball_registered'] = False
+            if angle not in ['FL', 'FR']:
+                result['uball_skip_reason'] = f'Angle {angle} not registered in Uball (FL/FR only)'
+
+        return jsonify(result)
+
+    except Exception as e:
+        logger.error(f"[BatchTranscode] Error completing job: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+
+@app.route('/api/batch/transcode/<job_id>/wait', methods=['POST'])
+def wait_for_batch_transcode(job_id):
+    """
+    Wait for a Batch transcode job to complete (blocking).
+
+    This endpoint will poll AWS Batch until the job reaches a terminal state
+    (SUCCEEDED or FAILED) or timeout is reached.
+
+    Request Body:
+    {
+        "timeout": 1800,      // Max wait time in seconds (default: 30 min)
+        "poll_interval": 30   // Seconds between status checks (default: 30)
+    }
+
+    Returns:
+        Final job status (same as GET /api/batch/transcode/{job_id}/status)
+    """
+    try:
+        from aws_batch_transcode import AWSBatchTranscoder, is_aws_gpu_transcode_enabled
+
+        if not is_aws_gpu_transcode_enabled():
+            return jsonify({
+                'success': False,
+                'error': 'AWS GPU transcoding is not enabled. Set USE_AWS_GPU_TRANSCODE=true'
+            }), 503
+
+        data = request.get_json() or {}
+        timeout = data.get('timeout', 1800)  # 30 min default
+        poll_interval = data.get('poll_interval', 30)
+
+        transcoder = AWSBatchTranscoder()
+
+        try:
+            status = transcoder.wait_for_job(job_id, timeout=timeout, poll_interval=poll_interval)
+            return jsonify({
+                'success': True,
+                **status
+            })
+        except TimeoutError as e:
+            return jsonify({
+                'success': False,
+                'error': str(e),
+                'timeout': True
+            }), 408
+
+    except Exception as e:
+        logger.error(f"[BatchTranscode] Error waiting for job: {e}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+
+@app.route('/api/batch/transcode/config', methods=['GET'])
+def get_batch_transcode_config():
+    """
+    Get AWS Batch transcoding configuration.
+
+    Returns:
+        {
+            "success": true,
+            "enabled": true|false,
+            "config": {
+                "job_queue": "...",
+                "job_definition": "...",
+                "region": "...",
+                "bucket": "..."
+            }
+        }
+    """
+    try:
+        from aws_batch_transcode import is_aws_gpu_transcode_enabled
+
+        enabled = is_aws_gpu_transcode_enabled()
+
+        config = {
+            'job_queue': os.getenv('AWS_BATCH_JOB_QUEUE', 'gpu-transcode-queue'),
+            'job_definition': os.getenv('AWS_BATCH_JOB_DEFINITION', 'ffmpeg-nvenc-transcode'),
+            'region': os.getenv('AWS_BATCH_REGION', os.getenv('AWS_REGION', 'us-east-1')),
+            'bucket': os.getenv('UPLOAD_BUCKET', 'uball-videos-production')
+        }
+
+        return jsonify({
+            'success': True,
+            'enabled': enabled,
+            'config': config
+        })
+
+    except Exception as e:
+        logger.error(f"[BatchTranscode] Error getting config: {e}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+
 if __name__ == '__main__':
     logger.info("=" * 60)
     logger.info("GoPro Controller API Service Starting...")
@@ -3404,6 +3681,16 @@ if __name__ == '__main__':
     logger.info(f"Log directory: {logging_service.log_dir}")
     logger.info(f"API endpoint: http://0.0.0.0:5000")
     logger.info("Make sure GoPros are connected via USB")
+
+    # Check AWS GPU transcoding status
+    use_aws_gpu = os.getenv('USE_AWS_GPU_TRANSCODE', 'false').lower() == 'true'
+    if use_aws_gpu:
+        logger.info("AWS GPU Transcoding: ENABLED")
+        logger.info(f"  Job Queue: {os.getenv('AWS_BATCH_JOB_QUEUE', 'gpu-transcode-queue')}")
+        logger.info(f"  Job Definition: {os.getenv('AWS_BATCH_JOB_DEFINITION', 'ffmpeg-nvenc-transcode')}")
+    else:
+        logger.info("AWS GPU Transcoding: DISABLED (using local CPU encoding)")
+
     logger.info("=" * 60)
 
     app.run(host='0.0.0.0', port=5000, debug=False, threaded=True)

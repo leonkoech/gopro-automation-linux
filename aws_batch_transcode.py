@@ -1,0 +1,406 @@
+"""
+AWS Batch GPU Transcoding Module
+
+Offloads 4K→1080p video transcoding to AWS Batch GPU instances (g4dn.xlarge)
+with NVIDIA NVENC hardware encoding for ~10x faster processing.
+
+Flow:
+1. Jetson extracts 4K clip with stream copy (fast, no encoding)
+2. Uploads 4K to S3 raw/ prefix
+3. Submits AWS Batch job for GPU transcoding
+4. Batch job downloads 4K, encodes to 1080p with NVENC, uploads result
+5. Raw 4K file is deleted after successful transcode
+
+Environment Variables:
+    USE_AWS_GPU_TRANSCODE: Enable GPU transcoding (true/false)
+    AWS_BATCH_JOB_QUEUE: Batch job queue name
+    AWS_BATCH_JOB_DEFINITION: Batch job definition name
+    AWS_BATCH_REGION: AWS region for Batch (default: us-east-1)
+"""
+
+import os
+import time
+from typing import Dict, Any, Optional, List
+
+import boto3
+from botocore.exceptions import ClientError
+
+from logging_service import get_logger
+
+logger = get_logger('gopro.aws_batch_transcode')
+
+
+class AWSBatchTranscoder:
+    """Manages AWS Batch GPU transcoding jobs for video processing."""
+
+    def __init__(
+        self,
+        job_queue: str = None,
+        job_definition: str = None,
+        region: str = None,
+        bucket: str = None
+    ):
+        """
+        Initialize AWS Batch Transcoder.
+
+        Args:
+            job_queue: Batch job queue name (default from env: AWS_BATCH_JOB_QUEUE)
+            job_definition: Batch job definition name (default from env: AWS_BATCH_JOB_DEFINITION)
+            region: AWS region (default from env: AWS_BATCH_REGION or us-east-1)
+            bucket: S3 bucket name (default from env: UPLOAD_BUCKET)
+        """
+        self.job_queue = job_queue or os.getenv('AWS_BATCH_JOB_QUEUE', 'gpu-transcode-queue')
+        self.job_definition = job_definition or os.getenv('AWS_BATCH_JOB_DEFINITION', 'ffmpeg-nvenc-transcode')
+        self.region = region or os.getenv('AWS_BATCH_REGION', os.getenv('AWS_REGION', 'us-east-1'))
+        self.bucket = bucket or os.getenv('UPLOAD_BUCKET', 'uball-videos-production')
+
+        # Initialize AWS clients
+        self.batch_client = boto3.client('batch', region_name=self.region)
+        self.s3_client = boto3.client('s3', region_name=self.region)
+
+        logger.info(f"AWSBatchTranscoder initialized: queue={self.job_queue}, "
+                    f"definition={self.job_definition}, region={self.region}, bucket={self.bucket}")
+
+    def submit_transcode_job(
+        self,
+        input_s3_key: str,
+        output_s3_key: str,
+        game_id: str,
+        angle: str,
+        job_name_prefix: str = 'transcode'
+    ) -> Dict[str, Any]:
+        """
+        Submit a transcode job to AWS Batch.
+
+        Args:
+            input_s3_key: S3 key of 4K source file (e.g., "raw/court-a/2026-01-20/uuid/FL_4k.mp4")
+            output_s3_key: S3 key for 1080p output (e.g., "court-a/2026-01-20/uuid/2026-01-20_uuid_FL.mp4")
+            game_id: Game identifier for tracking
+            angle: Camera angle code (FL, FR, NL, NR)
+            job_name_prefix: Prefix for job name
+
+        Returns:
+            Dict with jobId, jobName, and submission details
+        """
+        # Generate unique job name
+        timestamp = int(time.time())
+        job_name = f"{job_name_prefix}-{angle}-{timestamp}"
+
+        # Build S3 URIs
+        input_uri = f"s3://{self.bucket}/{input_s3_key}"
+        output_uri = f"s3://{self.bucket}/{output_s3_key}"
+
+        logger.info(f"Submitting Batch transcode job: {job_name}")
+        logger.info(f"  Input: {input_uri}")
+        logger.info(f"  Output: {output_uri}")
+
+        try:
+            response = self.batch_client.submit_job(
+                jobName=job_name,
+                jobQueue=self.job_queue,
+                jobDefinition=self.job_definition,
+                parameters={
+                    'input_uri': input_uri,
+                    'output_uri': output_uri,
+                    'bucket': self.bucket,
+                    'input_key': input_s3_key,
+                    'output_key': output_s3_key
+                },
+                containerOverrides={
+                    'environment': [
+                        {'name': 'INPUT_S3_URI', 'value': input_uri},
+                        {'name': 'OUTPUT_S3_URI', 'value': output_uri},
+                        {'name': 'S3_BUCKET', 'value': self.bucket},
+                        {'name': 'INPUT_S3_KEY', 'value': input_s3_key},
+                        {'name': 'OUTPUT_S3_KEY', 'value': output_s3_key},
+                        {'name': 'GAME_ID', 'value': game_id},
+                        {'name': 'ANGLE', 'value': angle}
+                    ]
+                },
+                tags={
+                    'game_id': game_id,
+                    'angle': angle,
+                    'service': 'gopro-automation'
+                }
+            )
+
+            job_id = response['jobId']
+            logger.info(f"Batch job submitted: {job_id}")
+
+            return {
+                'jobId': job_id,
+                'jobName': job_name,
+                'input_s3_key': input_s3_key,
+                'output_s3_key': output_s3_key,
+                'game_id': game_id,
+                'angle': angle,
+                'status': 'SUBMITTED',
+                'submitted_at': time.time()
+            }
+
+        except ClientError as e:
+            logger.error(f"Failed to submit Batch job: {e}")
+            raise
+
+    def get_job_status(self, job_id: str) -> Dict[str, Any]:
+        """
+        Get status of an AWS Batch job.
+
+        Args:
+            job_id: AWS Batch job ID
+
+        Returns:
+            Dict with status, statusReason, timestamps, etc.
+        """
+        try:
+            response = self.batch_client.describe_jobs(jobs=[job_id])
+
+            if not response['jobs']:
+                return {
+                    'jobId': job_id,
+                    'status': 'NOT_FOUND',
+                    'statusReason': 'Job not found'
+                }
+
+            job = response['jobs'][0]
+
+            result = {
+                'jobId': job['jobId'],
+                'jobName': job.get('jobName', ''),
+                'status': job['status'],
+                'statusReason': job.get('statusReason', ''),
+                'createdAt': job.get('createdAt'),
+                'startedAt': job.get('startedAt'),
+                'stoppedAt': job.get('stoppedAt')
+            }
+
+            # Add container exit code if available
+            if 'container' in job:
+                container = job['container']
+                result['exitCode'] = container.get('exitCode')
+                result['reason'] = container.get('reason', '')
+
+            # Add log stream name if available
+            if 'container' in job and 'logStreamName' in job['container']:
+                result['logStreamName'] = job['container']['logStreamName']
+
+            return result
+
+        except ClientError as e:
+            logger.error(f"Failed to get job status for {job_id}: {e}")
+            return {
+                'jobId': job_id,
+                'status': 'ERROR',
+                'statusReason': str(e)
+            }
+
+    def wait_for_job(
+        self,
+        job_id: str,
+        timeout: int = 1800,
+        poll_interval: int = 30
+    ) -> Dict[str, Any]:
+        """
+        Wait for a Batch job to complete.
+
+        Args:
+            job_id: AWS Batch job ID
+            timeout: Maximum wait time in seconds (default: 30 minutes)
+            poll_interval: Seconds between status checks (default: 30)
+
+        Returns:
+            Final job status dict
+
+        Raises:
+            TimeoutError: If job doesn't complete within timeout
+        """
+        terminal_states = {'SUCCEEDED', 'FAILED'}
+        start_time = time.time()
+
+        logger.info(f"Waiting for Batch job {job_id} (timeout: {timeout}s)")
+
+        while True:
+            status = self.get_job_status(job_id)
+            current_status = status.get('status', 'UNKNOWN')
+
+            logger.info(f"  Job {job_id}: {current_status}")
+
+            if current_status in terminal_states:
+                return status
+
+            if current_status == 'NOT_FOUND':
+                logger.error(f"Job {job_id} not found")
+                return status
+
+            elapsed = time.time() - start_time
+            if elapsed > timeout:
+                logger.error(f"Timeout waiting for job {job_id} after {elapsed:.0f}s")
+                raise TimeoutError(f"Job {job_id} did not complete within {timeout}s")
+
+            time.sleep(poll_interval)
+
+    def delete_raw_file(self, s3_key: str) -> bool:
+        """
+        Delete a raw 4K file from S3 after successful transcode.
+
+        Args:
+            s3_key: S3 key to delete (e.g., "raw/court-a/2026-01-20/uuid/FL_4k.mp4")
+
+        Returns:
+            True if deleted successfully, False otherwise
+        """
+        try:
+            logger.info(f"Deleting raw file: s3://{self.bucket}/{s3_key}")
+
+            self.s3_client.delete_object(
+                Bucket=self.bucket,
+                Key=s3_key
+            )
+
+            logger.info(f"Deleted: {s3_key}")
+            return True
+
+        except ClientError as e:
+            logger.error(f"Failed to delete {s3_key}: {e}")
+            return False
+
+    def get_output_file_info(self, s3_key: str) -> Dict[str, Any]:
+        """
+        Get information about the transcoded output file.
+
+        Args:
+            s3_key: S3 key of output file
+
+        Returns:
+            Dict with size_bytes, content_type, last_modified, or error
+        """
+        try:
+            response = self.s3_client.head_object(
+                Bucket=self.bucket,
+                Key=s3_key
+            )
+
+            return {
+                'exists': True,
+                's3_key': s3_key,
+                's3_uri': f"s3://{self.bucket}/{s3_key}",
+                'size_bytes': response.get('ContentLength', 0),
+                'size_mb': round(response.get('ContentLength', 0) / (1024 * 1024), 2),
+                'content_type': response.get('ContentType', ''),
+                'last_modified': response.get('LastModified').isoformat() if response.get('LastModified') else None
+            }
+
+        except ClientError as e:
+            if e.response['Error']['Code'] == '404':
+                return {
+                    'exists': False,
+                    's3_key': s3_key,
+                    'error': 'File not found'
+                }
+            logger.error(f"Failed to get file info for {s3_key}: {e}")
+            return {
+                'exists': False,
+                's3_key': s3_key,
+                'error': str(e)
+            }
+
+    def upload_4k_to_raw(
+        self,
+        local_path: str,
+        s3_key: str,
+        progress_callback=None
+    ) -> Optional[str]:
+        """
+        Upload a 4K file to the raw/ prefix in S3.
+
+        Args:
+            local_path: Path to local 4K file
+            s3_key: Target S3 key (should start with "raw/")
+            progress_callback: Optional callback(bytes_transferred)
+
+        Returns:
+            S3 URI on success, None on failure
+        """
+        try:
+            file_size = os.path.getsize(local_path)
+            logger.info(f"Uploading 4K file to S3: {local_path} ({file_size / (1024**3):.2f} GB)")
+            logger.info(f"  Target: s3://{self.bucket}/{s3_key}")
+
+            # Use multipart upload for large files
+            config = boto3.s3.transfer.TransferConfig(
+                multipart_threshold=25 * 1024 * 1024,  # 25 MB
+                multipart_chunksize=25 * 1024 * 1024,
+                max_concurrency=4
+            )
+
+            callback = None
+            if progress_callback:
+                callback = progress_callback
+
+            self.s3_client.upload_file(
+                local_path,
+                self.bucket,
+                s3_key,
+                Config=config,
+                Callback=callback
+            )
+
+            s3_uri = f"s3://{self.bucket}/{s3_key}"
+            logger.info(f"Upload complete: {s3_uri}")
+            return s3_uri
+
+        except Exception as e:
+            logger.error(f"Failed to upload {local_path} to {s3_key}: {e}")
+            return None
+
+    def generate_raw_s3_key(
+        self,
+        location: str,
+        game_date: str,
+        uball_game_id: str,
+        angle_code: str
+    ) -> str:
+        """
+        Generate S3 key for raw 4K file in raw/ prefix.
+
+        Format: raw/{location}/{date}/{game_uuid}/{angle}_4k.mp4
+
+        Args:
+            location: Court/location identifier
+            game_date: Game date (YYYY-MM-DD)
+            uball_game_id: Uball game UUID
+            angle_code: Camera angle (FL, FR, NL, NR)
+
+        Returns:
+            S3 key string
+        """
+        # Use first 4 segments of UUID for shorter but still unique folder name
+        if uball_game_id:
+            uuid_parts = uball_game_id.split('-')[:4]
+            folder = '-'.join(uuid_parts)
+        else:
+            folder = f"unknown-{game_date}"
+
+        return f"raw/{location}/{game_date}/{folder}/{angle_code}_4k.mp4"
+
+
+def is_aws_gpu_transcode_enabled() -> bool:
+    """Check if AWS GPU transcoding is enabled via environment variable."""
+    return os.getenv('USE_AWS_GPU_TRANSCODE', 'false').lower() == 'true'
+
+
+def get_batch_transcoder() -> Optional[AWSBatchTranscoder]:
+    """
+    Get AWSBatchTranscoder instance if GPU transcoding is enabled.
+
+    Returns:
+        AWSBatchTranscoder instance or None if not enabled
+    """
+    if not is_aws_gpu_transcode_enabled():
+        return None
+
+    try:
+        return AWSBatchTranscoder()
+    except Exception as e:
+        logger.error(f"Failed to initialize AWSBatchTranscoder: {e}")
+        return None
