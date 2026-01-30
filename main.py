@@ -8,6 +8,10 @@ REST API for remote control of GoPro cameras connected to Jetson Nano
 import os
 os.environ['OPENSSL_CONF'] = '/dev/null'
 
+# Load .env file for environment variables (CAMERA_ANGLE_MAP, etc.)
+from dotenv import load_dotenv
+load_dotenv()
+
 from flask import Flask, jsonify, request, send_file, Response, send_from_directory
 from flask_cors import CORS
 import subprocess
@@ -22,6 +26,9 @@ import re
 from videoupload import VideoUploadService
 from media_service import get_media_service
 from logging_service import get_logging_service, get_logger
+from firebase_service import get_firebase_service
+from uball_client import get_uball_client
+from video_processing import VideoProcessor, process_game_videos
 
 # Initialize logging service first
 logging_service = get_logging_service()
@@ -63,10 +70,33 @@ if UPLOAD_ENABLED:
     else:
         print("⚠ Upload enabled but AWS credentials not found in environment")
 
+# Initialize Firebase service
+firebase_service = get_firebase_service()
+if firebase_service:
+    print(f"✓ Firebase service initialized (Jetson ID: {firebase_service.jetson_id})")
+else:
+    print("⚠ Firebase service not available - recording sessions will not be registered")
+
+# Initialize Uball Backend client
+uball_client = get_uball_client()
+if uball_client:
+    print("✓ Uball Backend client initialized")
+else:
+    print("⚠ Uball Backend client not available - game sync will not work")
+
+# Initialize Video Processor
+video_processor = VideoProcessor(VIDEO_STORAGE_DIR, SEGMENTS_DIR)
+print(f"✓ Video processor initialized (output: {video_processor.output_dir})")
+
 # Global state
 recording_processes = {}
 recording_lock = threading.Lock()
 gopro_ip_cache = {}
+
+# Video processing jobs (async)
+import uuid
+video_processing_jobs = {}  # job_id -> job_state
+video_processing_lock = threading.Lock()
 
 def discover_gopro_ip_for_interface(interface, our_ip):
     """Discover the GoPro's IP address on a specific interface"""
@@ -218,6 +248,41 @@ def sanitize_filename(name):
     for char in invalid_chars:
         name = name.replace(char, '_')
     return name.strip()
+
+
+def _get_angle_code_from_camera_name(camera_name: str) -> str:
+    """
+    Extract angle code from camera name or CAMERA_ANGLE_MAP env var.
+
+    Args:
+        camera_name: GoPro camera name (e.g., "GoPro FL")
+
+    Returns:
+        Angle code (FL, FR, NL, NR) or 'UNK' if unknown
+    """
+    # Try CAMERA_ANGLE_MAP env var first
+    angle_map_str = os.getenv('CAMERA_ANGLE_MAP', '{}')
+    print(f"[DEBUG] CAMERA_ANGLE_MAP env: {angle_map_str}")
+    print(f"[DEBUG] Looking up camera_name: '{camera_name}'")
+    try:
+        angle_map = json.loads(angle_map_str)
+        print(f"[DEBUG] Parsed angle_map: {angle_map}")
+        if camera_name in angle_map:
+            result = angle_map[camera_name]
+            print(f"[DEBUG] Found mapping: {camera_name} -> {result}")
+            return result
+        else:
+            print(f"[DEBUG] Camera '{camera_name}' not in angle_map keys: {list(angle_map.keys())}")
+    except json.JSONDecodeError as e:
+        print(f"[DEBUG] JSON decode error: {e}")
+
+    # Fallback: extract from camera name like "GoPro FL"
+    if camera_name:
+        for code in ['FL', 'FR', 'NL', 'NR']:
+            if code in camera_name.upper():
+                return code
+
+    return 'UNK'  # Unknown angle
 
 def get_video_list():
     """Get list of all recorded videos"""
@@ -450,12 +515,31 @@ def start_recording(gopro_id):
             camera_name = f"GoPro-{gopro_id[-4:]}"
             print(f"Using fallback camera name: {camera_name}")
 
+        # Get angle code from camera name for segment folder naming
+        angle_code = _get_angle_code_from_camera_name(camera_name)
+        logger.info(f"[{gopro_id}] Camera angle code: {angle_code} (from camera_name='{camera_name}')")
+
         # Prepare session info - store start datetime for filename generation at stop time
+        # Include angle code in session_id for easier identification: {interface}_{angle}_{timestamp}
         start_datetime = datetime.now()
         timestamp = start_datetime.strftime('%Y%m%d_%H%M%S')
-        session_id = f"{gopro_id}_{timestamp}"
+        session_id = f"{gopro_id}_{angle_code}_{timestamp}"
         session_dir = os.path.join(SEGMENTS_DIR, session_id)
         os.makedirs(session_dir, exist_ok=True)
+
+        # Register recording session in Firebase
+        firebase_session_id = None
+        if firebase_service:
+            try:
+                session_data = {
+                    'camera_name': camera_name,
+                    'segment_session': session_id,
+                    'interface_id': gopro_id
+                }
+                firebase_session_id = firebase_service.register_recording_start(session_data)
+                logger.info(f"[{gopro_id}] Registered recording in Firebase: {firebase_session_id}")
+            except Exception as e:
+                logger.warning(f"[{gopro_id}] Failed to register in Firebase (continuing anyway): {e}")
 
         # Store recording state (video_path and video_filename will be generated at stop time)
         with recording_lock:
@@ -472,6 +556,7 @@ def start_recording(gopro_id):
                 'video_filename': None,  # Will be set at stop time
                 'session_id': session_id,
                 'session_dir': session_dir,
+                'firebase_session_id': firebase_session_id,  # Firebase document ID
                 'error': None,
                 'stage': 'recording',
                 'stage_message': 'Recording...'
@@ -483,7 +568,9 @@ def start_recording(gopro_id):
             'gopro_id': gopro_id,
             'gopro_ip': gopro_ip,
             'camera_name': camera_name,
-            'session_id': session_id
+            'angle_code': angle_code,
+            'session_id': session_id,
+            'firebase_session_id': firebase_session_id
         })
 
     except requests.exceptions.Timeout:
@@ -522,6 +609,7 @@ def stop_recording(gopro_id):
         pre_record_files = recording_info.get('pre_record_files', set())
         camera_name = recording_info.get('camera_name', f'GoPro-{gopro_id[-4:]}')
         start_datetime = recording_info.get('start_datetime', datetime.now())
+        firebase_session_id = recording_info.get('firebase_session_id')
 
         # Generate filename with format: YYYYMMDD HHMMSS - HHMMSS camera_name.mp4
         stop_datetime = datetime.now()
@@ -653,12 +741,33 @@ def stop_recording(gopro_id):
 
                 logger.info(f"[{gopro_id}] Total download size: {total_size_gb:.2f} GB")
 
+                # Update Firebase with recording stop info
+                if firebase_service and firebase_session_id:
+                    try:
+                        stop_data = {
+                            'total_chapters': len(new_chapters),
+                            'total_size_bytes': total_size_bytes
+                        }
+                        firebase_service.register_recording_stop(firebase_session_id, stop_data)
+                        logger.info(f"[{gopro_id}] Updated Firebase session: {firebase_session_id}")
+                    except Exception as e:
+                        logger.warning(f"[{gopro_id}] Failed to update Firebase (continuing anyway): {e}")
+
                 logger.info(f"[{gopro_id}] Found {len(new_chapters)} new chapters to download")
                 for ch in new_chapters:
                     logger.info(f"[{gopro_id}]   - {ch['filename']} ({ch['size']} bytes)")
 
                 if not new_chapters:
                     logger.warning(f"[{gopro_id}] No new chapters found")
+                    # Still update Firebase even if no chapters (edge case)
+                    if firebase_service and firebase_session_id:
+                        try:
+                            firebase_service.register_recording_stop(firebase_session_id, {
+                                'total_chapters': 0,
+                                'total_size_bytes': 0
+                            })
+                        except Exception as e:
+                            logger.warning(f"[{gopro_id}] Failed to update Firebase: {e}")
                     with recording_lock:
                         if gopro_id in recording_processes:
                             del recording_processes[gopro_id]
@@ -667,116 +776,70 @@ def stop_recording(gopro_id):
                 # Download all chapters
                 downloaded_files = []
                 total_chapters = len(new_chapters)
-                
+
                 for i, chapter in enumerate(new_chapters):
                     chapter_path = os.path.join(session_dir, f'chapter_{i+1:03d}_{chapter["filename"]}')
                     download_url = f'http://{gopro_ip}:8080/videos/DCIM/{chapter["directory"]}/{chapter["filename"]}'
+                    expected_size = int(chapter.get('size', 0))
                     
-                    logger.info(f"[{gopro_id}] Downloading chapter {i+1}/{total_chapters}: {chapter['filename']}")
+                    logger.info(f"[{gopro_id}] Downloading chapter {i+1}/{total_chapters}: {chapter['filename']} ({expected_size / (1024**3):.2f} GB)")
 
-                    try:
-                        response = requests.get(download_url, stream=True, timeout=600)
-                        total_size = int(response.headers.get('content-length', 0))
-                        downloaded = 0
+                    max_retries = 10
+                    for attempt in range(max_retries):
+                        try:
+                            # Keep GoPro awake
+                            requests.get(f'http://{gopro_ip}:8080/gopro/camera/keep_alive', timeout=2)
+                            
+                            # Check for resume
+                            current_size = os.path.getsize(chapter_path) if os.path.exists(chapter_path) else 0
+                            
+                            if expected_size > 0 and current_size >= expected_size:
+                                logger.info(f"[{gopro_id}] Chapter {i+1} already complete")
+                                break
+                            
+                            # Resume download
+                            headers = {'Range': f'bytes={current_size}-'} if current_size > 0 else {}
+                            response = requests.get(download_url, headers=headers, stream=True, timeout=600)
+                            
+                            mode = 'ab' if current_size > 0 else 'wb'
+                            with open(chapter_path, mode) as f:
+                                for chunk in response.iter_content(chunk_size=1048576):  # 1MB chunks
+                                    if chunk:
+                                        f.write(chunk)
+                            
+                            # Verify size
+                            final_size = os.path.getsize(chapter_path)
+                            if expected_size > 0 and final_size >= expected_size:
+                                logger.info(f"[{gopro_id}] Chapter {i+1} complete ({final_size / (1024**2):.1f} MB)")
+                                break
+                            else:
+                                logger.warning(f"[{gopro_id}] Chapter {i+1} incomplete: {final_size}/{expected_size} bytes, retrying...")
+                                
+                        except Exception as e:
+                            logger.warning(f"[{gopro_id}] Download attempt {attempt+1} failed: {e}")
+                            time.sleep(2)
+                    
+                    # After retry loop - add to downloaded files
+                    downloaded_files.append(chapter_path)
+                    file_size_mb = os.path.getsize(chapter_path) / (1024 * 1024)
+                    logger.info(f"[{gopro_id}] Downloaded chapter {i+1}: {file_size_mb:.1f} MB")
 
-                        with open(chapter_path, 'wb') as f:
-                            for chunk in response.iter_content(chunk_size=65536):
-                                if chunk:
-                                    f.write(chunk)
-                                    downloaded += len(chunk)
-
-                        downloaded_files.append(chapter_path)
-                        file_size_mb = os.path.getsize(chapter_path) / (1024 * 1024)
-                        logger.info(f"[{gopro_id}] Downloaded chapter {i+1}: {file_size_mb:.1f} MB")
-
-                        # Update progress
-                        with recording_lock:
-                            if gopro_id in recording_processes:
-                                progress = int(((i + 1) / total_chapters) * 100)
-                                recording_processes[gopro_id]['download_progress'] = progress
-
-                    except Exception as e:
-                        logger.error(f"[{gopro_id}] Error downloading chapter {chapter['filename']}: {e}")
-
-                # Merge all chapters
-                if downloaded_files:
-                    # Update stage: merging
+                    # Update progress
                     with recording_lock:
                         if gopro_id in recording_processes:
-                            recording_processes[gopro_id]['stage'] = 'merging'
-                            recording_processes[gopro_id]['stage_message'] = 'Merging video chapters...'
+                            progress = int(((i + 1) / total_chapters) * 100)
+                            recording_processes[gopro_id]['download_progress'] = progress
+                # Keep chapters in segments directory (no merging needed)
+                # Game extraction will use individual chapter files directly
+                if downloaded_files:
+                    total_size_mb = sum(os.path.getsize(f) for f in downloaded_files) / (1024 * 1024)
+                    logger.info(f"[{gopro_id}] Downloaded {len(downloaded_files)} chapters ({total_size_mb:.1f} MB) to {session_dir}")
 
-                    logger.info(f"[{gopro_id}] Merging {len(downloaded_files)} chapters into {video_path}...")
-
-                    if merge_videos_ffmpeg(downloaded_files, video_path):
-                        final_size_mb = os.path.getsize(video_path) / (1024 * 1024)
-                        logger.info(f"[{gopro_id}] Merged video saved: {video_path} ({final_size_mb:.1f} MB)")
-
-                        # Cleanup chapter files
-                        try:
-                            for f in downloaded_files:
-                                os.remove(f)
-                            os.rmdir(session_dir)
-                            logger.info(f"[{gopro_id}] Cleaned up {len(downloaded_files)} chapter files")
-                        except Exception as e:
-                            logger.warning(f"[{gopro_id}] Cleanup error: {e}")
-
-                        # Upload to S3 if enabled
-                        if upload_service:
-                            # Update stage: uploading
-                            with recording_lock:
-                                if gopro_id in recording_processes:
-                                    recording_processes[gopro_id]['stage'] = 'uploading'
-                                    recording_processes[gopro_id]['stage_message'] = 'Uploading to cloud...'
-
-                            try:
-                                logger.info(f"[{gopro_id}] Starting upload of {video_filename} to S3...")
-                                upload_date = datetime.now().strftime('%Y-%m-%d')
-
-                                # Get camera name from GoPro API, fallback to interface-based name
-                                camera_name = get_gopro_camera_name(gopro_ip)
-                                if not camera_name:
-                                    camera_name = f"GoPro-{gopro_id[-4:]}"
-                                    logger.info(f"[{gopro_id}] Using fallback camera name: {camera_name}")
-
-                                s3_uri = upload_service.upload_video(
-                                    video_path=video_path,
-                                    location=UPLOAD_LOCATION,
-                                    date=upload_date,
-                                    device_name=UPLOAD_DEVICE_NAME,
-                                    camera_name=camera_name,
-                                    compress=True,
-                                    delete_compressed_after_upload=True
-                                )
-                                logger.info(f"[{gopro_id}] Video uploaded to: {s3_uri}")
-
-                                # Update stage: done
-                                with recording_lock:
-                                    if gopro_id in recording_processes:
-                                        recording_processes[gopro_id]['stage'] = 'done'
-                                        recording_processes[gopro_id]['stage_message'] = 'Done!'
-
-                                # Optionally delete local file after upload
-                                if DELETE_AFTER_UPLOAD:
-                                    try:
-                                        os.remove(video_path)
-                                        logger.info(f"[{gopro_id}] Local file deleted after upload: {video_filename}")
-                                    except Exception as e:
-                                        logger.warning(f"[{gopro_id}] Failed to delete local file: {e}")
-                            except Exception as e:
-                                logger.error(f"[{gopro_id}] Upload failed: {e}")
-                                with recording_lock:
-                                    if gopro_id in recording_processes:
-                                        recording_processes[gopro_id]['stage'] = 'done'
-                                        recording_processes[gopro_id]['stage_message'] = 'Done (upload failed)'
-                        else:
-                            # No upload service, mark as done
-                            with recording_lock:
-                                if gopro_id in recording_processes:
-                                    recording_processes[gopro_id]['stage'] = 'done'
-                                    recording_processes[gopro_id]['stage_message'] = 'Done!'
-                    else:
-                        logger.error(f"[{gopro_id}] Failed to merge chapters - keeping individual files in {session_dir}")
+                    # Mark as done - chapters are kept in segments directory
+                    with recording_lock:
+                        if gopro_id in recording_processes:
+                            recording_processes[gopro_id]['stage'] = 'done'
+                            recording_processes[gopro_id]['stage_message'] = f'Done! {len(downloaded_files)} chapters saved'
                 else:
                     logger.warning(f"[{gopro_id}] No chapters downloaded")
 
@@ -837,6 +900,1198 @@ def recording_status(gopro_id):
             'error': info.get('error')
         })
 
+
+# ==================== Recording Session Registration ====================
+
+@app.route('/api/recording/register', methods=['POST'])
+def register_recording_session():
+    """
+    Register a recording session in Firebase.
+    Can be called manually or is called automatically when recording starts/stops.
+
+    Request Body:
+    {
+        "gopro_id": "enxd43260ef4d38",
+        "camera_name": "GoPro FL",
+        "segment_session": "enxd43260ef4d38_20250120_140530",
+        "action": "start" | "stop",
+        "total_chapters": 3,      // Only for stop
+        "total_size_bytes": 12345678  // Only for stop
+    }
+
+    Returns:
+        For start: { success: true, firebase_session_id: "..." }
+        For stop: { success: true, message: "Session updated" }
+    """
+    if not firebase_service:
+        return jsonify({
+            'success': False,
+            'error': 'Firebase service not configured'
+        }), 503
+
+    try:
+        data = request.get_json()
+        if not data:
+            return jsonify({'success': False, 'error': 'Request body required'}), 400
+
+        action = data.get('action')
+        if action not in ['start', 'stop']:
+            return jsonify({'success': False, 'error': 'action must be "start" or "stop"'}), 400
+
+        gopro_id = data.get('gopro_id', '')
+        camera_name = data.get('camera_name', '')
+        segment_session = data.get('segment_session', '')
+
+        if action == 'start':
+            # Register new recording session
+            session_data = {
+                'camera_name': camera_name,
+                'segment_session': segment_session,
+                'interface_id': gopro_id
+            }
+
+            firebase_session_id = firebase_service.register_recording_start(session_data)
+            logger.info(f"[Firebase] Registered recording start: {firebase_session_id}")
+
+            return jsonify({
+                'success': True,
+                'firebase_session_id': firebase_session_id,
+                'message': 'Recording session registered'
+            })
+
+        else:  # action == 'stop'
+            # Find the session by segment_session name
+            session = firebase_service.find_session_by_segment(segment_session)
+
+            if not session:
+                return jsonify({
+                    'success': False,
+                    'error': f'Session not found for segment: {segment_session}'
+                }), 404
+
+            stop_data = {
+                'total_chapters': data.get('total_chapters', 0),
+                'total_size_bytes': data.get('total_size_bytes', 0)
+            }
+
+            firebase_service.register_recording_stop(session['id'], stop_data)
+            logger.info(f"[Firebase] Registered recording stop: {session['id']}")
+
+            return jsonify({
+                'success': True,
+                'firebase_session_id': session['id'],
+                'message': 'Recording session updated'
+            })
+
+    except Exception as e:
+        logger.error(f"[Firebase] Error registering recording session: {e}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+
+@app.route('/api/recording/sessions', methods=['GET'])
+def list_recording_sessions():
+    """
+    List recording sessions from Firebase.
+
+    Query params:
+        jetson_id: Optional filter by Jetson ID
+        limit: Maximum number of sessions to return (default 50)
+
+    Returns:
+        { success: true, sessions: [...] }
+    """
+    if not firebase_service:
+        return jsonify({
+            'success': False,
+            'error': 'Firebase service not configured'
+        }), 503
+
+    try:
+        jetson_id = request.args.get('jetson_id')
+        limit = request.args.get('limit', 50, type=int)
+
+        sessions = firebase_service.get_recording_sessions(jetson_id=jetson_id, limit=limit)
+
+        return jsonify({
+            'success': True,
+            'count': len(sessions),
+            'sessions': sessions
+        })
+
+    except Exception as e:
+        logger.error(f"[Firebase] Error listing recording sessions: {e}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+
+@app.route('/api/recording/sessions/<session_id>', methods=['GET'])
+def get_recording_session(session_id):
+    """
+    Get a specific recording session from Firebase.
+
+    Returns:
+        { success: true, session: {...} }
+    """
+    if not firebase_service:
+        return jsonify({
+            'success': False,
+            'error': 'Firebase service not configured'
+        }), 503
+
+    try:
+        session = firebase_service.get_recording_session(session_id)
+
+        if not session:
+            return jsonify({
+                'success': False,
+                'error': 'Session not found'
+            }), 404
+
+        return jsonify({
+            'success': True,
+            'session': session
+        })
+
+    except Exception as e:
+        logger.error(f"[Firebase] Error getting recording session: {e}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+
+# ==================== Game Sync Endpoints ====================
+
+@app.route('/api/games/list', methods=['GET'])
+def list_games():
+    """
+    List basketball games from Firebase.
+
+    Query params:
+        limit: Maximum number of games (default 50)
+        status: Filter by status (e.g., "ended", "active")
+        date: Filter by date (YYYY-MM-DD)
+        sync_ready: If true, only show games ready for sync
+
+    Returns:
+        { success: true, games: [...] }
+    """
+    if not firebase_service:
+        return jsonify({
+            'success': False,
+            'error': 'Firebase service not configured'
+        }), 503
+
+    try:
+        limit = request.args.get('limit', 50, type=int)
+        status = request.args.get('status')
+        date = request.args.get('date')
+        sync_ready = request.args.get('sync_ready', 'false').lower() == 'true'
+
+        if sync_ready:
+            games = firebase_service.get_games_for_sync(limit=limit)
+        else:
+            games = firebase_service.list_games(limit=limit, status=status, date=date)
+
+        return jsonify({
+            'success': True,
+            'count': len(games),
+            'games': games
+        })
+
+    except Exception as e:
+        logger.error(f"[Games] Error listing games: {e}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+
+@app.route('/api/games/<game_id>', methods=['GET'])
+def get_game(game_id):
+    """
+    Get a specific basketball game from Firebase.
+
+    Returns:
+        { success: true, game: {...} }
+    """
+    if not firebase_service:
+        return jsonify({
+            'success': False,
+            'error': 'Firebase service not configured'
+        }), 503
+
+    try:
+        game = firebase_service.get_game(game_id)
+
+        if not game:
+            return jsonify({
+                'success': False,
+                'error': 'Game not found'
+            }), 404
+
+        return jsonify({
+            'success': True,
+            'game': game
+        })
+
+    except Exception as e:
+        logger.error(f"[Games] Error getting game: {e}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+
+@app.route('/api/games/sync', methods=['POST'])
+def sync_game_to_uball():
+    """
+    Sync a completed game from Firebase to Uball Backend.
+
+    Request Body:
+    {
+        "firebase_game_id": "abc123",
+        "team1_id": "uuid-of-team1",  // Optional - Uball team UUID
+        "team2_id": "uuid-of-team2"   // Optional - Uball team UUID
+    }
+
+    If team IDs not provided, teams are auto-created from Firebase game data.
+    Each game creates NEW teams (even if same name exists) because rosters differ.
+
+    Flow:
+    1. Fetch game from Firebase (basketball-games collection)
+    2. Extract: createdAt, endedAt, teams, scores
+    3. Auto-create teams in Uball Backend if not provided
+    4. Create game in Supabase with firebase_game_id linkage
+    5. Mark game as synced in Firebase
+    6. Return Uball game_id
+
+    Returns:
+        { success: true, uball_game_id: "...", firebase_game_id: "...", teams_created: [...] }
+    """
+    if not firebase_service:
+        return jsonify({
+            'success': False,
+            'error': 'Firebase service not configured'
+        }), 503
+
+    if not uball_client:
+        return jsonify({
+            'success': False,
+            'error': 'Uball Backend client not configured'
+        }), 503
+
+    try:
+        data = request.get_json()
+        if not data:
+            return jsonify({'success': False, 'error': 'Request body required'}), 400
+
+        firebase_game_id = data.get('firebase_game_id')
+        team1_id = data.get('team1_id')
+        team2_id = data.get('team2_id')
+
+        if not firebase_game_id:
+            return jsonify({'success': False, 'error': 'firebase_game_id required'}), 400
+
+        logger.info(f"[GameSync] === Starting sync for Firebase game: {firebase_game_id} ===")
+
+        # 1. Fetch game from Firebase
+        logger.info(f"[GameSync] Step 1: Fetching game from Firebase...")
+        firebase_game = firebase_service.get_game(firebase_game_id)
+        if not firebase_game:
+            return jsonify({
+                'success': False,
+                'error': f'Game not found in Firebase: {firebase_game_id}'
+            }), 404
+
+        logger.info(f"[GameSync] Step 1: Game found. Teams: {firebase_game.get('leftTeam', {}).get('name')} vs {firebase_game.get('rightTeam', {}).get('name')}")
+
+        # Check if already synced
+        if firebase_game.get('uballGameId'):
+            logger.info(f"[GameSync] Game already synced to Uball: {firebase_game['uballGameId']}")
+            return jsonify({
+                'success': True,
+                'message': 'Game already synced',
+                'uball_game_id': firebase_game['uballGameId'],
+                'firebase_game_id': firebase_game_id,
+                'video_name': f"{firebase_game.get('leftTeam', {}).get('name', 'Team 1')} vs {firebase_game.get('rightTeam', {}).get('name', 'Team 2')}"
+            })
+
+        # 2. Check if game already exists in Uball by firebase_game_id
+        logger.info(f"[GameSync] Step 2: Checking if game exists in Uball Backend...")
+        existing_game = uball_client.get_game_by_firebase_id(firebase_game_id)
+        if existing_game:
+            # Mark as synced in Firebase
+            firebase_service.mark_game_synced(firebase_game_id, existing_game['id'])
+            return jsonify({
+                'success': True,
+                'message': 'Game already exists in Uball, marked as synced',
+                'uball_game_id': str(existing_game['id']),
+                'firebase_game_id': firebase_game_id
+            })
+
+        # 3. Auto-create teams if not provided
+        logger.info(f"[GameSync] Step 3: Creating teams in Uball Backend...")
+        teams_created = []
+
+        if not team1_id:
+            # Extract team1 name from Firebase (leftTeam)
+            left_team = firebase_game.get('leftTeam', {})
+            team1_name = left_team.get('name', 'Team 1')
+
+            created_team1 = uball_client.create_team(team1_name)
+            if not created_team1:
+                return jsonify({
+                    'success': False,
+                    'error': f'Failed to create team: {team1_name}'
+                }), 500
+
+            team1_id = str(created_team1.get('id'))
+            teams_created.append({'name': team1_name, 'id': team1_id, 'side': 'left'})
+            logger.info(f"[GameSync] Auto-created team1: {team1_name} -> {team1_id}")
+
+        if not team2_id:
+            # Extract team2 name from Firebase (rightTeam)
+            right_team = firebase_game.get('rightTeam', {})
+            team2_name = right_team.get('name', 'Team 2')
+
+            created_team2 = uball_client.create_team(team2_name)
+            if not created_team2:
+                return jsonify({
+                    'success': False,
+                    'error': f'Failed to create team: {team2_name}'
+                }), 500
+
+            team2_id = str(created_team2.get('id'))
+            teams_created.append({'name': team2_name, 'id': team2_id, 'side': 'right'})
+            logger.info(f"[GameSync] Auto-created team2: {team2_name} -> {team2_id}")
+
+        # 4. Prepare game data for Uball Backend
+        logger.info(f"[GameSync] Step 4: Preparing game data for Uball Backend...")
+        created_at = firebase_game.get('createdAt', '')
+        ended_at = firebase_game.get('endedAt')
+
+        # Extract date from createdAt (format: 2025-01-20T14:30:00Z)
+        game_date = created_at[:10] if created_at else datetime.now().strftime('%Y-%m-%d')
+
+        uball_game_data = {
+            'firebase_game_id': firebase_game_id,
+            'date': game_date,
+            'team1_id': team1_id,
+            'team2_id': team2_id,
+            'start_time': created_at if created_at else None,
+            'end_time': ended_at if ended_at else None,
+            'source': 'firebase'
+        }
+
+        # Add scores and video_name from leftTeam/rightTeam
+        left_team = firebase_game.get('leftTeam', {})
+        right_team = firebase_game.get('rightTeam', {})
+
+        # Set video_name as "TEAM1 vs TEAM2"
+        team1_name = left_team.get('name', 'Team 1')
+        team2_name = right_team.get('name', 'Team 2')
+        uball_game_data['video_name'] = f"{team1_name} vs {team2_name}"
+
+        if left_team.get('finalScore') is not None:
+            uball_game_data['team1_score'] = left_team['finalScore']
+        if right_team.get('finalScore') is not None:
+            uball_game_data['team2_score'] = right_team['finalScore']
+
+        # Legacy score format support
+        if firebase_game.get('score'):
+            score = firebase_game['score']
+            if isinstance(score, dict):
+                uball_game_data['team1_score'] = score.get('home', score.get('team1'))
+                uball_game_data['team2_score'] = score.get('away', score.get('team2'))
+
+        # 5. Create game in Uball Backend
+        logger.info(f"[GameSync] Step 5: Creating game in Uball Backend...")
+        logger.info(f"[GameSync] Payload: team1={team1_id}, team2={team2_id}, date={game_date}, video_name={uball_game_data.get('video_name')}")
+        uball_game = uball_client.create_game(uball_game_data)
+
+        if not uball_game:
+            return jsonify({
+                'success': False,
+                'error': 'Failed to create game in Uball Backend'
+            }), 500
+
+        uball_game_id = str(uball_game.get('id', ''))
+
+        # 6. Mark game as synced in Firebase
+        logger.info(f"[GameSync] Step 6: Marking game as synced in Firebase...")
+        firebase_service.mark_game_synced(firebase_game_id, uball_game_id)
+        logger.info(f"[GameSync] === SUCCESS: Firebase {firebase_game_id} -> Uball {uball_game_id} ===")
+
+        video_name = uball_game_data.get('video_name', f"{team1_name} vs {team2_name}")
+
+        response_data = {
+            'success': True,
+            'message': 'Game synced successfully',
+            'uball_game_id': uball_game_id,
+            'firebase_game_id': firebase_game_id,
+            'video_name': video_name,
+            'game': uball_game
+        }
+
+        # Include teams created info if any
+        if teams_created:
+            response_data['teams_created'] = teams_created
+
+        return jsonify(response_data)
+
+    except Exception as e:
+        logger.error(f"[GameSync] Error syncing game: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+
+@app.route('/api/games/<game_id>/recordings', methods=['GET'])
+def get_game_recordings(game_id):
+    """
+    Get recording sessions that overlap with a specific game's time range.
+
+    Returns:
+        { success: true, recordings: [...] }
+    """
+    if not firebase_service:
+        return jsonify({
+            'success': False,
+            'error': 'Firebase service not configured'
+        }), 503
+
+    try:
+        # Get game from Firebase
+        game = firebase_service.get_game(game_id)
+        if not game:
+            return jsonify({
+                'success': False,
+                'error': 'Game not found'
+            }), 404
+
+        created_at = game.get('createdAt')
+        ended_at = game.get('endedAt')
+
+        if not created_at:
+            return jsonify({
+                'success': False,
+                'error': 'Game has no start time'
+            }), 400
+
+        # Parse timestamps
+        from datetime import datetime
+        start = datetime.fromisoformat(created_at.replace('Z', '+00:00'))
+
+        if ended_at:
+            end = datetime.fromisoformat(ended_at.replace('Z', '+00:00'))
+        else:
+            # Game still in progress, use current time
+            end = datetime.now()
+
+        # Find overlapping recording sessions
+        recordings = firebase_service.get_games_in_timerange(start, end)
+
+        # Actually we need recording sessions, not games
+        # Let's get all recording sessions and filter by time overlap
+        all_sessions = firebase_service.get_recording_sessions(limit=100)
+
+        overlapping_sessions = []
+        for session in all_sessions:
+            session_start = session.get('startedAt')
+            session_end = session.get('endedAt')
+
+            if not session_start:
+                continue
+
+            # Check for overlap
+            s_start = datetime.fromisoformat(session_start.replace('Z', '+00:00'))
+            s_end = datetime.fromisoformat(session_end.replace('Z', '+00:00')) if session_end else datetime.now()
+
+            # Overlap if: session_start < game_end AND session_end > game_start
+            if s_start < end and s_end > start:
+                overlapping_sessions.append(session)
+
+        return jsonify({
+            'success': True,
+            'game_id': game_id,
+            'game_start': created_at,
+            'game_end': ended_at,
+            'count': len(overlapping_sessions),
+            'recordings': overlapping_sessions
+        })
+
+    except Exception as e:
+        logger.error(f"[Games] Error getting game recordings: {e}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+
+@app.route('/api/uball/status', methods=['GET'])
+def uball_status():
+    """Check Uball Backend connection status."""
+    if not uball_client:
+        return jsonify({
+            'success': True,
+            'configured': False,
+            'message': 'Uball Backend client not configured'
+        })
+
+    try:
+        healthy = uball_client.health_check()
+        return jsonify({
+            'success': True,
+            'configured': True,
+            'healthy': healthy,
+            'backend_url': uball_client.backend_url
+        })
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+
+@app.route('/api/uball/teams', methods=['GET'])
+def list_uball_teams():
+    """List teams from Uball Backend (for team ID mapping)."""
+    if not uball_client:
+        return jsonify({
+            'success': False,
+            'error': 'Uball Backend client not configured'
+        }), 503
+
+    try:
+        teams = uball_client.list_teams()
+        return jsonify({
+            'success': True,
+            'count': len(teams),
+            'teams': teams
+        })
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+
+# ==================== Game Video Processing Endpoints ====================
+
+@app.route('/api/games/process-videos', methods=['POST'])
+def process_game_videos_endpoint():
+    """
+    Extract game portions from continuous recordings and upload to S3.
+
+    Request Body:
+    {
+        "firebase_game_id": "abc123",
+        "game_number": 1,           // Game number for the day
+        "location": "court-a"       // Optional, defaults to UPLOAD_LOCATION
+    }
+
+    Flow:
+    1. Fetch game from Firebase → get start/end times
+    2. Find matching recording sessions that overlap with game time
+    3. For each relevant session:
+       a. Find chapter files that contain game time range
+       b. Use FFmpeg to extract game portion
+       c. Upload to S3: {location}/{date}/game{N}/{date}_game{N}_{angle}.mp4
+    4. Update recording-sessions with processed game info
+
+    Returns:
+        {
+            success: true,
+            firebase_game_id: "...",
+            game_number: 1,
+            processed_videos: [...],
+            errors: [...]
+        }
+    """
+    if not firebase_service:
+        return jsonify({
+            'success': False,
+            'error': 'Firebase service not configured'
+        }), 503
+
+    try:
+        data = request.get_json()
+        if not data:
+            return jsonify({'success': False, 'error': 'Request body required'}), 400
+
+        firebase_game_id = data.get('firebase_game_id')
+        game_number = data.get('game_number', 1)
+        location = data.get('location', UPLOAD_LOCATION)
+
+        if not firebase_game_id:
+            return jsonify({'success': False, 'error': 'firebase_game_id required'}), 400
+
+        if not isinstance(game_number, int) or game_number < 1:
+            return jsonify({'success': False, 'error': 'game_number must be a positive integer'}), 400
+
+        logger.info(f"[VideoProcessing] Starting processing for game {firebase_game_id}, number {game_number}")
+
+        # Process the game videos (uball_client will auto-register FL/FR videos)
+        results = process_game_videos(
+            firebase_game_id=firebase_game_id,
+            game_number=game_number,
+            firebase_service=firebase_service,
+            upload_service=upload_service,
+            video_processor=video_processor,
+            location=location,
+            uball_client=uball_client,
+            s3_bucket=UPLOAD_BUCKET
+        )
+
+        if results['success']:
+            return jsonify(results)
+        else:
+            return jsonify(results), 500
+
+    except Exception as e:
+        logger.error(f"[VideoProcessing] Error: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+
+def _run_video_processing_job(job_id: str, firebase_game_id: str, game_number: int, location: str):
+    """Background worker for async video processing."""
+    def update_progress(stage: str, detail: str = '', progress: float = 0, current_angle: str = ''):
+        with video_processing_lock:
+            if job_id in video_processing_jobs:
+                video_processing_jobs[job_id]['stage'] = stage
+                video_processing_jobs[job_id]['detail'] = detail
+                video_processing_jobs[job_id]['progress'] = progress
+                video_processing_jobs[job_id]['current_angle'] = current_angle
+                video_processing_jobs[job_id]['updated_at'] = datetime.now().isoformat()
+
+    try:
+        update_progress('starting', 'Initializing video processing...', 0)
+
+        # Run the actual processing with progress callback
+        results = process_game_videos(
+            firebase_game_id=firebase_game_id,
+            game_number=game_number,
+            firebase_service=firebase_service,
+            upload_service=upload_service,
+            video_processor=video_processor,
+            location=location,
+            uball_client=uball_client,
+            s3_bucket=UPLOAD_BUCKET,
+            progress_callback=update_progress
+        )
+
+        with video_processing_lock:
+            if job_id in video_processing_jobs:
+                video_processing_jobs[job_id]['status'] = 'completed' if results['success'] else 'failed'
+                video_processing_jobs[job_id]['result'] = results
+
+                # Handle skipped case (no videos found but not an error)
+                if results.get('skipped'):
+                    video_processing_jobs[job_id]['stage'] = 'skipped'
+                    video_processing_jobs[job_id]['detail'] = results.get('skip_reason', 'No videos to process')
+                else:
+                    video_processing_jobs[job_id]['stage'] = 'completed' if results['success'] else 'failed'
+                    video_processing_jobs[job_id]['detail'] = 'Processing complete' if results['success'] else 'Processing failed'
+
+                video_processing_jobs[job_id]['progress'] = 100 if results['success'] else 0
+                video_processing_jobs[job_id]['completed_at'] = datetime.now().isoformat()
+
+    except Exception as e:
+        logger.error(f"[VideoProcessing] Job {job_id} failed: {e}")
+        import traceback
+        traceback.print_exc()
+        with video_processing_lock:
+            if job_id in video_processing_jobs:
+                video_processing_jobs[job_id]['status'] = 'failed'
+                video_processing_jobs[job_id]['stage'] = 'error'
+                video_processing_jobs[job_id]['detail'] = str(e)
+                video_processing_jobs[job_id]['error'] = str(e)
+                video_processing_jobs[job_id]['completed_at'] = datetime.now().isoformat()
+
+
+@app.route('/api/games/process-videos/async', methods=['POST'])
+def process_game_videos_async():
+    """
+    Start async video processing and return job ID immediately.
+
+    Request Body:
+    {
+        "firebase_game_id": "abc123",
+        "game_number": 1,
+        "location": "court-a"
+    }
+
+    Returns immediately:
+    {
+        "success": true,
+        "job_id": "uuid",
+        "message": "Processing started"
+    }
+
+    Use GET /api/games/process-videos/<job_id>/status to check progress.
+    """
+    if not firebase_service:
+        return jsonify({
+            'success': False,
+            'error': 'Firebase service not configured'
+        }), 503
+
+    try:
+        data = request.get_json()
+        if not data:
+            return jsonify({'success': False, 'error': 'Request body required'}), 400
+
+        firebase_game_id = data.get('firebase_game_id')
+        game_number = data.get('game_number', 1)
+        location = data.get('location', UPLOAD_LOCATION)
+
+        if not firebase_game_id:
+            return jsonify({'success': False, 'error': 'firebase_game_id required'}), 400
+
+        if not isinstance(game_number, int) or game_number < 1:
+            return jsonify({'success': False, 'error': 'game_number must be a positive integer'}), 400
+
+        # Create job
+        job_id = str(uuid.uuid4())
+
+        with video_processing_lock:
+            video_processing_jobs[job_id] = {
+                'job_id': job_id,
+                'firebase_game_id': firebase_game_id,
+                'game_number': game_number,
+                'location': location,
+                'status': 'running',
+                'stage': 'queued',
+                'detail': 'Job queued',
+                'progress': 0,
+                'current_angle': '',
+                'created_at': datetime.now().isoformat(),
+                'updated_at': datetime.now().isoformat(),
+                'result': None,
+                'error': None
+            }
+
+        # Start background thread
+        thread = threading.Thread(
+            target=_run_video_processing_job,
+            args=(job_id, firebase_game_id, game_number, location),
+            daemon=True
+        )
+        thread.start()
+
+        logger.info(f"[VideoProcessing] Started async job {job_id} for game {firebase_game_id}")
+
+        return jsonify({
+            'success': True,
+            'job_id': job_id,
+            'message': 'Video processing started'
+        })
+
+    except Exception as e:
+        logger.error(f"[VideoProcessing] Error starting async job: {e}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+
+@app.route('/api/games/process-videos/<job_id>/status', methods=['GET'])
+def get_video_processing_status(job_id):
+    """
+    Get status of an async video processing job.
+
+    Returns:
+    {
+        "success": true,
+        "job_id": "uuid",
+        "status": "running|completed|failed",
+        "stage": "extracting|uploading|registering|completed|error",
+        "detail": "Extracting NR video...",
+        "progress": 45,
+        "current_angle": "NR",
+        "result": {...}  // Only when completed
+    }
+    """
+    with video_processing_lock:
+        job = video_processing_jobs.get(job_id)
+
+    if not job:
+        return jsonify({
+            'success': False,
+            'error': 'Job not found'
+        }), 404
+
+    response = {
+        'success': True,
+        'job_id': job['job_id'],
+        'firebase_game_id': job['firebase_game_id'],
+        'game_number': job['game_number'],
+        'status': job['status'],
+        'stage': job['stage'],
+        'detail': job['detail'],
+        'progress': job['progress'],
+        'current_angle': job.get('current_angle', ''),
+        'created_at': job['created_at'],
+        'updated_at': job['updated_at']
+    }
+
+    if job['status'] == 'completed':
+        response['result'] = job['result']
+        response['completed_at'] = job.get('completed_at')
+        # Extract status details from result
+        if job.get('result'):
+            response['status_message'] = job['result'].get('status_message')
+            response['result_status'] = job['result'].get('status')  # success, partial, corrupted, failed
+            response['corrupted_sessions'] = job['result'].get('corrupted_sessions', [])
+    elif job['status'] == 'failed':
+        response['error'] = job.get('error')
+        response['result'] = job.get('result')
+        response['completed_at'] = job.get('completed_at')
+        # Extract status details from result even on failure
+        if job.get('result'):
+            response['status_message'] = job['result'].get('status_message')
+            response['result_status'] = job['result'].get('status')
+            response['corrupted_sessions'] = job['result'].get('corrupted_sessions', [])
+
+    return jsonify(response)
+
+
+@app.route('/api/games/process-videos/jobs', methods=['GET'])
+def list_video_processing_jobs():
+    """List all video processing jobs."""
+    with video_processing_lock:
+        jobs = list(video_processing_jobs.values())
+
+    # Sort by created_at descending
+    jobs.sort(key=lambda j: j['created_at'], reverse=True)
+
+    return jsonify({
+        'success': True,
+        'count': len(jobs),
+        'jobs': [{
+            'job_id': j['job_id'],
+            'firebase_game_id': j['firebase_game_id'],
+            'game_number': j['game_number'],
+            'status': j['status'],
+            'stage': j['stage'],
+            'progress': j['progress'],
+            'created_at': j['created_at']
+        } for j in jobs[:20]]  # Last 20 jobs
+    })
+
+
+@app.route('/api/games/<game_id>/preview-extraction', methods=['GET'])
+def preview_game_extraction(game_id):
+    """
+    Preview what would be extracted for a game without actually extracting.
+
+    Returns information about:
+    - Game time range
+    - Overlapping recording sessions
+    - Chapter files that would be used
+    - Estimated extraction parameters
+
+    Returns:
+        {
+            success: true,
+            game: {...},
+            sessions: [{
+                session_id: "...",
+                angle: "FL",
+                chapters: [...],
+                extraction_params: {...}
+            }]
+        }
+    """
+    if not firebase_service:
+        return jsonify({
+            'success': False,
+            'error': 'Firebase service not configured'
+        }), 503
+
+    try:
+        # Get game from Firebase
+        game = firebase_service.get_game(game_id)
+        if not game:
+            return jsonify({
+                'success': False,
+                'error': 'Game not found'
+            }), 404
+
+        created_at = game.get('createdAt')
+        ended_at = game.get('endedAt')
+
+        if not created_at:
+            return jsonify({
+                'success': False,
+                'error': 'Game has no start time'
+            }), 400
+
+        # Parse timestamps
+        game_start = datetime.fromisoformat(created_at.replace('Z', '+00:00'))
+        game_end = datetime.fromisoformat(ended_at.replace('Z', '+00:00')) if ended_at else datetime.now(game_start.tzinfo)
+        game_duration = (game_end - game_start).total_seconds()
+
+        # Find overlapping sessions - get ALL sessions (from all Jetsons) for preview
+        # Processing will filter by jetson_id, but preview shows the full picture
+        this_jetson_id = os.getenv('JETSON_ID', 'unknown')
+        logger.info(f"[VideoProcessing] Preview for game {game_id} (this Jetson: {this_jetson_id})")
+        all_sessions = firebase_service.get_recording_sessions(limit=100)  # No jetson_id filter for preview
+        logger.info(f"[VideoProcessing] Found {len(all_sessions)} total sessions across all Jetsons")
+        session_previews = []
+
+        for session in all_sessions:
+            session_start_str = session.get('startedAt')
+            session_end_str = session.get('endedAt')
+
+            if not session_start_str:
+                continue
+
+            s_start = datetime.fromisoformat(session_start_str.replace('Z', '+00:00'))
+            s_end = datetime.fromisoformat(session_end_str.replace('Z', '+00:00')) if session_end_str else datetime.now(s_start.tzinfo)
+
+            # Check overlap
+            if s_start < game_end and s_end > game_start:
+                session_name = session.get('segmentSession', '')
+                angle_code = session.get('angleCode', 'UNKNOWN')
+                session_jetson_id = session.get('jetsonId', 'unknown')
+                is_local = (session_jetson_id == this_jetson_id)
+
+                # Get chapters (only available if session is on this Jetson)
+                chapters = video_processor.get_session_chapters(session_name) if is_local else []
+
+                # Calculate extraction params
+                if chapters:
+                    params = video_processor.calculate_extraction_params(
+                        game_start, game_end, s_start, chapters
+                    )
+                else:
+                    if is_local:
+                        params = {'error': 'No chapters found locally'}
+                    else:
+                        params = {'error': f'Session on {session_jetson_id} (process from that Jetson)'}
+
+                session_previews.append({
+                    'session_id': session.get('id'),
+                    'segment_session': session_name,
+                    'angle': angle_code,
+                    'jetson_id': session_jetson_id,
+                    'is_local': is_local,
+                    'session_start': session_start_str,
+                    'session_end': session_end_str,
+                    'chapters_count': len(chapters),
+                    'chapters': chapters,
+                    'extraction_params': params
+                })
+
+        # Build response matching frontend ExtractionPreviewResponse type
+        issues = []
+        if not ended_at:
+            issues.append('Game has no end time - using current time')
+        if len(session_previews) == 0:
+            issues.append('No overlapping recording sessions found')
+
+        # Reshape session data to match ExtractionPreviewSession type
+        formatted_sessions = []
+        for sp in session_previews:
+            extraction_params = sp.get('extraction_params', {})
+            chapters_raw = sp.get('chapters', [])
+            formatted_chapters = []
+            for ch in chapters_raw:
+                if isinstance(ch, dict):
+                    formatted_chapters.append(ch)
+                elif isinstance(ch, str):
+                    formatted_chapters.append({
+                        'filename': ch,
+                        'size_mb': 0,
+                        'duration_str': 'unknown'
+                    })
+
+            formatted_sessions.append({
+                'session_id': sp.get('session_id', ''),
+                'session_name': sp.get('segment_session', ''),
+                'angle_code': sp.get('angle', 'UNKNOWN'),
+                'jetson_id': sp.get('jetson_id', 'unknown'),
+                'is_local': sp.get('is_local', False),
+                'recording_start': sp.get('session_start', ''),
+                'recording_end': sp.get('session_end', ''),
+                'chapters': formatted_chapters,
+                'extraction_params': {
+                    'offset_str': extraction_params.get('offset_str', '00:00:00'),
+                    'duration_str': extraction_params.get('duration_str', '00:00:00'),
+                    'chapters_to_process': extraction_params.get('chapters_to_process', 0),
+                    'total_chapters': sp.get('chapters_count', len(chapters_raw)),
+                }
+            })
+
+        # Count sessions that have local chapters (ready to process on THIS Jetson)
+        local_sessions_with_chapters = [s for s in formatted_sessions if s['is_local'] and s['extraction_params']['chapters_to_process'] > 0]
+
+        return jsonify({
+            'success': True,
+            'firebase_game_id': game_id,
+            'game_start': created_at,
+            'game_end': ended_at or '',
+            'game_duration_minutes': round(game_duration / 60, 1),
+            'this_jetson_id': this_jetson_id,
+            'overlapping_sessions': formatted_sessions,
+            'local_sessions_ready': len(local_sessions_with_chapters),
+            'ready_for_extraction': len(local_sessions_with_chapters) > 0,
+            'issues': issues if issues else None
+        })
+
+    except Exception as e:
+        logger.error(f"[VideoProcessing] Preview error: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+
+@app.route('/api/games/register-video', methods=['POST'])
+def register_video_in_uball():
+    """
+    Manually register a video in Uball Backend.
+
+    Use this endpoint to register videos that were uploaded outside of
+    the normal processing flow, or to retry failed registrations.
+
+    Request Body:
+    {
+        "firebase_game_id": "abc123",
+        "s3_key": "court-a/2025-01-20/game1/2025-01-20_game1_FL.mp4",
+        "angle_code": "FL",           // FL or FR only
+        "filename": "2025-01-20_game1_FL.mp4",
+        "duration": 3600.5,           // Optional, seconds
+        "file_size": 1234567890       // Optional, bytes
+    }
+
+    Returns:
+        { success: true, video: {...} }
+    """
+    if not uball_client:
+        return jsonify({
+            'success': False,
+            'error': 'Uball Backend client not configured'
+        }), 503
+
+    try:
+        data = request.get_json()
+        if not data:
+            return jsonify({'success': False, 'error': 'Request body required'}), 400
+
+        firebase_game_id = data.get('firebase_game_id')
+        s3_key = data.get('s3_key')
+        angle_code = data.get('angle_code', '').upper()
+        filename = data.get('filename')
+        duration = data.get('duration')
+        file_size = data.get('file_size')
+
+        if not firebase_game_id:
+            return jsonify({'success': False, 'error': 'firebase_game_id required'}), 400
+        if not s3_key:
+            return jsonify({'success': False, 'error': 's3_key required'}), 400
+        if not filename:
+            return jsonify({'success': False, 'error': 'filename required'}), 400
+        if angle_code not in ['FL', 'FR']:
+            return jsonify({
+                'success': False,
+                'error': 'angle_code must be FL or FR (only these angles are registered in Uball)'
+            }), 400
+
+        # Register the video
+        result = uball_client.register_game_video(
+            firebase_game_id=firebase_game_id,
+            s3_key=s3_key,
+            angle_code=angle_code,
+            filename=filename,
+            duration=duration,
+            file_size=file_size,
+            s3_bucket=UPLOAD_BUCKET
+        )
+
+        if result:
+            return jsonify({
+                'success': True,
+                'video': result
+            })
+        else:
+            return jsonify({
+                'success': False,
+                'error': 'Failed to register video in Uball'
+            }), 500
+
+    except Exception as e:
+        logger.error(f"[VideoRegistration] Error: {e}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+
+@app.route('/api/games/<game_id>/videos', methods=['GET'])
+def get_game_videos_from_uball(game_id):
+    """
+    Get all registered videos for a game from Uball Backend.
+
+    Args:
+        game_id: Firebase game ID
+
+    Returns:
+        { success: true, videos: [...] }
+    """
+    if not uball_client:
+        return jsonify({
+            'success': False,
+            'error': 'Uball Backend client not configured'
+        }), 503
+
+    try:
+        # First get the Uball game ID from Firebase game ID
+        game = uball_client.get_game_by_firebase_id(game_id)
+        if not game:
+            return jsonify({
+                'success': False,
+                'error': f'Game not found for Firebase ID: {game_id}'
+            }), 404
+
+        uball_game_id = str(game.get('id', ''))
+
+        # Get videos for this game
+        videos = uball_client.get_videos_for_game(uball_game_id)
+
+        return jsonify({
+            'success': True,
+            'firebase_game_id': game_id,
+            'uball_game_id': uball_game_id,
+            'count': len(videos),
+            'videos': videos
+        })
+
+    except Exception as e:
+        logger.error(f"[VideoRegistration] Error getting videos: {e}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+
 @app.route('/api/videos', methods=['GET'])
 def list_videos():
     """List all recorded videos"""
@@ -896,6 +2151,145 @@ def system_info():
             'success': False,
             'error': str(e)
         }), 500
+
+
+@app.route('/api/system/ntp', methods=['GET'])
+def get_ntp_status():
+    """
+    Check NTP synchronization status using chronyc.
+
+    Returns:
+        JSON with NTP sync info:
+        - synced: Whether the system is synchronized
+        - offset_ms: Time offset from NTP server in milliseconds
+        - stratum: Stratum level (1 = primary server, 2+ = derived)
+        - source: Current NTP source
+        - warning: Present if offset > 500ms
+    """
+    try:
+        result = subprocess.run(
+            ['chronyc', 'tracking'],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+
+        if result.returncode != 0:
+            # chronyc not available or failed
+            return jsonify({
+                'success': True,
+                'synced': False,
+                'error': 'chronyc command failed or not available',
+                'stderr': result.stderr
+            })
+
+        output = result.stdout
+        response = {
+            'success': True,
+            'synced': False,
+            'offset_ms': None,
+            'stratum': None,
+            'source': None,
+            'raw_output': output
+        }
+
+        # Parse chronyc tracking output
+        for line in output.split('\n'):
+            line = line.strip()
+
+            # Reference ID line: "Reference ID    : 203.0.113.1 (time.example.com)"
+            if line.startswith('Reference ID'):
+                parts = line.split(':', 1)
+                if len(parts) > 1:
+                    source_part = parts[1].strip()
+                    # Extract the hostname/IP from parentheses if present
+                    if '(' in source_part and ')' in source_part:
+                        response['source'] = source_part.split('(')[1].split(')')[0]
+                    else:
+                        response['source'] = source_part.split()[0] if source_part else None
+
+            # Stratum line: "Stratum         : 2"
+            elif line.startswith('Stratum'):
+                parts = line.split(':', 1)
+                if len(parts) > 1:
+                    try:
+                        response['stratum'] = int(parts[1].strip())
+                    except ValueError:
+                        pass
+
+            # System time line: "System time     : 0.000012345 seconds fast of NTP time"
+            elif line.startswith('System time'):
+                parts = line.split(':', 1)
+                if len(parts) > 1:
+                    time_part = parts[1].strip()
+                    # Extract the seconds value
+                    try:
+                        seconds_str = time_part.split()[0]
+                        offset_seconds = float(seconds_str)
+                        response['offset_ms'] = round(offset_seconds * 1000, 3)
+                    except (ValueError, IndexError):
+                        pass
+
+            # Leap status line: "Leap status     : Normal"
+            elif line.startswith('Leap status'):
+                parts = line.split(':', 1)
+                if len(parts) > 1:
+                    leap_status = parts[1].strip()
+                    response['synced'] = leap_status.lower() == 'normal'
+
+        # Add warning if offset is too high
+        if response['offset_ms'] is not None and abs(response['offset_ms']) > 500:
+            response['warning'] = f"Time offset ({response['offset_ms']}ms) exceeds 500ms threshold"
+
+        return jsonify(response)
+
+    except subprocess.TimeoutExpired:
+        return jsonify({
+            'success': False,
+            'error': 'chronyc command timed out'
+        }), 500
+    except FileNotFoundError:
+        return jsonify({
+            'success': True,
+            'synced': False,
+            'error': 'chronyc not installed. Install chrony for NTP sync.'
+        })
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+
+@app.route('/api/debug/env', methods=['GET'])
+def debug_env():
+    """Debug endpoint to check environment variables."""
+    angle_map_str = os.getenv('CAMERA_ANGLE_MAP', '{}')
+    try:
+        angle_map = json.loads(angle_map_str)
+    except:
+        angle_map = None
+
+    # Test the actual function from main.py
+    test_result_main = _get_angle_code_from_camera_name('Backbone 1')
+
+    # Test firebase_service's angle code function
+    firebase_angle_map = None
+    firebase_test_result = None
+    if firebase_service:
+        firebase_angle_map = firebase_service.camera_angle_map
+        firebase_test_result = firebase_service._get_angle_code('Backbone 1')
+
+    return jsonify({
+        'CAMERA_ANGLE_MAP_raw': angle_map_str,
+        'CAMERA_ANGLE_MAP_parsed': angle_map,
+        'JETSON_ID': os.getenv('JETSON_ID'),
+        'test_main_backbone_1': test_result_main,
+        'firebase_camera_angle_map': firebase_angle_map,
+        'test_firebase_backbone_1': firebase_test_result,
+        'dotenv_loaded': True
+    })
+
 
 @app.route('/api/videos/<filename>/download', methods=['GET'])
 def download_video(filename):
@@ -1524,16 +2918,26 @@ def get_segment_upload_status(upload_id):
 
 @app.route('/api/media/segments/upload/jobs', methods=['GET'])
 def list_segment_upload_jobs():
-    """List all segment upload jobs"""
+    """List all segment upload jobs (supports both batch and single session formats)"""
     with segment_upload_lock:
         jobs = []
         for upload_id, status in segment_upload_status.items():
-            jobs.append({
+            # Handle both batch uploads (total/completed) and single session uploads (total_files/files_completed)
+            total = status.get('total', status.get('total_files', 0))
+            completed = status.get('completed', status.get('files_completed', 0))
+
+            job_info = {
                 'upload_id': upload_id,
                 'status': status['status'],
-                'total': status['total'],
-                'completed': status['completed']
-            })
+                'total': total,
+                'completed': completed
+            }
+
+            # Include session_name for single session uploads
+            if 'session_name' in status:
+                job_info['session_name'] = status['session_name']
+
+            jobs.append(job_info)
 
     return jsonify({
         'success': True,
@@ -1543,7 +2947,7 @@ def list_segment_upload_jobs():
 
 @app.route('/api/media/segments/<session_name>/upload', methods=['POST'])
 def upload_single_segment(session_name):
-    """Upload a single segment session to S3"""
+    """Upload a single segment session to S3 (async with progress tracking)"""
     if not upload_service:
         return jsonify({
             'success': False,
@@ -1554,6 +2958,8 @@ def upload_single_segment(session_name):
         data = request.get_json() or {}
         camera_name_map = data.get('camera_name_map', {})
         delete_after_upload = data.get('delete_after_upload', False)
+        # Allow sync mode for backward compatibility (default to async)
+        async_mode = data.get('async', True)
 
         # Get session info
         session_result = media_service.get_segment_session_files(session_name)
@@ -1576,17 +2982,195 @@ def upload_single_segment(session_name):
                 'error': 'Session has no files'
             }), 400
 
-        # Upload synchronously for single session
-        result = upload_single_segment_session(session, camera_name_map, delete_after_upload)
+        # Calculate total size
+        total_size_mb = sum(f.get('size_mb', 0) for f in session['files'] if f.get('is_video'))
+        video_files = [f for f in session['files'] if f.get('is_video')]
 
-        return jsonify(result), 200 if result.get('success') else 500
+        if not async_mode:
+            # Synchronous upload (for backward compatibility)
+            result = upload_single_segment_session(session, camera_name_map, delete_after_upload)
+            return jsonify(result), 200 if result.get('success') else 500
+
+        # Generate upload ID for this single session
+        upload_id = f"single_{session_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+
+        # Initialize status tracking
+        with segment_upload_lock:
+            segment_upload_status[upload_id] = {
+                'status': 'starting',
+                'session_name': session_name,
+                'total_files': len(video_files),
+                'total_size_mb': round(total_size_mb, 2),
+                'current_file': None,
+                'current_file_index': 0,
+                'current_file_progress': 0,
+                'files_completed': 0,
+                'uploaded_uris': [],
+                'errors': [],
+                'started_at': datetime.now().isoformat(),
+                'completed_at': None
+            }
+
+        # Background upload function
+        def upload_session_background():
+            try:
+                with segment_upload_lock:
+                    segment_upload_status[upload_id]['status'] = 'in_progress'
+
+                # Run the upload with progress tracking
+                result = upload_single_segment_session_with_progress(
+                    session, camera_name_map, delete_after_upload, upload_id
+                )
+
+                with segment_upload_lock:
+                    if result.get('success'):
+                        segment_upload_status[upload_id]['status'] = 'completed'
+                        segment_upload_status[upload_id]['uploaded_uris'] = result.get('s3_uri', [])
+                        if isinstance(segment_upload_status[upload_id]['uploaded_uris'], str):
+                            segment_upload_status[upload_id]['uploaded_uris'] = [segment_upload_status[upload_id]['uploaded_uris']]
+                    else:
+                        segment_upload_status[upload_id]['status'] = 'failed'
+                        segment_upload_status[upload_id]['errors'].append(result.get('error', 'Unknown error'))
+                    segment_upload_status[upload_id]['completed_at'] = datetime.now().isoformat()
+
+            except Exception as e:
+                logger.error(f"Background upload error for {session_name}: {e}")
+                with segment_upload_lock:
+                    segment_upload_status[upload_id]['status'] = 'failed'
+                    segment_upload_status[upload_id]['errors'].append(str(e))
+                    segment_upload_status[upload_id]['completed_at'] = datetime.now().isoformat()
+
+        # Start background thread
+        upload_thread = threading.Thread(target=upload_session_background, daemon=True)
+        upload_thread.start()
+
+        return jsonify({
+            'success': True,
+            'message': f'Upload started for session {session_name}',
+            'upload_id': upload_id,
+            'session_name': session_name,
+            'total_files': len(video_files),
+            'total_size_mb': round(total_size_mb, 2),
+            'status_url': f'/api/media/segments/upload/{upload_id}/status'
+        })
 
     except Exception as e:
-        logger.error(f"Error uploading segment {session_name}: {e}")
+        logger.error(f"Error starting upload for segment {session_name}: {e}")
         return jsonify({
             'success': False,
             'error': str(e)
         }), 500
+
+
+def upload_single_segment_session_with_progress(session: dict, camera_name_map: dict, delete_after_upload: bool, upload_id: str) -> dict:
+    """
+    Upload a single segment session with progress tracking.
+    Updates segment_upload_status with per-file progress.
+    """
+    session_name = session['session_name']
+    session_path = session['path']
+    files = session['files']
+
+    logger.info(f"[SegmentUpload] Processing session: {session_name}")
+
+    # Parse session name: format is interfaceId_YYYYMMDD_HHMMSS
+    parts = session_name.split('_')
+    if len(parts) < 3:
+        return {
+            'session_name': session_name,
+            'success': False,
+            'error': f'Invalid session name format: {session_name}'
+        }
+
+    interface_id = '_'.join(parts[:-2])
+    date_str = parts[-2]
+    upload_date = f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:8]}"
+
+    camera_name = camera_name_map.get(interface_id)
+    if not camera_name:
+        camera_name = f"GoPro-{interface_id[-4:]}"
+
+    logger.info(f"[SegmentUpload] Camera: {camera_name}, Date: {upload_date}")
+
+    video_files = sorted([f for f in files if f['is_video']], key=lambda x: x['filename'])
+
+    if not video_files:
+        return {
+            'session_name': session_name,
+            'success': False,
+            'error': 'No video files in session'
+        }
+
+    logger.info(f"[SegmentUpload] Uploading {len(video_files)} files directly...")
+
+    uploaded_uris = []
+    for idx, vf in enumerate(video_files):
+        file_path = os.path.join(session_path, vf['filename'])
+
+        # Update status with current file
+        with segment_upload_lock:
+            segment_upload_status[upload_id]['current_file'] = vf['filename']
+            segment_upload_status[upload_id]['current_file_index'] = idx + 1
+            segment_upload_status[upload_id]['current_file_progress'] = 0
+
+        if len(video_files) > 1:
+            file_camera_name = f"{camera_name}_ch{idx+1:02d}"
+        else:
+            file_camera_name = camera_name
+
+        logger.info(f"[SegmentUpload] Uploading file {idx+1}/{len(video_files)}: {vf['filename']}")
+
+        try:
+            # Create progress callback for this file
+            def progress_callback(percent):
+                with segment_upload_lock:
+                    if upload_id in segment_upload_status:
+                        segment_upload_status[upload_id]['current_file_progress'] = percent
+
+            s3_uri = upload_service.upload_video(
+                video_path=file_path,
+                location=UPLOAD_LOCATION,
+                date=upload_date,
+                device_name=UPLOAD_DEVICE_NAME,
+                camera_name=file_camera_name,
+                compress=False,
+                delete_compressed_after_upload=False,
+                progress_callback=progress_callback
+            )
+            uploaded_uris.append(s3_uri)
+            logger.info(f"[SegmentUpload] Uploaded: {s3_uri}")
+
+            # Update completed count
+            with segment_upload_lock:
+                segment_upload_status[upload_id]['files_completed'] = idx + 1
+                segment_upload_status[upload_id]['current_file_progress'] = 100
+
+        except Exception as upload_err:
+            logger.warning(f"[SegmentUpload] Failed to upload {vf['filename']}: {upload_err}")
+            with segment_upload_lock:
+                segment_upload_status[upload_id]['errors'].append(f"Failed to upload {vf['filename']}: {str(upload_err)}")
+
+    if not uploaded_uris:
+        return {
+            'session_name': session_name,
+            'success': False,
+            'error': 'Failed to upload any files'
+        }
+
+    logger.info(f"[SegmentUpload] Upload complete: {len(uploaded_uris)} files uploaded")
+
+    if delete_after_upload:
+        logger.info(f"[SegmentUpload] Deleting session after upload...")
+        media_service.delete_segment_session(session_name)
+
+    return {
+        'session_name': session_name,
+        'success': True,
+        's3_uri': uploaded_uris[0] if len(uploaded_uris) == 1 else uploaded_uris,
+        'camera_name': camera_name,
+        'date': upload_date,
+        'files_uploaded': len(uploaded_uris)
+    }
 
 
 # ==================== Cloud/S3 Video Endpoints ====================

@@ -112,9 +112,14 @@ jobs:
 
           SERVICE_NAME="gopro-controller"
           DEPLOY_PATH="/home/developer/Development/gopro-automation-linux"
+          SUDO_PASS="$1"
+
+          run_sudo() {
+            echo "$SUDO_PASS" | sudo -S "$@" 2>/dev/null
+          }
 
           echo "[1/7] Stopping service before deployment..."
-          sudo systemctl stop $SERVICE_NAME 2>/dev/null || echo "Service was not running"
+          run_sudo systemctl stop $SERVICE_NAME 2>/dev/null || echo "Service was not running"
 
           echo "[2/7] Navigating to project directory..."
           if [ ! -d "$DEPLOY_PATH" ]; then
@@ -139,7 +144,7 @@ jobs:
           pip install -r requirements.txt -q
 
           echo "[6/7] Starting service..."
-          sudo systemctl start $SERVICE_NAME
+          run_sudo systemctl start $SERVICE_NAME
 
           echo "[7/7] Verifying deployment..."
           sleep 3
@@ -153,7 +158,7 @@ jobs:
             fi
           else
             echo "ERROR: Service failed to start"
-            sudo journalctl -u $SERVICE_NAME --no-pager -n 20
+            run_sudo journalctl -u $SERVICE_NAME --no-pager -n 20
             exit 1
           fi
 
@@ -165,9 +170,9 @@ jobs:
           echo "=========================================="
           DEPLOY_SCRIPT
 
-          # Copy and execute deployment script
+          # Copy and execute deployment script with sudo password
           scp -o StrictHostKeyChecking=no deploy.sh developer@$JETSON_IP:/tmp/deploy.sh
-          ssh -o StrictHostKeyChecking=no developer@$JETSON_IP "chmod +x /tmp/deploy.sh && GITHUB_REPOSITORY=${{ github.repository }} /tmp/deploy.sh"
+          ssh -o StrictHostKeyChecking=no developer@$JETSON_IP "chmod +x /tmp/deploy.sh && GITHUB_REPOSITORY=${{ github.repository }} /tmp/deploy.sh '${{ secrets.JETSON_SUDO_PASSWORD }}'"
 
       - name: Deployment Summary
         if: always()

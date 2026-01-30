@@ -38,7 +38,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # Configuration
 SCRIPT_DIR = Path(__file__).parent.resolve()
 SSH_KEY_PATH = SCRIPT_DIR / "id_rsa"
-TAILSCALE_API_KEY = os.getenv("TAILSCALE_API_KEY", "tskey-api-k6ussKkux221CNTRL-z6meRYNS3xSpnQqsRbxKxSzQfoigxkFDd")
+TAILSCALE_API_KEY = os.getenv("TAILSCALE_API_KEY")
 TAILSCALE_API_BASE = "https://api.tailscale.com/api/v2"
 
 # Default SSH user
@@ -120,6 +120,11 @@ def print_status(name: str, status: str, success: bool):
 
 def discover_jetsons() -> List[Jetson]:
     """Discover Jetson devices via Tailscale API"""
+    if not TAILSCALE_API_KEY:
+        print(Colors.error("TAILSCALE_API_KEY environment variable is not set!"))
+        print("Please set it: export TAILSCALE_API_KEY=your-api-key")
+        return []
+
     headers = {"Authorization": f"Bearer {TAILSCALE_API_KEY}"}
 
     try:
