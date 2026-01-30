@@ -760,8 +760,8 @@ class VideoProcessor:
 
             logger.info(f"  FFmpeg cmd: {' '.join(cmd)}")
 
-            # Stream copy is very fast - 5 minute timeout is plenty
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+            # Stream copy reads full 4K data from disk - allow 30 min for large multi-chapter extracts
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
 
             # Clean up concat file if created
             if len(chapters) > 1:
