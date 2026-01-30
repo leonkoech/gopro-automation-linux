@@ -1037,8 +1037,20 @@ def process_game_videos(
                 results['errors'].append(f"No chapters for session {session_name}")
                 continue
 
-            # Check for corrupted chapters
-            corrupted_chapters = [ch for ch in chapters if ch.get('is_corrupted')]
+            # Calculate extraction parameters FIRST to know which chapters we actually need
+            params = video_processor.calculate_extraction_params(
+                game_start, game_end, recording_start, chapters
+            )
+
+            logger.info(f"  Offset: {params['offset_str']}, Duration: {params['duration_str']}")
+            logger.info(f"  Chapters needed: {params['chapters_to_process']}/{params['total_chapters']}")
+
+            if not params['chapters_needed']:
+                logger.warning(f"No chapters needed for this game timeframe")
+                continue
+
+            # Check for corrupted chapters ONLY among the chapters we actually need
+            corrupted_chapters = [ch for ch in params['chapters_needed'] if ch.get('is_corrupted')]
             if corrupted_chapters:
                 corruption_msg = corrupted_chapters[0].get('corruption_error', 'Unknown corruption')
                 logger.error(f"Corrupted video files for {angle_code}: {corruption_msg}")
@@ -1051,18 +1063,6 @@ def process_game_videos(
                     'session': session_name,
                     'error': corruption_msg
                 })
-                continue
-
-            # Calculate extraction parameters
-            params = video_processor.calculate_extraction_params(
-                game_start, game_end, recording_start, chapters
-            )
-
-            logger.info(f"  Offset: {params['offset_str']}, Duration: {params['duration_str']}")
-            logger.info(f"  Chapters needed: {params['chapters_to_process']}/{params['total_chapters']}")
-
-            if not params['chapters_needed']:
-                logger.warning(f"No chapters needed for this game timeframe")
                 continue
 
             # Generate output filename and S3 key upfront
