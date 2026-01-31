@@ -144,17 +144,17 @@ upload_file_to_s3() {
 
     log "  Uploading: $(basename "$file_path") (${file_hr}) -> s3://${UPLOAD_BUCKET}/${s3_key}"
 
-    # Use aws cli for upload with progress
-    if aws s3 cp "$file_path" "s3://${UPLOAD_BUCKET}/${s3_key}" \
+    # Use aws cli for upload
+    local aws_err
+    aws_err=$(aws s3 cp "$file_path" "s3://${UPLOAD_BUCKET}/${s3_key}" \
         --region "$UPLOAD_REGION" \
-        --content-type "video/mp4" \
-        --no-progress 2>> "$LOG_FILE"; then
+        --content-type "video/mp4" 2>&1) && {
         log "  Uploaded: s3://${UPLOAD_BUCKET}/${s3_key}"
         return 0
-    else
-        err "  Failed to upload $(basename "$file_path")"
-        return 1
-    fi
+    }
+    err "  Failed to upload $(basename "$file_path"): ${aws_err}"
+    echo "$aws_err" >> "$LOG_FILE"
+    return 1
 }
 
 # ======================== Session Upload ========================
@@ -166,45 +166,44 @@ upload_session() {
 
     log "Processing session: ${session_name}"
 
-    # Parse session name: {interface_id}_{angle}_{YYYYMMDD}_{HHMMSS}
-    # interface_id can contain underscores, so extract date/time from the end
+    # Parse session name: {interface}_{angle}_{YYYYMMDD}_{HHMMSS}
+    # interface can contain underscores, so extract from the end:
+    #   last part = HHMMSS, second-to-last = YYYYMMDD, third-to-last = angle
     local parts_count
     parts_count=$(echo "$session_name" | tr '_' '\n' | wc -l)
 
-    if [ "$parts_count" -lt 3 ]; then
-        err "Invalid session name format: ${session_name} (expected {id}_{YYYYMMDD}_{HHMMSS})"
+    if [ "$parts_count" -lt 4 ]; then
+        err "Invalid session name format: ${session_name} (expected {interface}_{angle}_{YYYYMMDD}_{HHMMSS})"
         return 1
     fi
 
-    # Extract date and time from the last two underscore-separated parts
-    local date_str time_str interface_id
+    local time_str date_str angle interface_id
     time_str=$(echo "$session_name" | rev | cut -d'_' -f1 | rev)
     date_str=$(echo "$session_name" | rev | cut -d'_' -f2 | rev)
-    interface_id=$(echo "$session_name" | rev | cut -d'_' -f3- | rev)
+    angle=$(echo "$session_name" | rev | cut -d'_' -f3 | rev)
+    interface_id=$(echo "$session_name" | rev | cut -d'_' -f4- | rev)
 
     # Format date as YYYY-MM-DD
     local upload_date
     upload_date="${date_str:0:4}-${date_str:4:2}-${date_str:6:2}"
 
-    # Derive camera name from interface_id
-    # Same logic as Python: camera_name_map.get(interface_id) or GoPro-{last4}
-    local camera_name
-    camera_name="GoPro-${interface_id: -4}"
+    # Use angle as the camera name
+    local camera_name="$angle"
 
-    log "  Interface: ${interface_id}, Camera: ${camera_name}, Date: ${upload_date}"
+    log "  Interface: ${interface_id}, Angle: ${angle}, Camera: ${camera_name}, Date: ${upload_date}"
 
-    # Get sorted list of video files
+    # Get sorted list of video files (skip 0-byte files)
     local video_files=()
-    while IFS= read -r -d '' vf; do
+    while IFS= read -r vf; do
+        [ -f "$vf" ] || continue
+        local sz
+        sz=$(stat -c%s "$vf" 2>/dev/null || echo 0)
+        if [ "$sz" -eq 0 ]; then
+            log "  Skipping 0-byte file: $(basename "$vf")"
+            continue
+        fi
         video_files+=("$vf")
-    done < <(find "$session_dir" -maxdepth 1 -name '*.MP4' -o -name '*.mp4' | sort -z 2>/dev/null || find "$session_dir" -maxdepth 1 \( -name '*.MP4' -o -name '*.mp4' \) -print0 | sort -z)
-
-    # Fallback if -print0 isn't working
-    if [ ${#video_files[@]} -eq 0 ]; then
-        while IFS= read -r vf; do
-            video_files+=("$vf")
-        done < <(find "$session_dir" -maxdepth 1 \( -name '*.MP4' -o -name '*.mp4' \) | sort)
-    fi
+    done < <(find "$session_dir" -maxdepth 1 \( -name '*.MP4' -o -name '*.mp4' \) | sort)
 
     local total_files=${#video_files[@]}
 
