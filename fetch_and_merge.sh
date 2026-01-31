@@ -8,13 +8,22 @@ set -euo pipefail
 # ======================== Usage ========================
 
 usage() {
-    echo "Usage: $0 <MM-DD>"
+    echo "Usage: $0 <MM-DD> [camera]"
+    echo "       $0 clean"
     echo ""
-    echo "Downloads GoPro files from a specific date and merges them per-camera."
+    echo "Downloads GoPro segments from a specific date, optionally filtered by camera."
+    echo ""
+    echo "Commands:"
+    echo "  clean    Delete all files in ~/gopro_videos/segments/"
+    echo ""
+    echo "Arguments:"
+    echo "  MM-DD    Date filter (required)"
+    echo "  camera   Camera angle filter (optional) — e.g., FL, NR, backbone, UNK"
     echo ""
     echo "Examples:"
-    echo "  $0 01-30          # Downloads and merges all files from January 30th"
-    echo "  $0 12-25          # Downloads and merges all files from December 25th"
+    echo "  $0 01-30              # Downloads all cameras from January 30th"
+    echo "  $0 01-30 backbone     # Downloads only the 'backbone' camera from Jan 30"
+    echo "  $0 clean              # Remove all downloaded segments"
     exit 1
 }
 
@@ -22,6 +31,28 @@ usage() {
 
 if [ $# -lt 1 ]; then
     usage
+fi
+
+# Handle "clean" command
+if [ "$1" = "clean" ]; then
+    SEGMENTS_DIR="${HOME}/gopro_videos/segments"
+    if [ ! -d "$SEGMENTS_DIR" ]; then
+        echo "Nothing to clean — ${SEGMENTS_DIR} does not exist."
+        exit 0
+    fi
+    local_size=$(du -sh "$SEGMENTS_DIR" 2>/dev/null | cut -f1)
+    local_count=$(find "$SEGMENTS_DIR" -type f | wc -l)
+    echo "This will delete ${local_count} file(s) (${local_size}) from:"
+    echo "  ${SEGMENTS_DIR}"
+    echo ""
+    read -rp "Are you sure? [y/N] " confirm
+    if [[ "$confirm" =~ ^[Yy]$ ]]; then
+        rm -rf "${SEGMENTS_DIR:?}"/*
+        echo "Cleaned. Freed ${local_size}."
+    else
+        echo "Aborted."
+    fi
+    exit 0
 fi
 
 TARGET_DATE_INPUT="$1"
@@ -35,6 +66,12 @@ fi
 TARGET_MM="${TARGET_DATE_INPUT:0:2}"
 TARGET_DD="${TARGET_DATE_INPUT:3:2}"
 
+# Optional camera angle filter
+TARGET_CAMERA=""
+if [ $# -ge 2 ]; then
+    TARGET_CAMERA="$2"
+fi
+
 # ======================== Configuration ========================
 VIDEO_STORAGE_DIR="${HOME}/gopro_videos"
 SEGMENTS_DIR="${VIDEO_STORAGE_DIR}/segments"
@@ -42,6 +79,12 @@ LOG_DIR="${VIDEO_STORAGE_DIR}/logs"
 CONNECT_TIMEOUT=3
 DOWNLOAD_TIMEOUT=600
 KEEPALIVE_INTERVAL=2
+
+# Manual angle overrides: camera_name -> angle_code
+# Used when camera names don't follow the FAR/NEAR + LEFT/RIGHT pattern
+declare -A CAMERA_NAME_MAP=(
+    ["Backbone 2"]="backbone"
+)
 
 mkdir -p "$LOG_DIR"
 LOG_FILE="${LOG_DIR}/fetch_merge_${TARGET_MM}-${TARGET_DD}_$(date '+%Y%m%d_%H%M%S').log"
@@ -255,6 +298,12 @@ get_camera_angle() {
     # Write camera name to log file directly (not stdout, which is captured)
     echo "[$(date '+%Y-%m-%d %H:%M:%S')]   Camera name: ${camera_name}" >> "$LOG_FILE"
 
+    # Check manual CAMERA_NAME_MAP first
+    if [ -n "${CAMERA_NAME_MAP[$camera_name]+x}" ]; then
+        echo "${CAMERA_NAME_MAP[$camera_name]}"
+        return
+    fi
+
     local upper_name
     upper_name=$(echo "$camera_name" | tr '[:lower:]' '[:upper:]')
 
@@ -401,6 +450,12 @@ download_and_organize() {
     angle=$(get_camera_angle "$gopro_ip")
     log "  Camera angle: ${angle}"
 
+    # Skip if camera filter is set and doesn't match
+    if [ -n "$TARGET_CAMERA" ] && [ "$angle" != "$TARGET_CAMERA" ]; then
+        log "  Skipping — angle '${angle}' does not match filter '${TARGET_CAMERA}'"
+        return 0
+    fi
+
     log "Fetching media list from ${gopro_ip}..."
     local media_json
     media_json=$(get_media_list "$gopro_ip")
@@ -464,6 +519,31 @@ download_and_organize() {
 
     log "Found ${#video_groups[@]} recording(s) matching ${TARGET_MM}-${TARGET_DD}, skipped ${skipped} file(s)"
 
+    # Calculate total download size and check available disk space
+    local total_download_size=0
+    for vid in "${!video_groups[@]}"; do
+        while IFS=$'\t' read -r _dir _fn size _ts; do
+            # Subtract size of any already-downloaded partial file
+            total_download_size=$((total_download_size + size))
+        done <<< "${video_groups[$vid]}"
+    done
+
+    local available_bytes
+    available_bytes=$(df --output=avail -B1 "$SEGMENTS_DIR" 2>/dev/null | tail -1 | tr -d ' ')
+    local total_hr available_hr
+    total_hr=$(numfmt --to=iec-i --suffix=B "$total_download_size")
+    available_hr=$(numfmt --to=iec-i --suffix=B "$available_bytes")
+
+    log "Total download size: ${total_hr}, available disk space: ${available_hr}"
+
+    # Require at least 1 GiB headroom beyond what we need
+    local required=$((total_download_size + 1073741824))
+    if [ "$available_bytes" -lt "$required" ]; then
+        err "Not enough disk space! Need ${total_hr} + 1 GiB headroom but only ${available_hr} available."
+        err "Free up space and re-run."
+        return 1
+    fi
+
     start_keepalive "$gopro_ip"
 
     # Step 2: For each video ID, create a session folder and download chapters
@@ -510,7 +590,7 @@ download_and_organize() {
 
 main() {
     log "=========================================="
-    log "GoPro Fetch & Merge — date filter: ${TARGET_MM}-${TARGET_DD}"
+    log "GoPro Fetch — date: ${TARGET_MM}-${TARGET_DD}, camera: ${TARGET_CAMERA:-all}"
     log "Log file: ${LOG_FILE}"
     log "=========================================="
 
