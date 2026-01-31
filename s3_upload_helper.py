@@ -14,7 +14,8 @@ Prints result to stdout: OK:<s3_uri>  or  FAIL:<error>
 import sys
 import os
 
-# SSL fixes MUST come before any other imports (same as videoupload.py)
+# SSL fixes MUST come before any other imports
+# The core issue: OpenSSL 3.x on ARM/Jetson fails with TLS 1.3
 os.environ['OPENSSL_CONF'] = '/dev/null'
 os.environ['PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION'] = 'python'
 
@@ -22,14 +23,30 @@ import ssl
 import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
+# Patch urllib3's SSL context creation to force TLS 1.2 and lenient settings
 try:
-    import urllib3.util.ssl_
-    ctx = ssl.create_default_context()
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
-    ctx.set_ciphers('DEFAULT@SECLEVEL=1')
-    ctx.options |= ssl.OP_LEGACY_SERVER_CONNECT
-    urllib3.util.ssl_.DEFAULT_CIPHERS = 'DEFAULT@SECLEVEL=1'
+    import urllib3.util.ssl_ as urllib3_ssl
+    urllib3_ssl.DEFAULT_CIPHERS = 'DEFAULT@SECLEVEL=1'
+
+    _original_create_context = urllib3_ssl.create_urllib3_context
+
+    def _patched_create_context(ssl_version=None, cert_reqs=None, *args, **kwargs):
+        ctx = _original_create_context(ssl_version, cert_reqs, *args, **kwargs)
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        ctx.set_ciphers('DEFAULT@SECLEVEL=1')
+        # Force TLS 1.2 max — TLS 1.3 is broken on ARM + OpenSSL 3.x
+        try:
+            ctx.maximum_version = ssl.TLSVersion.TLSv1_2
+        except Exception:
+            pass
+        try:
+            ctx.options |= ssl.OP_LEGACY_SERVER_CONNECT
+        except Exception:
+            pass
+        return ctx
+
+    urllib3_ssl.create_urllib3_context = _patched_create_context
 except Exception:
     pass
 
@@ -45,12 +62,9 @@ from botocore.config import Config as BotoConfig
 from botocore.exceptions import ClientError
 import botocore.httpsession
 
-# Patch botocore SSL (same as videoupload.py)
+# Patch botocore SSL
 try:
-    original_get_cert_path = botocore.httpsession.get_cert_path
-    def patched_ssl_context(*args, **kwargs):
-        return False
-    botocore.httpsession.get_cert_path = patched_ssl_context
+    botocore.httpsession.get_cert_path = lambda *a, **k: False
 except Exception:
     pass
 
