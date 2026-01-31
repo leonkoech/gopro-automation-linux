@@ -133,28 +133,67 @@ show_upload_progress() {
 
 # ======================== S3 Upload ========================
 
+# Python helper handles SSL workarounds for Jetson/ARM
+UPLOAD_HELPER="${SCRIPT_DIR}/s3_upload_helper.py"
+
+show_upload_bar() {
+    local percent="$1"
+    local filename="$2"
+    local file_hr="$3"
+    local width=30
+
+    local filled=$(( percent * width / 100 ))
+    local empty=$(( width - filled ))
+
+    local bar=""
+    for ((i=0; i<filled; i++)); do bar+="█"; done
+    for ((i=0; i<empty; i++)); do bar+="░"; done
+
+    printf "\r  %s (%s) [%s] %3d%%" "$filename" "$file_hr" "$bar" "$percent"
+}
+
 upload_file_to_s3() {
     local file_path="$1"
     local s3_key="$2"
 
-    local file_size
+    local file_size filename
     file_size=$(stat -c%s "$file_path" 2>/dev/null || stat -f%z "$file_path" 2>/dev/null || echo 0)
+    filename=$(basename "$file_path")
     local file_hr
     file_hr=$(numfmt --to=iec-i --suffix=B "$file_size" 2>/dev/null || echo "${file_size} bytes")
 
-    log "  Uploading: $(basename "$file_path") (${file_hr}) -> s3://${UPLOAD_BUCKET}/${s3_key}"
+    log "  Uploading: ${filename} (${file_hr}) -> s3://${UPLOAD_BUCKET}/${s3_key}"
 
-    # Use aws cli for upload
-    local aws_err
-    aws_err=$(aws s3 cp "$file_path" "s3://${UPLOAD_BUCKET}/${s3_key}" \
-        --region "$UPLOAD_REGION" \
-        --content-type "video/mp4" 2>&1) && {
-        log "  Uploaded: s3://${UPLOAD_BUCKET}/${s3_key}"
+    # Use Python helper with SSL workarounds (reads config from .env)
+    local last_line=""
+    local upload_ok=false
+
+    while IFS= read -r line; do
+        case "$line" in
+            PROGRESS:*)
+                local pct="${line#PROGRESS:}"
+                show_upload_bar "$pct" "$filename" "$file_hr"
+                ;;
+            OK:*)
+                upload_ok=true
+                last_line="${line#OK:}"
+                ;;
+            FAIL:*)
+                last_line="${line#FAIL:}"
+                ;;
+        esac
+    done < <(python3 "$UPLOAD_HELPER" "$file_path" "$s3_key" 2>> "$LOG_FILE")
+
+    if [ "$upload_ok" = true ]; then
+        show_upload_bar 100 "$filename" "$file_hr"
+        printf " ✓\n"
+        log "  Uploaded: ${last_line}"
         return 0
-    }
-    err "  Failed to upload $(basename "$file_path"): ${aws_err}"
-    echo "$aws_err" >> "$LOG_FILE"
-    return 1
+    else
+        printf " ✗\n"
+        err "  Failed to upload ${filename}: ${last_line}"
+        return 1
+    fi
 }
 
 # ======================== Session Upload ========================
@@ -308,9 +347,42 @@ show_s3_status() {
     echo "S3 contents for ${UPLOAD_LOCATION}/${today}:"
     echo ""
 
-    aws s3 ls "s3://${UPLOAD_BUCKET}/${UPLOAD_LOCATION}/${today}/" \
-        --region "$UPLOAD_REGION" \
-        --human-readable 2>/dev/null || echo "  (empty or access denied)"
+    python3 -c "
+import os, sys
+os.environ['OPENSSL_CONF'] = '/dev/null'
+import ssl, urllib3
+urllib3.disable_warnings()
+try:
+    import urllib3.util.ssl_
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    ctx.set_ciphers('DEFAULT@SECLEVEL=1')
+    ctx.options |= ssl.OP_LEGACY_SERVER_CONNECT
+    urllib3.util.ssl_.DEFAULT_CIPHERS = 'DEFAULT@SECLEVEL=1'
+except: pass
+from dotenv import load_dotenv
+load_dotenv('${SCRIPT_DIR}/.env')
+import boto3, botocore.httpsession
+from botocore.config import Config
+try:
+    botocore.httpsession.get_cert_path = lambda *a,**k: False
+except: pass
+c = boto3.client('s3',
+    aws_access_key_id=os.getenv('AWS_ACCESS_KEY_ID'),
+    aws_secret_access_key=os.getenv('AWS_SECRET_ACCESS_KEY'),
+    region_name='${UPLOAD_REGION}',
+    config=Config(retries={'max_attempts':3}),
+    verify=False)
+prefix='${UPLOAD_LOCATION}/${today}/'
+r = c.list_objects_v2(Bucket='${UPLOAD_BUCKET}', Prefix=prefix)
+if 'Contents' not in r:
+    print('  (empty)')
+else:
+    for obj in sorted(r['Contents'], key=lambda x: x['Key']):
+        mb = obj['Size'] / 1048576
+        print(f\"  {obj['Key'].split('/')[-1]:50s} {mb:>10.1f} MB\")
+" 2>/dev/null || echo "  (error listing bucket)"
 }
 
 # ======================== Main ========================
@@ -326,22 +398,30 @@ main() {
     log "  Log file: ${LOG_FILE}"
     log "=========================================="
 
-    # Check for aws cli
-    if ! command -v aws &> /dev/null; then
-        err "AWS CLI not found. Install with: sudo apt install awscli  (or: pip install awscli)"
+    # Check for Python helper and dependencies
+    if [ ! -f "$UPLOAD_HELPER" ]; then
+        err "Upload helper not found: ${UPLOAD_HELPER}"
         exit 1
     fi
 
-    # Verify credentials work
-    log "Verifying AWS credentials..."
-    if ! aws sts get-caller-identity --region "$UPLOAD_REGION" > /dev/null 2>&1; then
-        # Try a lightweight S3 operation instead (sts might not be available)
-        if ! aws s3 ls "s3://${UPLOAD_BUCKET}" --region "$UPLOAD_REGION" --max-items 1 > /dev/null 2>&1; then
-            err "AWS credentials invalid or bucket not accessible. Check .env"
-            exit 1
-        fi
+    if ! python3 -c "import boto3, dotenv" 2>/dev/null; then
+        err "Missing Python dependencies. Install with: pip3 install boto3 python-dotenv"
+        exit 1
     fi
-    log "AWS credentials OK"
+
+    # Verify credentials work (uses Python helper with SSL workarounds)
+    log "Verifying AWS credentials..."
+    local verify_result
+    verify_result=$(python3 "$UPLOAD_HELPER" --verify 2>> "$LOG_FILE")
+    case "$verify_result" in
+        OK:*)
+            log "AWS credentials OK"
+            ;;
+        *)
+            err "AWS credentials check failed: ${verify_result#FAIL:}"
+            exit 1
+            ;;
+    esac
 
     case "$TARGET" in
         list)
