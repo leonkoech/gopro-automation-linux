@@ -54,9 +54,9 @@ try:
 except Exception:
     pass
 
-# Part size for multipart upload: 100 MB
-# Smaller parts = more requests but each is more likely to succeed
-PART_SIZE = 100 * 1024 * 1024
+# Part size for multipart upload: 25 MB
+# Smaller parts = more reliable on constrained Jetson devices
+PART_SIZE = 25 * 1024 * 1024
 MAX_RETRIES = 5
 
 
@@ -263,23 +263,39 @@ def upload_file(file_path, s3_key):
 
 
 def _curl_upload_part(file_path, presigned_url, offset, length, part_num, total_parts):
-    """Upload a single part via curl, return ETag on success or None on failure."""
+    """Upload a single part via curl using temp file + --upload-file, return ETag."""
     import tempfile
     import time
 
     for attempt in range(MAX_RETRIES):
-        header_file = tempfile.mktemp(suffix='.headers')
+        part_file = None
+        header_file = None
         try:
-            # Build curl command
+            # Write part data to a temp file (avoids curl buffering entire part in RAM)
+            part_file = tempfile.mktemp(suffix=f'.part{part_num}')
+            header_file = tempfile.mktemp(suffix='.headers')
+
+            with open(file_path, 'rb') as src, open(part_file, 'wb') as dst:
+                src.seek(offset)
+                remaining = length
+                while remaining > 0:
+                    chunk = src.read(min(remaining, 8 * 1024 * 1024))  # 8MB read chunks
+                    if not chunk:
+                        break
+                    dst.write(chunk)
+                    remaining -= len(chunk)
+
+            # Upload using --upload-file (streams from disk, no RAM buffering)
             curl_cmd = [
                 'curl', '-s', '-S',
                 '--insecure',
                 '--tlsv1.2', '--tls-max', '1.2',
                 '-X', 'PUT',
                 '-H', 'Content-Type: application/octet-stream',
-                '--data-binary', '@-',
+                '--upload-file', part_file,
                 '--retry', '2',
                 '--retry-delay', '3',
+                '--retry-all-errors',
                 '--connect-timeout', '30',
                 '--max-time', '600',
                 '-D', header_file,
@@ -288,19 +304,9 @@ def _curl_upload_part(file_path, presigned_url, offset, length, part_num, total_
                 presigned_url
             ]
 
-            # Read the exact bytes for this part and pipe to curl
-            with open(file_path, 'rb') as f:
-                f.seek(offset)
-                part_data = f.read(length)
-
-            result = subprocess.run(
-                curl_cmd,
-                input=part_data,
-                capture_output=True,
-                timeout=660
-            )
-
+            result = subprocess.run(curl_cmd, capture_output=True, timeout=660)
             http_code = result.stdout.decode().strip()
+            stderr_text = result.stderr.decode().strip()
 
             if http_code == '200':
                 # Parse ETag from response headers
@@ -317,25 +323,23 @@ def _curl_upload_part(file_path, presigned_url, offset, length, part_num, total_
                 if etag:
                     return etag
                 else:
-                    # If we can't parse ETag, the upload might still be OK
-                    # but we can't complete the multipart without it
-                    raise Exception(f"Got 200 but no ETag in response headers")
+                    raise Exception(f"HTTP 200 but no ETag in headers")
 
             else:
-                stderr_text = result.stderr.decode().strip()
-                raise Exception(f"HTTP {http_code}: {stderr_text}")
+                raise Exception(f"HTTP {http_code} (curl exit {result.returncode}): {stderr_text}")
 
         except subprocess.TimeoutExpired:
-            pass  # Will retry
+            print(f"PART_ERR:Part {part_num} attempt {attempt+1}/{MAX_RETRIES}: timeout", flush=True, file=sys.stderr)
         except Exception as e:
+            print(f"PART_ERR:Part {part_num} attempt {attempt+1}/{MAX_RETRIES}: {e}", flush=True, file=sys.stderr)
             if attempt >= MAX_RETRIES - 1:
                 return None
 
         finally:
-            try:
-                os.unlink(header_file)
-            except Exception:
-                pass
+            for f in [part_file, header_file]:
+                if f:
+                    try: os.unlink(f)
+                    except: pass
 
         time.sleep(min(2 ** attempt, 30))
 
