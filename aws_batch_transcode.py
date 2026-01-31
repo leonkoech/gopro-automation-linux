@@ -19,10 +19,15 @@ Environment Variables:
 """
 
 import os
+import ssl
 import time
 from typing import Dict, Any, Optional, List
 
+# Fix SSL issues on Jetson/ARM devices with OpenSSL 3.x (same as videoupload.py)
+os.environ.setdefault('OPENSSL_CONF', '/dev/null')
+
 import boto3
+from botocore.config import Config as BotoConfig
 from botocore.exceptions import ClientError
 
 from logging_service import get_logger
@@ -54,9 +59,13 @@ class AWSBatchTranscoder:
         self.region = region or os.getenv('AWS_BATCH_REGION', os.getenv('AWS_REGION', 'us-east-1'))
         self.bucket = bucket or os.getenv('UPLOAD_BUCKET', 'uball-videos-production')
 
-        # Initialize AWS clients
-        self.batch_client = boto3.client('batch', region_name=self.region)
-        self.s3_client = boto3.client('s3', region_name=self.region)
+        # Initialize AWS clients with SSL workarounds for Jetson/ARM OpenSSL 3.x
+        boto_config = BotoConfig(
+            retries={'max_attempts': 3, 'mode': 'adaptive'},
+            max_pool_connections=1,
+        )
+        self.batch_client = boto3.client('batch', region_name=self.region, config=boto_config, verify=False)
+        self.s3_client = boto3.client('s3', region_name=self.region, config=boto_config, verify=False)
 
         logger.info(f"AWSBatchTranscoder initialized: queue={self.job_queue}, "
                     f"definition={self.job_definition}, region={self.region}, bucket={self.bucket}")
