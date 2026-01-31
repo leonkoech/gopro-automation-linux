@@ -36,9 +36,9 @@ TARGET_MM="${TARGET_DATE_INPUT:0:2}"
 TARGET_DD="${TARGET_DATE_INPUT:3:2}"
 
 # ======================== Configuration ========================
-OUTPUT_DIR="${HOME}/gopro_videos/merged"
-TEMP_DIR="${HOME}/gopro_videos/tmp_downloads"
-LOG_DIR="${HOME}/gopro_videos/logs"
+VIDEO_STORAGE_DIR="${HOME}/gopro_videos"
+SEGMENTS_DIR="${VIDEO_STORAGE_DIR}/segments"
+LOG_DIR="${VIDEO_STORAGE_DIR}/logs"
 CONNECT_TIMEOUT=3
 DOWNLOAD_TIMEOUT=600
 KEEPALIVE_INTERVAL=2
@@ -228,12 +228,40 @@ verify_video() {
     return 1
 }
 
-# ======================== Media Listing ========================
+# ======================== Camera Info ========================
 
 get_media_list() {
     local gopro_ip="$1"
     curl -s --connect-timeout "$CONNECT_TIMEOUT" \
         "http://${gopro_ip}:8080/gopro/media/list" 2>/dev/null
+}
+
+get_camera_angle() {
+    # Get the camera angle code (FL, FR, NL, NR) from the GoPro's ap_ssid
+    local gopro_ip="$1"
+    local info_json
+    info_json=$(curl -s --connect-timeout "$CONNECT_TIMEOUT" \
+        "http://${gopro_ip}:8080/gopro/camera/info" 2>/dev/null) || { echo "UNK"; return; }
+
+    local camera_name
+    camera_name=$(echo "$info_json" | jq -r '.ap_ssid // .info.ap_ssid // empty' 2>/dev/null)
+
+    if [ -z "$camera_name" ]; then
+        echo "UNK"
+        return
+    fi
+
+    log "  Camera name: ${camera_name}"
+    local upper_name
+    upper_name=$(echo "$camera_name" | tr '[:lower:]' '[:upper:]')
+
+    for code in FL FR NL NR; do
+        if [[ "$upper_name" == *"$code"* ]]; then
+            echo "$code"
+            return
+        fi
+    done
+    echo "UNK"
 }
 
 # ======================== File Download ========================
@@ -319,13 +347,42 @@ download_file() {
     return 1
 }
 
-# ======================== Download All From One GoPro ========================
+# ======================== Download & Organize Per GoPro ========================
 
-download_gopro_files() {
+# GoPro filename format: G[Type][Chapter][VideoID].MP4
+# e.g. GH010042.MP4 = Type H, Chapter 01, Video 0042
+# Chapters with the same VideoID belong to one recording.
+
+get_video_id() {
+    local filename="$1"
+    local upper
+    upper=$(echo "$filename" | tr '[:lower:]' '[:upper:]')
+    if [[ ${#upper} -ge 8 && "$upper" == G* ]]; then
+        echo "${upper:4:4}"
+    else
+        echo "${filename%.*}"
+    fi
+}
+
+get_chapter_num() {
+    local filename="$1"
+    local upper
+    upper=$(echo "$filename" | tr '[:lower:]' '[:upper:]')
+    if [[ ${#upper} -ge 8 && "$upper" == G* ]]; then
+        echo "${upper:2:2}"
+    else
+        echo "00"
+    fi
+}
+
+download_and_organize() {
     local gopro_ip="$1"
-    local gopro_label="$2"
-    local gopro_dir="${TEMP_DIR}/${gopro_label}"
-    mkdir -p "$gopro_dir"
+    local iface="$2"
+
+    # Get camera angle code
+    local angle
+    angle=$(get_camera_angle "$gopro_ip")
+    log "Camera angle: ${angle}"
 
     log "Fetching media list from ${gopro_ip}..."
     local media_json
@@ -336,32 +393,28 @@ download_gopro_files() {
         return 1
     fi
 
-    # Parse media list with jq: extract directory, filename, size, creation time
     local file_count
     file_count=$(echo "$media_json" | jq '[.media[].fs[]] | length')
-    log "Found ${file_count} file(s) on GoPro ${gopro_label}"
+    log "Found ${file_count} file(s) on GoPro"
 
     if [ "$file_count" -eq 0 ]; then
-        log "No files to download from ${gopro_label}"
+        log "No files on this GoPro"
         return 0
     fi
 
-    start_keepalive "$gopro_ip"
-
-    # Iterate over each directory and file, filtering by target date
+    # Step 1: Build list of matching files grouped by video ID
+    # Format: video_id \t chapter_num \t directory \t filename \t size \t creation_ts
+    declare -A video_groups  # video_id -> newline-separated "chapter_num\tdir\tfilename\tsize\tcreation_ts"
+    declare -A video_first_ts  # video_id -> earliest creation timestamp (for session naming)
     local downloaded=0
     local skipped=0
 
-    echo "$media_json" | jq -r '.media[] | .d as $dir | .fs[] | "\($dir)\t\(.n)\t\(.s)\t\(.cre)"' | \
     while IFS=$'\t' read -r directory filename size creation_ts; do
-        # Only download video files
         local upper_fn
         upper_fn=$(echo "$filename" | tr '[:lower:]' '[:upper:]')
-        if [[ ! "$upper_fn" == *.MP4 ]]; then
-            continue
-        fi
+        [[ "$upper_fn" == *.MP4 ]] || continue
 
-        # Filter by target date (compare MM-DD from creation timestamp)
+        # Filter by target date
         local file_mm file_dd
         file_mm=$(date -d "@${creation_ts}" '+%m' 2>/dev/null || echo "00")
         file_dd=$(date -d "@${creation_ts}" '+%d' 2>/dev/null || echo "00")
@@ -371,176 +424,69 @@ download_gopro_files() {
             continue
         fi
 
-        local output_path="${gopro_dir}/${directory}__${filename}"
-        log "  Downloading: ${directory}/${filename} ($(numfmt --to=iec-i --suffix=B "$size"))"
-        download_file "$gopro_ip" "$directory" "$filename" "$output_path" "$size"
-        downloaded=$((downloaded + 1))
-    done
+        local vid
+        vid=$(get_video_id "$filename")
+        local entry="${directory}\t${filename}\t${size}\t${creation_ts}"
 
-    log "  Downloaded ${downloaded} file(s), skipped ${skipped} file(s) not matching ${TARGET_MM}-${TARGET_DD}"
+        if [ -z "${video_groups[$vid]+x}" ]; then
+            video_groups[$vid]="$entry"
+            video_first_ts[$vid]="$creation_ts"
+        else
+            video_groups[$vid]="${video_groups[$vid]}"$'\n'"$entry"
+            # Track earliest timestamp for session naming
+            if [ "$creation_ts" -lt "${video_first_ts[$vid]}" ]; then
+                video_first_ts[$vid]="$creation_ts"
+            fi
+        fi
+    done < <(echo "$media_json" | jq -r '.media[] | .d as $dir | .fs[] | "\($dir)\t\(.n)\t\(.s)\t\(.cre)"')
 
-    stop_keepalive
-    log "Download complete for GoPro ${gopro_label}"
-}
-
-# ======================== Chapter Grouping & Merging ========================
-
-# GoPro filename format: G[Type][Chapter][VideoID].MP4
-# e.g. GH010042.MP4 = Type H, Chapter 01, Video 0042
-# Chapters with the same VideoID belong together.
-
-get_video_id() {
-    local filename="$1"
-    # Strip directory prefix (100GOPRO__) if present
-    local base
-    base=$(basename "$filename")
-    local upper
-    upper=$(echo "$base" | tr '[:lower:]' '[:upper:]')
-
-    if [[ ${#upper} -ge 8 && "$upper" == G* ]]; then
-        echo "${upper:4:4}"  # Characters 4-7 = video ID
-    else
-        echo "$base"
-    fi
-}
-
-get_chapter_num() {
-    local filename="$1"
-    local base
-    base=$(basename "$filename")
-    local upper
-    upper=$(echo "$base" | tr '[:lower:]' '[:upper:]')
-
-    if [[ ${#upper} -ge 8 && "$upper" == G* ]]; then
-        echo "${upper:2:2}"  # Characters 2-3 = chapter number
-    else
-        echo "00"
-    fi
-}
-
-get_file_date() {
-    local filepath="$1"
-    # Use file modification time to determine the date
-    date -r "$filepath" '+%Y-%m-%d' 2>/dev/null || echo "unknown"
-}
-
-merge_gopro_files() {
-    local gopro_label="$1"
-    local gopro_dir="${TEMP_DIR}/${gopro_label}"
-
-    if [ ! -d "$gopro_dir" ] || [ -z "$(ls -A "$gopro_dir" 2>/dev/null)" ]; then
-        log "No files to merge for ${gopro_label}"
+    if [ ${#video_groups[@]} -eq 0 ]; then
+        log "No video files match ${TARGET_MM}-${TARGET_DD} (skipped ${skipped})"
         return 0
     fi
 
-    log "Grouping and merging files for ${gopro_label}..."
+    log "Found ${#video_groups[@]} recording(s) matching ${TARGET_MM}-${TARGET_DD}, skipped ${skipped} file(s)"
 
-    # Step 1: Group files by (date, video_id)
-    # Build an associative array: key="date|video_id" -> sorted list of chapter files
-    declare -A groups
+    start_keepalive "$gopro_ip"
 
-    for filepath in "${gopro_dir}"/*.MP4 "${gopro_dir}"/*.mp4; do
-        [ -f "$filepath" ] || continue
+    # Step 2: For each video ID, create a session folder and download chapters
+    declare -a SESSION_DIRS=()
 
-        local filename
-        filename=$(basename "$filepath")
-        local video_id
-        video_id=$(get_video_id "$filename")
-        local file_date
-        file_date=$(get_file_date "$filepath")
-        local key="${file_date}|${video_id}"
+    for vid in $(echo "${!video_groups[@]}" | tr ' ' '\n' | sort); do
+        local first_ts="${video_first_ts[$vid]}"
+        local session_ts
+        session_ts=$(date -d "@${first_ts}" '+%Y%m%d_%H%M%S' 2>/dev/null || echo "00000000_000000")
 
-        if [ -z "${groups[$key]+x}" ]; then
-            groups[$key]="$filepath"
-        else
-            groups[$key]="${groups[$key]}"$'\n'"$filepath"
-        fi
+        # Session folder: {interface}_{angle}_{YYYYMMDD_HHMMSS}
+        local session_id="${iface}_${angle}_${session_ts}"
+        local session_dir="${SEGMENTS_DIR}/${session_id}"
+        mkdir -p "$session_dir"
+        SESSION_DIRS+=("$session_dir")
+
+        log "Recording ${vid} → session: ${session_id}"
+
+        # Sort chapters by GoPro chapter number and download
+        local chapter_idx=0
+        while IFS=$'\t' read -r directory filename size creation_ts; do
+            chapter_idx=$((chapter_idx + 1))
+            local chapter_name
+            chapter_name=$(printf "chapter_%03d_%s" "$chapter_idx" "$filename")
+            local output_path="${session_dir}/${chapter_name}"
+
+            log "  Downloading: ${directory}/${filename} ($(numfmt --to=iec-i --suffix=B "$size"))"
+            download_file "$gopro_ip" "$directory" "$filename" "$output_path" "$size"
+
+            # Preserve the GoPro creation timestamp
+            touch -d "@${creation_ts}" "$output_path" 2>/dev/null || true
+
+            downloaded=$((downloaded + 1))
+        done < <(echo -e "${video_groups[$vid]}" | sort -t$'\t' -k2,2)
+        # Sort by filename ensures chapter order (GX01..., GX02..., GX03...)
     done
 
-    # Step 2: For each group, merge chapters into one file
-    # Then collect per-date files for the final per-date merge
-    declare -A date_files
-
-    for key in "${!groups[@]}"; do
-        local file_date="${key%%|*}"
-        local video_id="${key##*|}"
-        local file_list="${groups[$key]}"
-
-        # Sort chapters by chapter number
-        local sorted_files
-        sorted_files=$(echo "$file_list" | while read -r f; do
-            local chap
-            chap=$(get_chapter_num "$(basename "$f")")
-            echo "${chap} ${f}"
-        done | sort -k1,1 | awk '{print $2}')
-
-        local file_count
-        file_count=$(echo "$sorted_files" | wc -l)
-
-        local group_output="${gopro_dir}/merged_${file_date}_${video_id}.mp4"
-
-        if [ "$file_count" -eq 1 ]; then
-            # Single chapter, just copy
-            cp "$(echo "$sorted_files" | head -1)" "$group_output"
-            log "  Single chapter: video ${video_id} on ${file_date}"
-        else
-            # Multiple chapters, merge with ffmpeg concat demuxer
-            local concat_file="${gopro_dir}/concat_${video_id}.txt"
-            echo "$sorted_files" | while read -r f; do
-                echo "file '$(realpath "$f")'"
-            done > "$concat_file"
-
-            start_spinner "Merging ${file_count} chapters for video ${video_id}..."
-            ffmpeg -y -f concat -safe 0 -i "$concat_file" -c copy "$group_output" \
-                -loglevel warning >> "$LOG_FILE" 2>&1
-            stop_spinner
-            log "  ✓ Merged ${file_count} chapters for video ${video_id} on ${file_date}"
-
-            rm -f "$concat_file"
-        fi
-
-        # Collect for per-date merge
-        if [ -z "${date_files[$file_date]+x}" ]; then
-            date_files[$file_date]="$group_output"
-        else
-            date_files[$file_date]="${date_files[$file_date]}"$'\n'"$group_output"
-        fi
-    done
-
-    # Step 3: Merge all videos from the same date into one final file per date
-    local date_output_dir="${OUTPUT_DIR}/${gopro_label}"
-    mkdir -p "$date_output_dir"
-
-    for file_date in "${!date_files[@]}"; do
-        local day_files="${date_files[$file_date]}"
-        local day_count
-        day_count=$(echo "$day_files" | wc -l)
-        local final_output="${date_output_dir}/${gopro_label}_${file_date}.mp4"
-
-        if [ "$day_count" -eq 1 ]; then
-            mv "$(echo "$day_files" | head -1)" "$final_output"
-            log "  Final (single video): ${final_output}"
-        else
-            # Sort by filename (which includes video ID) for consistent ordering
-            local sorted_day
-            sorted_day=$(echo "$day_files" | sort)
-
-            local concat_file="${gopro_dir}/concat_date_${file_date}.txt"
-            echo "$sorted_day" | while read -r f; do
-                echo "file '$(realpath "$f")'"
-            done > "$concat_file"
-
-            start_spinner "Merging ${day_count} videos for ${file_date} into final file..."
-            ffmpeg -y -f concat -safe 0 -i "$concat_file" -c copy "$final_output" \
-                -loglevel warning >> "$LOG_FILE" 2>&1
-            stop_spinner
-            log "  ✓ Final: ${final_output}"
-
-            rm -f "$concat_file"
-        fi
-    done
-
-    log "Merge complete for ${gopro_label}. Output: ${date_output_dir}/"
+    stop_keepalive
+    log "Downloaded ${downloaded} file(s) into ${#SESSION_DIRS[@]} session(s)"
+    log "Done processing GoPro at ${gopro_ip}"
 }
 
 # ======================== Main ========================
@@ -552,14 +498,14 @@ main() {
     log "=========================================="
 
     # Check dependencies
-    for cmd in curl jq ffmpeg numfmt; do
+    for cmd in curl jq numfmt; do
         if ! command -v "$cmd" &> /dev/null; then
             err "Required command not found: ${cmd}"
             exit 1
         fi
     done
 
-    mkdir -p "$OUTPUT_DIR" "$TEMP_DIR"
+    mkdir -p "$SEGMENTS_DIR"
 
     declare -a GOPRO_IPS=()
     declare -a GOPRO_IFACES=()
@@ -567,33 +513,26 @@ main() {
     # Step 1: Discover GoPros
     discover_gopros
 
-    # Step 2: Download files from each GoPro
+    # Step 2: Download, organize into segments, and merge
     for i in "${!GOPRO_IPS[@]}"; do
         local ip="${GOPRO_IPS[$i]}"
         local iface="${GOPRO_IFACES[$i]}"
-        local label="gopro_${iface}"
 
         log "------------------------------------------"
-        log "Processing GoPro at ${ip} (${label})"
+        log "Processing GoPro at ${ip} (${iface})"
         log "------------------------------------------"
 
-        download_gopro_files "$ip" "$label" || {
-            err "Failed to download from ${ip}, skipping merge."
+        download_and_organize "$ip" "$iface" || {
+            err "Failed to process GoPro at ${ip}."
             continue
         }
-
-        merge_gopro_files "$label"
     done
 
-    # Step 3: Cleanup temp files
-    log "Cleaning up temporary downloads..."
-    rm -rf "$TEMP_DIR"
-
     log "=========================================="
-    log "All done! Merged videos are in: ${OUTPUT_DIR}"
+    log "All done! Segments: ${SEGMENTS_DIR}"
     log "Full log: ${LOG_FILE}"
     log "=========================================="
-    ls -lhR "$OUTPUT_DIR" 2>/dev/null | tee -a "$LOG_FILE" || true
+    ls -lhR "$SEGMENTS_DIR" 2>/dev/null | tee -a "$LOG_FILE" || true
 }
 
 main "$@"
