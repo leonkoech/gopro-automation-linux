@@ -43,15 +43,18 @@ discover_gopros() {
 
     # Get all network interfaces with 172.x.x.x IPs (USB-connected GoPros)
     while IFS= read -r line; do
-        # Extract interface name and IP
+        # Extract interface name (last field) and IP (second field, strip CIDR)
         local iface ip base our_last
         iface=$(echo "$line" | awk '{print $NF}')
-        ip=$(echo "$line" | grep -oP '172\.\d+\.\d+\.\d+')
+        ip=$(echo "$line" | awk '{print $2}' | cut -d'/' -f1)
 
-        [ -z "$ip" ] && continue
+        # Verify it's a 172.x.x.x address
+        [[ "$ip" =~ ^172\. ]] || continue
 
-        base=$(echo "$ip" | grep -oP '^\d+\.\d+\.\d+')
-        our_last=$(echo "$ip" | grep -oP '\d+$')
+        base=$(echo "$ip" | rev | cut -d'.' -f2- | rev)
+        our_last=$(echo "$ip" | rev | cut -d'.' -f1 | rev)
+
+        log "  Interface ${iface}: our IP is ${ip} (base=${base}, last=${our_last})"
 
         # Build candidate GoPro IPs based on our own IP
         local candidates=()
@@ -65,16 +68,17 @@ discover_gopros() {
 
         # Try each candidate
         for candidate in "${candidates[@]}"; do
+            log "  Trying ${candidate}..."
             if curl -s --connect-timeout "$CONNECT_TIMEOUT" \
                 "http://${candidate}:8080/gopro/camera/state" > /dev/null 2>&1; then
-                log "Found GoPro at ${candidate} (via interface ${iface})"
+                log "  Found GoPro at ${candidate} (via interface ${iface})"
                 GOPRO_IPS+=("$candidate")
                 GOPRO_IFACES+=("$iface")
                 found=$((found + 1))
                 break
             fi
         done
-    done < <(ip addr show | grep 'inet 172\.' | grep -v '127.0.0.1')
+    done < <(ip addr show | grep 'inet 172\.')
 
     if [ "$found" -eq 0 ]; then
         err "No GoPro cameras found on USB interfaces."
