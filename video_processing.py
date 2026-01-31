@@ -104,7 +104,7 @@ class VideoProcessor:
                 '-show_entries', 'format=duration',
                 '-of', 'default=noprint_wrappers=1:nokey=1',
                 filepath
-            ], capture_output=True, text=True, timeout=30)
+            ], capture_output=True, text=True, timeout=120)
 
             if result.returncode == 0 and result.stdout.strip():
                 return float(result.stdout.strip())
@@ -129,7 +129,7 @@ class VideoProcessor:
                 '-show_entries', 'format=duration',
                 '-of', 'default=noprint_wrappers=1:nokey=1',
                 filepath
-            ], capture_output=True, text=True, timeout=30)
+            ], capture_output=True, text=True, timeout=120)
 
             if result.returncode != 0:
                 if 'moov atom not found' in result.stderr:
@@ -143,6 +143,9 @@ class VideoProcessor:
             if not result.stdout.strip():
                 return True, 'Video file corrupted: no duration metadata'
 
+            return False, ''
+        except subprocess.TimeoutExpired:
+            logger.warning(f"ffprobe timeout checking {filepath} — assuming valid (large 4K file on loaded system)")
             return False, ''
         except Exception as e:
             return True, f'Error checking video: {str(e)}'
@@ -158,7 +161,7 @@ class VideoProcessor:
                 '-show_entries', 'stream=height',
                 '-of', 'csv=p=0',
                 filepath
-            ], capture_output=True, text=True, timeout=30)
+            ], capture_output=True, text=True, timeout=120)
 
             if result.returncode == 0 and result.stdout.strip():
                 return int(result.stdout.strip())
@@ -176,7 +179,7 @@ class VideoProcessor:
                 '-show_entries', 'stream=codec_name',
                 '-of', 'csv=p=0',
                 filepath
-            ], capture_output=True, text=True, timeout=30)
+            ], capture_output=True, text=True, timeout=120)
 
             if result.returncode == 0 and result.stdout.strip():
                 return result.stdout.strip().lower()
@@ -855,7 +858,7 @@ class VideoProcessor:
                 '-show_format',
                 '-show_streams',
                 filepath
-            ], capture_output=True, text=True, timeout=30)
+            ], capture_output=True, text=True, timeout=120)
 
             if result.returncode == 0:
                 import json

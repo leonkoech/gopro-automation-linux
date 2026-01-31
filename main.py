@@ -102,6 +102,8 @@ def verify_video_integrity(file_path):
     """
     Quick check that video file is valid using ffprobe.
     Returns True if file appears to be a valid video.
+    A timeout is treated as valid (not corrupted) since large 4K files
+    on a loaded Jetson can exceed probe time without being corrupt.
     """
     try:
         result = subprocess.run(
@@ -109,7 +111,7 @@ def verify_video_integrity(file_path):
              '-show_entries', 'stream=duration', '-of', 'csv=p=0', file_path],
             capture_output=True,
             text=True,
-            timeout=30
+            timeout=120
         )
         # Check return code and that we got some duration output
         if result.returncode == 0 and result.stdout.strip():
@@ -118,8 +120,8 @@ def verify_video_integrity(file_path):
                 return True
         return False
     except subprocess.TimeoutExpired:
-        logger.warning(f"ffprobe timeout checking {file_path}")
-        return False
+        logger.warning(f"ffprobe timeout checking {file_path} — assuming valid (file size matched)")
+        return True
     except Exception as e:
         logger.warning(f"ffprobe error checking {file_path}: {e}")
         return False

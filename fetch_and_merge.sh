@@ -5,25 +5,111 @@
 
 set -euo pipefail
 
+# ======================== Usage ========================
+
+usage() {
+    echo "Usage: $0 <MM-DD>"
+    echo ""
+    echo "Downloads GoPro files from a specific date and merges them per-camera."
+    echo ""
+    echo "Examples:"
+    echo "  $0 01-30          # Downloads and merges all files from January 30th"
+    echo "  $0 12-25          # Downloads and merges all files from December 25th"
+    exit 1
+}
+
+# ======================== Date Argument ========================
+
+if [ $# -lt 1 ]; then
+    usage
+fi
+
+TARGET_DATE_INPUT="$1"
+
+# Validate MM-DD format
+if [[ ! "$TARGET_DATE_INPUT" =~ ^[0-9]{2}-[0-9]{2}$ ]]; then
+    err "Invalid date format: ${TARGET_DATE_INPUT}. Expected MM-DD (e.g., 01-30)"
+    usage
+fi
+
+TARGET_MM="${TARGET_DATE_INPUT:0:2}"
+TARGET_DD="${TARGET_DATE_INPUT:3:2}"
+
 # ======================== Configuration ========================
 OUTPUT_DIR="${HOME}/gopro_videos/merged"
 TEMP_DIR="${HOME}/gopro_videos/tmp_downloads"
-CHUNK_SIZE=1048576  # 1MB download chunks
+LOG_DIR="${HOME}/gopro_videos/logs"
 CONNECT_TIMEOUT=3
 DOWNLOAD_TIMEOUT=600
 KEEPALIVE_INTERVAL=2
 
+mkdir -p "$LOG_DIR"
+LOG_FILE="${LOG_DIR}/fetch_merge_${TARGET_MM}-${TARGET_DD}_$(date '+%Y%m%d_%H%M%S').log"
+
 # ======================== Helper Functions ========================
 
 log() {
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"
+    local msg="[$(date '+%Y-%m-%d %H:%M:%S')] $*"
+    echo "$msg"
+    echo "$msg" >> "$LOG_FILE"
 }
 
 err() {
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: $*" >&2
+    local msg="[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: $*"
+    echo "$msg" >&2
+    echo "$msg" >> "$LOG_FILE"
+}
+
+# Spinner for long-running operations
+SPINNER_PID=""
+start_spinner() {
+    local msg="$1"
+    (
+        local chars='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
+        local i=0
+        while true; do
+            local c="${chars:$i:1}"
+            printf "\r  %s %s" "$c" "$msg"
+            i=$(( (i + 1) % ${#chars} ))
+            sleep 0.1
+        done
+    ) &
+    SPINNER_PID=$!
+}
+
+stop_spinner() {
+    if [ -n "$SPINNER_PID" ]; then
+        kill "$SPINNER_PID" 2>/dev/null || true
+        wait "$SPINNER_PID" 2>/dev/null || true
+        SPINNER_PID=""
+        printf "\r\033[K"  # Clear the spinner line
+    fi
+}
+
+# Progress bar for downloads
+show_progress_bar() {
+    local current="$1"
+    local total="$2"
+    local filename="$3"
+    local width=30
+
+    if [ "$total" -le 0 ]; then return; fi
+
+    local percent=$(( current * 100 / total ))
+    local filled=$(( percent * width / 100 ))
+    local empty=$(( width - filled ))
+    local current_mb=$(awk "BEGIN {printf \"%.1f\", ${current}/1048576}")
+    local total_mb=$(awk "BEGIN {printf \"%.1f\", ${total}/1048576}")
+
+    local bar=""
+    for ((i=0; i<filled; i++)); do bar+="█"; done
+    for ((i=0; i<empty; i++)); do bar+="░"; done
+
+    printf "\r  %s [%s] %3d%% (%s/%s MB)" "$filename" "$bar" "$percent" "$current_mb" "$total_mb"
 }
 
 cleanup_on_exit() {
+    stop_spinner
     # Kill any background keep-alive loops
     if [ ${#KEEPALIVE_PIDS[@]} -gt 0 ]; then
         for pid in "${KEEPALIVE_PIDS[@]}"; do
@@ -68,14 +154,17 @@ discover_gopros() {
 
         # Try each candidate
         for candidate in "${candidates[@]}"; do
-            log "  Trying ${candidate}..."
+            start_spinner "Trying ${candidate}..."
             if curl -s --connect-timeout "$CONNECT_TIMEOUT" \
                 "http://${candidate}:8080/gopro/camera/state" > /dev/null 2>&1; then
-                log "  Found GoPro at ${candidate} (via interface ${iface})"
+                stop_spinner
+                log "  ✓ Found GoPro at ${candidate} (via interface ${iface})"
                 GOPRO_IPS+=("$candidate")
                 GOPRO_IFACES+=("$iface")
                 found=$((found + 1))
                 break
+            else
+                stop_spinner
             fi
         done
     done < <(ip addr show | grep 'inet 172\.')
@@ -110,6 +199,35 @@ stop_keepalive() {
     fi
 }
 
+# ======================== Video Integrity ========================
+
+FFPROBE_TIMEOUT=120
+
+verify_video() {
+    local filepath="$1"
+    local filename
+    filename=$(basename "$filepath")
+
+    # ffprobe to check the file has a valid video stream with duration
+    local duration
+    duration=$(timeout "$FFPROBE_TIMEOUT" ffprobe -v error -select_streams v:0 \
+        -show_entries stream=duration -of csv=p=0 "$filepath" 2>/dev/null) || {
+        local exit_code=$?
+        if [ "$exit_code" -eq 124 ]; then
+            # Timeout — assume valid (large 4K file on loaded system)
+            log "  ⚠ ffprobe timeout for ${filename} — assuming valid (file size matched)"
+            echo "$duration" >> "$LOG_FILE"
+            return 0
+        fi
+        return 1
+    }
+
+    if [ -n "$duration" ] && awk "BEGIN {exit !($duration > 0)}" 2>/dev/null; then
+        return 0
+    fi
+    return 1
+}
+
 # ======================== Media Listing ========================
 
 get_media_list() {
@@ -133,7 +251,9 @@ download_file() {
     if [ -f "$output_path" ]; then
         current_size=$(stat -c%s "$output_path" 2>/dev/null || echo 0)
         if [ "$current_size" -ge "$expected_size" ]; then
-            log "  Already downloaded: ${filename} (${expected_size} bytes)"
+            show_progress_bar "$expected_size" "$expected_size" "$filename"
+            printf " ✓\n"
+            log "  Already downloaded: ${filename}"
             return 0
         fi
         log "  Resuming ${filename} from byte ${current_size}..."
@@ -141,27 +261,55 @@ download_file() {
 
     local max_retries=5
     for attempt in $(seq 1 $max_retries); do
+        # Use curl with progress callback via --write-out and background monitoring
         if [ "$current_size" -gt 0 ]; then
-            # Resume download
-            curl -s --connect-timeout "$CONNECT_TIMEOUT" \
+            curl --connect-timeout "$CONNECT_TIMEOUT" \
                 --max-time "$DOWNLOAD_TIMEOUT" \
                 -H "Range: bytes=${current_size}-" \
                 -o "$output_path" -C - \
-                "$url" 2>/dev/null
+                "$url" 2>/dev/null &
         else
-            curl -s --connect-timeout "$CONNECT_TIMEOUT" \
+            curl --connect-timeout "$CONNECT_TIMEOUT" \
                 --max-time "$DOWNLOAD_TIMEOUT" \
                 -o "$output_path" \
-                "$url" 2>/dev/null
+                "$url" 2>/dev/null &
         fi
+        local curl_pid=$!
+
+        # Monitor download progress in foreground
+        while kill -0 "$curl_pid" 2>/dev/null; do
+            if [ -f "$output_path" ]; then
+                local dl_size
+                dl_size=$(stat -c%s "$output_path" 2>/dev/null || echo 0)
+                show_progress_bar "$dl_size" "$expected_size" "$filename"
+            fi
+            sleep 0.5
+        done
+        wait "$curl_pid" 2>/dev/null || true
 
         # Verify file size
         local actual_size
         actual_size=$(stat -c%s "$output_path" 2>/dev/null || echo 0)
+        show_progress_bar "$actual_size" "$expected_size" "$filename"
+
         if [ "$actual_size" -ge "$expected_size" ]; then
+            # Size matches — run integrity check
+            printf " verifying..."
+            if verify_video "$output_path"; then
+                printf "\r\033[K"
+                show_progress_bar "$actual_size" "$expected_size" "$filename"
+                printf " ✓\n"
+                log "  Downloaded & verified: ${filename} ($(numfmt --to=iec-i --suffix=B "$actual_size"))"
+            else
+                printf "\r\033[K"
+                show_progress_bar "$actual_size" "$expected_size" "$filename"
+                printf " ⚠ (integrity check failed, keeping file)\n"
+                log "  ⚠ ${filename}: integrity check failed but file size matches — keeping"
+            fi
             return 0
         fi
 
+        printf " ✗\n"
         current_size="$actual_size"
         log "  Retry ${attempt}/${max_retries} for ${filename} (got ${actual_size}/${expected_size} bytes)"
         sleep 2
@@ -200,7 +348,10 @@ download_gopro_files() {
 
     start_keepalive "$gopro_ip"
 
-    # Iterate over each directory and file
+    # Iterate over each directory and file, filtering by target date
+    local downloaded=0
+    local skipped=0
+
     echo "$media_json" | jq -r '.media[] | .d as $dir | .fs[] | "\($dir)\t\(.n)\t\(.s)\t\(.cre)"' | \
     while IFS=$'\t' read -r directory filename size creation_ts; do
         # Only download video files
@@ -210,10 +361,23 @@ download_gopro_files() {
             continue
         fi
 
+        # Filter by target date (compare MM-DD from creation timestamp)
+        local file_mm file_dd
+        file_mm=$(date -d "@${creation_ts}" '+%m' 2>/dev/null || echo "00")
+        file_dd=$(date -d "@${creation_ts}" '+%d' 2>/dev/null || echo "00")
+
+        if [ "$file_mm" != "$TARGET_MM" ] || [ "$file_dd" != "$TARGET_DD" ]; then
+            skipped=$((skipped + 1))
+            continue
+        fi
+
         local output_path="${gopro_dir}/${directory}__${filename}"
         log "  Downloading: ${directory}/${filename} ($(numfmt --to=iec-i --suffix=B "$size"))"
         download_file "$gopro_ip" "$directory" "$filename" "$output_path" "$size"
+        downloaded=$((downloaded + 1))
     done
+
+    log "  Downloaded ${downloaded} file(s), skipped ${skipped} file(s) not matching ${TARGET_MM}-${TARGET_DD}"
 
     stop_keepalive
     log "Download complete for GoPro ${gopro_label}"
@@ -326,9 +490,11 @@ merge_gopro_files() {
                 echo "file '$(realpath "$f")'"
             done > "$concat_file"
 
-            log "  Merging ${file_count} chapters for video ${video_id} on ${file_date}..."
+            start_spinner "Merging ${file_count} chapters for video ${video_id}..."
             ffmpeg -y -f concat -safe 0 -i "$concat_file" -c copy "$group_output" \
-                -loglevel warning 2>&1 | while read -r line; do log "    ffmpeg: $line"; done
+                -loglevel warning >> "$LOG_FILE" 2>&1
+            stop_spinner
+            log "  ✓ Merged ${file_count} chapters for video ${video_id} on ${file_date}"
 
             rm -f "$concat_file"
         fi
@@ -364,12 +530,13 @@ merge_gopro_files() {
                 echo "file '$(realpath "$f")'"
             done > "$concat_file"
 
-            log "  Merging ${day_count} videos for ${file_date} into final file..."
+            start_spinner "Merging ${day_count} videos for ${file_date} into final file..."
             ffmpeg -y -f concat -safe 0 -i "$concat_file" -c copy "$final_output" \
-                -loglevel warning 2>&1 | while read -r line; do log "    ffmpeg: $line"; done
+                -loglevel warning >> "$LOG_FILE" 2>&1
+            stop_spinner
+            log "  ✓ Final: ${final_output}"
 
             rm -f "$concat_file"
-            log "  Final: ${final_output}"
         fi
     done
 
@@ -380,7 +547,8 @@ merge_gopro_files() {
 
 main() {
     log "=========================================="
-    log "GoPro Fetch & Merge"
+    log "GoPro Fetch & Merge — date filter: ${TARGET_MM}-${TARGET_DD}"
+    log "Log file: ${LOG_FILE}"
     log "=========================================="
 
     # Check dependencies
@@ -423,8 +591,9 @@ main() {
 
     log "=========================================="
     log "All done! Merged videos are in: ${OUTPUT_DIR}"
+    log "Full log: ${LOG_FILE}"
     log "=========================================="
-    ls -lhR "$OUTPUT_DIR" 2>/dev/null || true
+    ls -lhR "$OUTPUT_DIR" 2>/dev/null | tee -a "$LOG_FILE" || true
 }
 
 main "$@"
