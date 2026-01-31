@@ -238,6 +238,7 @@ get_media_list() {
 
 get_camera_angle() {
     # Get the camera angle code (FL, FR, NL, NR) from the GoPro's ap_ssid
+    # NOTE: Do NOT call log() here — this runs inside $() so stdout is captured
     local gopro_ip="$1"
     local info_json
     info_json=$(curl -s --connect-timeout "$CONNECT_TIMEOUT" \
@@ -251,16 +252,32 @@ get_camera_angle() {
         return
     fi
 
-    log "  Camera name: ${camera_name}"
+    # Write camera name to log file directly (not stdout, which is captured)
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')]   Camera name: ${camera_name}" >> "$LOG_FILE"
+
     local upper_name
     upper_name=$(echo "$camera_name" | tr '[:lower:]' '[:upper:]')
 
+    # Match common angle keywords
     for code in FL FR NL NR; do
         if [[ "$upper_name" == *"$code"* ]]; then
             echo "$code"
             return
         fi
     done
+
+    # Fallback: try to match "FAR"/"NEAR" + "LEFT"/"RIGHT" patterns
+    local pos="" side=""
+    [[ "$upper_name" == *FAR* ]] && pos="F"
+    [[ "$upper_name" == *NEAR* ]] && pos="N"
+    [[ "$upper_name" == *LEFT* ]] && side="L"
+    [[ "$upper_name" == *RIGHT* ]] && side="R"
+
+    if [ -n "$pos" ] && [ -n "$side" ]; then
+        echo "${pos}${side}"
+        return
+    fi
+
     echo "UNK"
 }
 
@@ -382,7 +399,7 @@ download_and_organize() {
     # Get camera angle code
     local angle
     angle=$(get_camera_angle "$gopro_ip")
-    log "Camera angle: ${angle}"
+    log "  Camera angle: ${angle}"
 
     log "Fetching media list from ${gopro_ip}..."
     local media_json
