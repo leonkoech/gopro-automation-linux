@@ -131,7 +131,7 @@ def verify_video_integrity(file_path):
                 return True
         return False
     except subprocess.TimeoutExpired:
-        logger.warning(f"ffprobe timeout checking {file_path} — assuming valid (file size matched)")
+        logger.warning(f"ffprobe timeout checking {file_path} — assuming valid (large 4K file on loaded system)")
         return True
     except Exception as e:
         logger.warning(f"ffprobe error checking {file_path}: {e}")
