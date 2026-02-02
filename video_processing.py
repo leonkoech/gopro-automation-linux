@@ -692,6 +692,108 @@ class VideoProcessor:
                 pass
             return None
 
+    def extract_4k_stream_copy(
+        self,
+        chapters: List[Dict[str, Any]],
+        offset_seconds: float,
+        duration_seconds: float,
+        output_path: str,
+        add_buffer: float = 30.0
+    ) -> Optional[str]:
+        """
+        Extract a clip with stream copy (no re-encoding). Ultra-fast for 4K extraction.
+
+        This method is used for AWS GPU transcoding flow where we want to quickly
+        extract the 4K video and offload encoding to AWS Batch.
+
+        Args:
+            chapters: List of chapter files to process
+            offset_seconds: Seek position from start of first chapter
+            duration_seconds: Length of clip to extract
+            output_path: Full path for output file
+            add_buffer: Extra seconds to add before/after game (default 30s)
+
+        Returns:
+            Path to extracted video file, or None on failure
+        """
+        if not chapters:
+            logger.error("No chapters provided for 4K stream copy extraction")
+            return None
+
+        # Add buffer time (but don't go negative)
+        buffered_offset = max(0, offset_seconds - add_buffer)
+        buffered_duration = duration_seconds + (2 * add_buffer)
+
+        logger.info(f"Extracting 4K with stream copy:")
+        logger.info(f"  Chapters: {len(chapters)}")
+        logger.info(f"  Offset: {self._format_duration(buffered_offset)}")
+        logger.info(f"  Duration: {self._format_duration(buffered_duration)}")
+        logger.info(f"  Output: {output_path}")
+
+        try:
+            if len(chapters) == 1:
+                # Single file extraction with stream copy
+                cmd = [
+                    'ffmpeg', '-y',
+                    '-ss', str(buffered_offset),
+                    '-i', chapters[0]['path'],
+                    '-t', str(buffered_duration),
+                    '-c', 'copy',  # Stream copy - no encoding
+                    '-avoid_negative_ts', 'make_zero',
+                    output_path
+                ]
+            else:
+                # Multiple files - create concat file
+                with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
+                    concat_file = f.name
+                    for chapter in chapters:
+                        escaped_path = chapter['path'].replace("'", "'\\''")
+                        f.write(f"file '{escaped_path}'\n")
+
+                cmd = [
+                    'ffmpeg', '-y',
+                    '-ss', str(buffered_offset),
+                    '-f', 'concat', '-safe', '0',
+                    '-i', concat_file,
+                    '-t', str(buffered_duration),
+                    '-c', 'copy',  # Stream copy - no encoding
+                    '-avoid_negative_ts', 'make_zero',
+                    output_path
+                ]
+
+            logger.info(f"  FFmpeg cmd: {' '.join(cmd)}")
+
+            # Stream copy reads full 4K data from disk - allow 30 min for large multi-chapter extracts
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
+
+            # Clean up concat file if created
+            if len(chapters) > 1:
+                try:
+                    os.unlink(concat_file)
+                except:
+                    pass
+
+            if result.returncode != 0:
+                logger.error(f"FFmpeg stream copy error: {result.stderr}")
+                return None
+
+            if os.path.exists(output_path):
+                size_mb = os.path.getsize(output_path) / (1024 * 1024)
+                size_gb = size_mb / 1024
+                logger.info(f"Extracted 4K stream copy: {output_path} ({size_gb:.2f} GB)")
+                return output_path
+
+            return None
+
+        except subprocess.TimeoutExpired:
+            logger.error("Stream copy extraction timed out (>5 min)")
+            return None
+        except Exception as e:
+            logger.error(f"Stream copy extraction failed: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+
     def generate_game_filename(
         self,
         date: str,
@@ -827,9 +929,17 @@ def process_game_videos(
         'success': False,
         'processed_videos': [],
         'registered_videos': [],  # Videos registered in Uball (FL/FR only)
+        'batch_jobs': [],  # AWS Batch transcode jobs (when USE_AWS_GPU_TRANSCODE=true)
         'errors': [],
         'uball_game_id': None
     }
+
+    # Check if AWS GPU transcoding is enabled
+    use_aws_gpu = os.getenv('USE_AWS_GPU_TRANSCODE', 'false').lower() == 'true'
+    if use_aws_gpu:
+        logger.info("AWS GPU transcoding ENABLED - will use stream copy + AWS Batch")
+    else:
+        logger.info("AWS GPU transcoding disabled - using local CPU encoding")
 
     report_progress('initializing', 'Loading game data...', 5)
 
@@ -930,8 +1040,20 @@ def process_game_videos(
                 results['errors'].append(f"No chapters for session {session_name}")
                 continue
 
-            # Check for corrupted chapters
-            corrupted_chapters = [ch for ch in chapters if ch.get('is_corrupted')]
+            # Calculate extraction parameters FIRST to know which chapters we actually need
+            params = video_processor.calculate_extraction_params(
+                game_start, game_end, recording_start, chapters
+            )
+
+            logger.info(f"  Offset: {params['offset_str']}, Duration: {params['duration_str']}")
+            logger.info(f"  Chapters needed: {params['chapters_to_process']}/{params['total_chapters']}")
+
+            if not params['chapters_needed']:
+                logger.warning(f"No chapters needed for this game timeframe")
+                continue
+
+            # Check for corrupted chapters ONLY among the chapters we actually need
+            corrupted_chapters = [ch for ch in params['chapters_needed'] if ch.get('is_corrupted')]
             if corrupted_chapters:
                 corruption_msg = corrupted_chapters[0].get('corruption_error', 'Unknown corruption')
                 logger.error(f"Corrupted video files for {angle_code}: {corruption_msg}")
@@ -946,18 +1068,6 @@ def process_game_videos(
                 })
                 continue
 
-            # Calculate extraction parameters
-            params = video_processor.calculate_extraction_params(
-                game_start, game_end, recording_start, chapters
-            )
-
-            logger.info(f"  Offset: {params['offset_str']}, Duration: {params['duration_str']}")
-            logger.info(f"  Chapters needed: {params['chapters_to_process']}/{params['total_chapters']}")
-
-            if not params['chapters_needed']:
-                logger.warning(f"No chapters needed for this game timeframe")
-                continue
-
             # Generate output filename and S3 key upfront
             output_filename = video_processor.generate_game_filename(
                 game_date, angle_code, uball_game_id
@@ -967,140 +1077,272 @@ def process_game_videos(
                 location, game_date, angle_code, uball_game_id
             ) if upload_service else None
 
-            # Extract the clip — streams directly to S3 if upload_service is available
-            report_progress('extracting', f'Encoding & streaming {angle_code} to S3...', session_base_progress, angle_code)
+            # ============================================================
+            # BRANCHING: AWS GPU vs Local CPU encoding
+            # ============================================================
+            if use_aws_gpu and upload_service:
+                # ===========================================================
+                # FAST PATH: 4K stream copy + AWS Batch GPU transcoding
+                # ===========================================================
+                logger.info(f"[AWS GPU] Using stream copy + Batch for {angle_code}")
+                report_progress('extracting', f'Stream copying 4K {angle_code}...', session_base_progress, angle_code)
 
-            extracted_path = video_processor.extract_game_clip(
-                params['chapters_needed'],
-                params['offset_seconds'],
-                params['duration_seconds'],
-                output_filename,
-                add_buffer=30.0,
-                s3_upload_service=upload_service,
-                s3_key=s3_key
-            )
+                # Import AWS Batch transcoder
+                from aws_batch_transcode import AWSBatchTranscoder
 
-            if not extracted_path:
-                results['errors'].append(f"Extraction failed for {angle_code}")
-                continue
-
-            # When streamed to S3, file is not on disk — get info from S3 instead
-            streamed_to_s3 = upload_service and s3_key
-            if streamed_to_s3:
-                # Get file size from S3
                 try:
-                    s3_head = upload_service.s3_client.head_object(
-                        Bucket=upload_service.bucket_name, Key=s3_key
-                    )
-                    video_info = {
-                        'size_bytes': s3_head.get('ContentLength', 0),
-                        'duration': params['duration_seconds'],
-                    }
+                    batch_transcoder = AWSBatchTranscoder(bucket=upload_service.bucket_name)
                 except Exception as e:
-                    logger.warning(f"Could not get S3 object info: {e}")
-                    video_info = {'size_bytes': 0, 'duration': params['duration_seconds']}
+                    logger.error(f"Failed to initialize AWS Batch transcoder: {e}")
+                    results['errors'].append(f"AWS Batch init failed: {str(e)}")
+                    continue
 
-                s3_uri = f"s3://{upload_service.bucket_name}/{s3_key}"
-                logger.info(f"Streamed to S3: {s3_uri}")
-            else:
-                video_info = video_processor.get_video_info(extracted_path)
+                # 1. Extract 4K with stream copy (fast, no re-encoding)
+                temp_4k_filename = f"{angle_code}_4k_temp.mp4"
+                temp_4k_path = os.path.join(video_processor.output_dir, temp_4k_filename)
 
-            # 4. Upload to S3 (only if NOT already streamed)
-            if upload_service:
+                extracted_4k = video_processor.extract_4k_stream_copy(
+                    params['chapters_needed'],
+                    params['offset_seconds'],
+                    params['duration_seconds'],
+                    temp_4k_path,
+                    add_buffer=30.0
+                )
+
+                if not extracted_4k:
+                    results['errors'].append(f"4K stream copy extraction failed for {angle_code}")
+                    continue
+
+                # Get 4K file info
+                video_info_4k = video_processor.get_video_info(extracted_4k)
+                size_4k_gb = video_info_4k.get('size_bytes', 0) / (1024**3)
+                logger.info(f"[AWS GPU] Extracted 4K: {size_4k_gb:.2f} GB")
+
+                # 2. Upload 4K to S3 raw/ prefix
+                report_progress('uploading', f'Uploading 4K {angle_code} to S3 raw/...', session_base_progress + 15, angle_code)
+
+                raw_s3_key = batch_transcoder.generate_raw_s3_key(
+                    location, game_date, uball_game_id, angle_code
+                )
+
+                raw_s3_uri = batch_transcoder.upload_4k_to_raw(extracted_4k, raw_s3_key)
+
+                if not raw_s3_uri:
+                    results['errors'].append(f"Failed to upload 4K {angle_code} to S3 raw/")
+                    # Clean up local file
+                    try:
+                        os.remove(extracted_4k)
+                    except:
+                        pass
+                    continue
+
+                logger.info(f"[AWS GPU] Uploaded 4K to: {raw_s3_uri}")
+
+                # 3. Submit AWS Batch transcode job
+                report_progress('batch_submit', f'Submitting Batch job for {angle_code}...', session_base_progress + 30, angle_code)
+
                 try:
-                    upload_progress = session_base_progress + 25
+                    job = batch_transcoder.submit_transcode_job(
+                        input_s3_key=raw_s3_key,
+                        output_s3_key=s3_key,
+                        game_id=firebase_game_id,
+                        angle=angle_code
+                    )
 
-                    if not streamed_to_s3:
-                        # Fallback: separate upload (only if streaming was not used)
-                        report_progress('uploading', f'Uploading {angle_code} to S3...', upload_progress, angle_code)
-                        s3_uri = upload_service.upload_video_with_key(
-                            video_path=extracted_path,
-                            s3_key=s3_key
-                        )
-                        logger.info(f"Uploaded to S3: {s3_uri}")
+                    logger.info(f"[AWS GPU] Batch job submitted: {job['jobId']}")
 
-                    report_progress('uploaded', f'{angle_code} uploaded successfully', upload_progress + 10, angle_code)
+                    # 4. Track job info for later completion
+                    batch_job_info = {
+                        'job_id': job['jobId'],
+                        'job_name': job['jobName'],
+                        'angle': angle_code,
+                        'raw_s3_key': raw_s3_key,
+                        'final_s3_key': s3_key,
+                        'session_id': session['id'],
+                        'filename': output_filename,
+                        'duration': params['duration_seconds'],
+                        'status': 'SUBMITTED'
+                    }
+                    results['batch_jobs'].append(batch_job_info)
 
-                    # Update recording session with processed game info
+                    # Update recording session with pending Batch job info
                     firebase_service.add_processed_game(session['id'], {
                         'firebase_game_id': firebase_game_id,
                         'game_number': game_number,
                         'extracted_filename': output_filename,
-                        's3_key': s3_key
+                        's3_key': s3_key,
+                        'batch_job_id': job['jobId'],
+                        'batch_status': 'pending'
                     })
 
-                    video_result = {
+                except Exception as e:
+                    logger.error(f"[AWS GPU] Failed to submit Batch job for {angle_code}: {e}")
+                    results['errors'].append(f"Batch job submission failed for {angle_code}: {str(e)}")
+                    # Clean up raw file from S3 if job submission failed
+                    batch_transcoder.delete_raw_file(raw_s3_key)
+
+                # 5. Clean up local 4K file (it's now in S3)
+                try:
+                    os.remove(extracted_4k)
+                    logger.info(f"[AWS GPU] Cleaned up local 4K file: {extracted_4k}")
+                except Exception as e:
+                    logger.warning(f"Could not clean up local file: {e}")
+
+            else:
+                # ===========================================================
+                # SLOW PATH: Existing Jetson CPU encoding (libx264)
+                # ===========================================================
+
+                # Extract the clip — streams directly to S3 if upload_service is available
+                report_progress('extracting', f'Encoding & streaming {angle_code} to S3...', session_base_progress, angle_code)
+
+                extracted_path = video_processor.extract_game_clip(
+                    params['chapters_needed'],
+                    params['offset_seconds'],
+                    params['duration_seconds'],
+                    output_filename,
+                    add_buffer=30.0,
+                    s3_upload_service=upload_service,
+                    s3_key=s3_key
+                )
+
+                if not extracted_path:
+                    results['errors'].append(f"Extraction failed for {angle_code}")
+                    continue
+
+                # When streamed to S3, file is not on disk — get info from S3 instead
+                streamed_to_s3 = upload_service and s3_key
+                if streamed_to_s3:
+                    # Get file size from S3
+                    try:
+                        s3_head = upload_service.s3_client.head_object(
+                            Bucket=upload_service.bucket_name, Key=s3_key
+                        )
+                        video_info = {
+                            'size_bytes': s3_head.get('ContentLength', 0),
+                            'duration': params['duration_seconds'],
+                        }
+                    except Exception as e:
+                        logger.warning(f"Could not get S3 object info: {e}")
+                        video_info = {'size_bytes': 0, 'duration': params['duration_seconds']}
+
+                    s3_uri = f"s3://{upload_service.bucket_name}/{s3_key}"
+                    logger.info(f"Streamed to S3: {s3_uri}")
+                else:
+                    video_info = video_processor.get_video_info(extracted_path)
+
+                # 4. Upload to S3 (only if NOT already streamed)
+                if upload_service:
+                    try:
+                        upload_progress = session_base_progress + 25
+
+                        if not streamed_to_s3:
+                            # Fallback: separate upload (only if streaming was not used)
+                            report_progress('uploading', f'Uploading {angle_code} to S3...', upload_progress, angle_code)
+                            s3_uri = upload_service.upload_video_with_key(
+                                video_path=extracted_path,
+                                s3_key=s3_key
+                            )
+                            logger.info(f"Uploaded to S3: {s3_uri}")
+
+                        report_progress('uploaded', f'{angle_code} uploaded successfully', upload_progress + 10, angle_code)
+
+                        # Update recording session with processed game info
+                        firebase_service.add_processed_game(session['id'], {
+                            'firebase_game_id': firebase_game_id,
+                            'game_number': game_number,
+                            'extracted_filename': output_filename,
+                            's3_key': s3_key
+                        })
+
+                        video_result = {
+                            'angle': angle_code,
+                            'session_id': session['id'],
+                            'filename': output_filename,
+                            's3_key': s3_key,
+                            's3_uri': s3_uri,
+                            'duration': video_info.get('duration'),
+                            'size_bytes': video_info.get('size_bytes', 0),
+                            'size_mb': round(video_info.get('size_bytes', 0) / (1024 * 1024), 2)
+                        }
+
+                        results['processed_videos'].append(video_result)
+
+                        # 5. Register FL/FR videos in Uball Backend
+                        if uball_client and angle_code in ['FL', 'FR']:
+                            report_progress('registering', f'Registering {angle_code} in Uball...', upload_progress + 15, angle_code)
+                            try:
+                                uball_result = uball_client.register_game_video(
+                                    firebase_game_id=firebase_game_id,
+                                    s3_key=s3_key,
+                                    angle_code=angle_code,
+                                    filename=output_filename,
+                                    duration=video_info.get('duration'),
+                                    file_size=video_info.get('size_bytes'),
+                                    s3_bucket=s3_bucket
+                                )
+
+                                if uball_result:
+                                    logger.info(f"Registered {angle_code} video in Uball: {uball_result.get('id')}")
+                                    results['registered_videos'].append({
+                                        'angle': angle_code,
+                                        'uball_video_id': uball_result.get('id'),
+                                        's3_key': s3_key
+                                    })
+                                else:
+                                    logger.warning(f"Failed to register {angle_code} video in Uball")
+                                    results['errors'].append(f"Uball registration failed for {angle_code}")
+
+                            except Exception as e:
+                                logger.error(f"Uball registration error for {angle_code}: {e}")
+                                results['errors'].append(f"Uball registration error for {angle_code}: {str(e)}")
+
+                        # Clean up local file after upload (skip if streamed to S3)
+                        if not streamed_to_s3:
+                            try:
+                                os.remove(extracted_path)
+                            except:
+                                pass
+
+                    except Exception as e:
+                        logger.error(f"Upload failed for {angle_code}: {e}")
+                        results['errors'].append(f"Upload failed for {angle_code}: {str(e)}")
+                else:
+                    # No upload service, just record local file
+                    results['processed_videos'].append({
                         'angle': angle_code,
                         'session_id': session['id'],
                         'filename': output_filename,
-                        's3_key': s3_key,
-                        's3_uri': s3_uri,
+                        'local_path': extracted_path,
                         'duration': video_info.get('duration'),
-                        'size_bytes': video_info.get('size_bytes', 0),
                         'size_mb': round(video_info.get('size_bytes', 0) / (1024 * 1024), 2)
-                    }
+                    })
 
-                    results['processed_videos'].append(video_result)
-
-                    # 5. Register FL/FR videos in Uball Backend
-                    if uball_client and angle_code in ['FL', 'FR']:
-                        report_progress('registering', f'Registering {angle_code} in Uball...', upload_progress + 15, angle_code)
-                        try:
-                            uball_result = uball_client.register_game_video(
-                                firebase_game_id=firebase_game_id,
-                                s3_key=s3_key,
-                                angle_code=angle_code,
-                                filename=output_filename,
-                                duration=video_info.get('duration'),
-                                file_size=video_info.get('size_bytes'),
-                                s3_bucket=s3_bucket
-                            )
-
-                            if uball_result:
-                                logger.info(f"Registered {angle_code} video in Uball: {uball_result.get('id')}")
-                                results['registered_videos'].append({
-                                    'angle': angle_code,
-                                    'uball_video_id': uball_result.get('id'),
-                                    's3_key': s3_key
-                                })
-                            else:
-                                logger.warning(f"Failed to register {angle_code} video in Uball")
-                                results['errors'].append(f"Uball registration failed for {angle_code}")
-
-                        except Exception as e:
-                            logger.error(f"Uball registration error for {angle_code}: {e}")
-                            results['errors'].append(f"Uball registration error for {angle_code}: {str(e)}")
-
-                    # Clean up local file after upload (skip if streamed to S3)
-                    if not streamed_to_s3:
-                        try:
-                            os.remove(extracted_path)
-                        except:
-                            pass
-
-                except Exception as e:
-                    logger.error(f"Upload failed for {angle_code}: {e}")
-                    results['errors'].append(f"Upload failed for {angle_code}: {str(e)}")
-            else:
-                # No upload service, just record local file
-                results['processed_videos'].append({
-                    'angle': angle_code,
-                    'session_id': session['id'],
-                    'filename': output_filename,
-                    'local_path': extracted_path,
-                    'duration': video_info.get('duration'),
-                    'size_mb': round(video_info.get('size_bytes', 0) / (1024 * 1024), 2)
-                })
-
-        results['success'] = len(results['processed_videos']) > 0
+        # Success if we processed videos directly OR submitted batch jobs
+        batch_jobs_count = len(results.get('batch_jobs', []))
+        processed_count = len(results['processed_videos'])
+        results['success'] = processed_count > 0 or batch_jobs_count > 0
 
         # Build detailed status message
-        processed_count = len(results['processed_videos'])
         corrupted_count = len(results.get('corrupted_sessions', []))
         error_count = len(results.get('errors', []))
 
+        # Add GPU transcode flag to results
+        results['gpu_transcode_enabled'] = use_aws_gpu
+
         if results['success']:
-            if corrupted_count > 0:
+            if batch_jobs_count > 0:
+                # AWS GPU path - jobs submitted
+                batch_angles = ', '.join([j['angle'] for j in results['batch_jobs']])
+                if corrupted_count > 0:
+                    corrupted_angles = ', '.join([c['angle'] for c in results['corrupted_sessions']])
+                    status_msg = f"Submitted {batch_jobs_count} GPU transcode job(s) ({batch_angles}). {corrupted_count} corrupted ({corrupted_angles})"
+                    results['status'] = 'batch_partial'
+                else:
+                    status_msg = f"Submitted {batch_jobs_count} GPU transcode job(s) ({batch_angles})"
+                    results['status'] = 'batch_submitted'
+                report_progress('batch_submitted', status_msg, 100)
+            elif corrupted_count > 0:
                 # Partial success with some corrupted files
                 corrupted_angles = ', '.join([c['angle'] for c in results['corrupted_sessions']])
                 status_msg = f"Processed {processed_count} video(s). {corrupted_count} corrupted ({corrupted_angles})"
