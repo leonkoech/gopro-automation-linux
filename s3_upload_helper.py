@@ -14,6 +14,7 @@ import os
 import subprocess
 import math
 import json
+import time
 
 # SSL fixes for the small boto3 API calls (create/complete multipart)
 os.environ['OPENSSL_CONF'] = '/dev/null'
@@ -55,8 +56,9 @@ except Exception:
     pass
 
 # Part size for multipart upload: 25 MB
-# Smaller parts = more reliable on constrained Jetson devices
 PART_SIZE = 25 * 1024 * 1024
+# Simple PUT limit: 4.5 GB (S3 max single PUT is 5 GB)
+SIMPLE_PUT_LIMIT = 4500 * 1024 * 1024
 MAX_RETRIES = 5
 
 
@@ -96,185 +98,95 @@ def verify_credentials():
         sys.exit(1)
 
 
-def upload_part_with_curl(presigned_url, file_path, offset, length, part_num, total_parts):
-    """Upload a single part using curl (bypasses Python SSL issues)."""
+def _get_temp_dir(file_path):
+    """Use same directory as the file for temp storage (avoids tmpfs/RAM issues on Jetson)."""
+    d = os.path.dirname(os.path.abspath(file_path))
+    tmp = os.path.join(d, '.upload_tmp')
+    os.makedirs(tmp, exist_ok=True)
+    return tmp
+
+
+def _cleanup_temp_dir(file_path):
+    """Remove the temp directory after upload."""
+    tmp = os.path.join(os.path.dirname(os.path.abspath(file_path)), '.upload_tmp')
+    try:
+        import shutil
+        shutil.rmtree(tmp, ignore_errors=True)
+    except Exception:
+        pass
+
+
+def _curl_simple_upload(file_path, presigned_url, file_size):
+    """Upload entire file with a single PUT using presigned URL. Returns True or raises."""
+    tmp_dir = _get_temp_dir(file_path)
+    header_file = os.path.join(tmp_dir, 'put_headers.txt')
+    body_file = os.path.join(tmp_dir, 'put_body.txt')
+
     for attempt in range(MAX_RETRIES):
         try:
-            # Use dd to extract the part, pipe to curl
-            dd_cmd = [
-                'dd', f'if={file_path}',
-                f'bs={1024*1024}',  # 1MB block size
-                f'skip={offset // (1024*1024)}',
-                f'count={math.ceil(length / (1024*1024))}',
-                'status=none'
-            ]
-
             curl_cmd = [
                 'curl', '-s', '-S',
-                '--insecure',          # Skip SSL verification
-                '--tlsv1.2',           # Force TLS 1.2
-                '--tls-max', '1.2',    # Cap at TLS 1.2
-                '-X', 'PUT',
-                '-H', 'Content-Type: application/octet-stream',
-                '--data-binary', '@-',  # Read from stdin
-                '--retry', '3',
-                '--retry-delay', '2',
+                '--insecure',
+                '--tlsv1.2', '--tls-max', '1.2',
+                '--upload-file', file_path,       # Streams from disk, implies PUT
+                '-H', 'Content-Type: video/mp4',
+                '-H', 'Expect:',                  # Suppress 100-continue (critical!)
+                '--retry', '2',
+                '--retry-delay', '5',
+                '--retry-all-errors',
                 '--connect-timeout', '30',
-                '--max-time', '600',    # 10 min timeout per part
+                '--speed-limit', '1024',           # Abort if < 1KB/s
+                '--speed-time', '60',              # ... for 60 seconds
+                '--max-time', '7200',              # 2 hour max for large files
+                '-D', header_file,
+                '-o', body_file,
                 '-w', '%{http_code}',
-                '-o', '/dev/null',
                 presigned_url
             ]
 
-            # If the part is the last one, it may be smaller than a full MB block
-            # Use exact byte count with head -c
-            if length % (1024*1024) != 0:
-                # dd gives us ceiling(length/1MB) * 1MB, pipe through head -c to get exact
-                dd_proc = subprocess.Popen(dd_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                head_cmd = ['head', '-c', str(length)]
-                head_proc = subprocess.Popen(head_cmd, stdin=dd_proc.stdout, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                dd_proc.stdout.close()
-                curl_proc = subprocess.Popen(curl_cmd, stdin=head_proc.stdout, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                head_proc.stdout.close()
-            else:
-                dd_proc = subprocess.Popen(dd_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                head_proc = None
-                curl_proc = subprocess.Popen(curl_cmd, stdin=dd_proc.stdout, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                dd_proc.stdout.close()
-
-            stdout, stderr = curl_proc.communicate(timeout=660)
-            http_code = stdout.decode().strip()
-
-            # Clean up
-            dd_proc.wait()
-            if head_proc:
-                head_proc.wait()
+            result = subprocess.run(curl_cmd, capture_output=True, timeout=7260)
+            http_code = result.stdout.decode().strip()
 
             if http_code == '200':
-                # Extract ETag from response headers — need to redo with headers
-                # Actually, presigned upload_part returns ETag in headers
-                # Let's redo the curl call to capture headers
-                pass
-            elif curl_proc.returncode == 0 and http_code.startswith('2'):
-                pass
+                return True
             else:
-                raise Exception(f"HTTP {http_code}, curl exit {curl_proc.returncode}: {stderr.decode().strip()}")
+                body = ''
+                try:
+                    with open(body_file, 'r') as f:
+                        body = f.read()[:500]
+                except Exception:
+                    pass
+                stderr_text = result.stderr.decode().strip()
+                raise Exception(f"HTTP {http_code} (curl exit {result.returncode}): {stderr_text} | {body}")
 
         except subprocess.TimeoutExpired:
-            if attempt < MAX_RETRIES - 1:
-                import time
-                time.sleep(2 ** attempt)
-                continue
-            print(f"FAIL:Part {part_num} timed out after {MAX_RETRIES} retries", flush=True)
-            return None
+            print(f"PUT_ERR:Simple PUT attempt {attempt+1}/{MAX_RETRIES}: timeout", flush=True, file=sys.stderr)
         except Exception as e:
-            if attempt < MAX_RETRIES - 1:
-                import time
-                time.sleep(2 ** attempt)
-                continue
-            print(f"FAIL:Part {part_num} failed: {e}", flush=True)
-            return None
+            print(f"PUT_ERR:Simple PUT attempt {attempt+1}/{MAX_RETRIES}: {e}", flush=True, file=sys.stderr)
+            if attempt >= MAX_RETRIES - 1:
+                raise
 
-    # Need to get ETag — re-upload with header capture
-    # Actually, let's use a simpler approach: capture headers with -D
-    return True  # We'll use a different approach below
+        finally:
+            for f in [header_file, body_file]:
+                try: os.unlink(f)
+                except Exception: pass
 
+        time.sleep(min(2 ** attempt, 30))
 
-def upload_file(file_path, s3_key):
-    """Upload a file to S3 using presigned multipart upload + curl."""
-    bucket = os.getenv('UPLOAD_BUCKET', 'jetson-videos')
-    client = create_s3_client()
-
-    if not os.path.exists(file_path):
-        print(f"FAIL:File not found: {file_path}", flush=True)
-        sys.exit(1)
-
-    file_size = os.path.getsize(file_path)
-    num_parts = math.ceil(file_size / PART_SIZE)
-
-    print(f"PROGRESS:0", flush=True)
-
-    # Step 1: Create multipart upload (small API call)
-    try:
-        mpu = client.create_multipart_upload(
-            Bucket=bucket,
-            Key=s3_key,
-            ContentType='video/mp4'
-        )
-        upload_id = mpu['UploadId']
-    except Exception as e:
-        print(f"FAIL:Could not create multipart upload: {e}", flush=True)
-        sys.exit(1)
-
-    # Step 2: Upload each part using curl with presigned URLs
-    parts = []
-    try:
-        for part_num in range(1, num_parts + 1):
-            offset = (part_num - 1) * PART_SIZE
-            length = min(PART_SIZE, file_size - offset)
-
-            # Generate presigned URL for this part
-            presigned_url = client.generate_presigned_url(
-                'upload_part',
-                Params={
-                    'Bucket': bucket,
-                    'Key': s3_key,
-                    'UploadId': upload_id,
-                    'PartNumber': part_num
-                },
-                ExpiresIn=3600
-            )
-
-            # Upload part with curl, capturing ETag from response headers
-            etag = _curl_upload_part(file_path, presigned_url, offset, length, part_num, num_parts)
-            if etag is None:
-                raise Exception(f"Part {part_num}/{num_parts} failed after retries")
-
-            parts.append({'ETag': etag, 'PartNumber': part_num})
-
-            pct = int(part_num * 100 / num_parts)
-            print(f"PROGRESS:{pct}", flush=True)
-
-    except Exception as e:
-        # Abort the multipart upload on failure
-        try:
-            client.abort_multipart_upload(
-                Bucket=bucket, Key=s3_key, UploadId=upload_id
-            )
-        except Exception:
-            pass
-        print(f"FAIL:{e}", flush=True)
-        sys.exit(1)
-
-    # Step 3: Complete multipart upload (small API call)
-    try:
-        client.complete_multipart_upload(
-            Bucket=bucket,
-            Key=s3_key,
-            UploadId=upload_id,
-            MultipartUpload={'Parts': parts}
-        )
-    except Exception as e:
-        print(f"FAIL:Complete multipart failed: {e}", flush=True)
-        sys.exit(1)
-
-    s3_uri = f"s3://{bucket}/{s3_key}"
-    print(f"OK:{s3_uri}", flush=True)
+    raise Exception("Simple PUT failed after all retries")
 
 
 def _curl_upload_part(file_path, presigned_url, offset, length, part_num, total_parts):
-    """Upload a single part via curl using temp file + --upload-file, return ETag."""
-    import tempfile
-    import time
+    """Upload a single part via curl, return ETag or None."""
+    tmp_dir = _get_temp_dir(file_path)
 
     for attempt in range(MAX_RETRIES):
-        part_file = None
-        header_file = None
-        try:
-            # Write part data to a temp file (avoids curl buffering entire part in RAM)
-            part_file = tempfile.mktemp(suffix=f'.part{part_num}')
-            header_file = tempfile.mktemp(suffix='.headers')
+        part_file = os.path.join(tmp_dir, f'part{part_num}.dat')
+        header_file = os.path.join(tmp_dir, f'part{part_num}.headers')
+        body_file = os.path.join(tmp_dir, f'part{part_num}.body')
 
+        try:
+            # Write part data to file on same disk (not /tmp which may be RAM-backed)
             with open(file_path, 'rb') as src, open(part_file, 'wb') as dst:
                 src.seek(offset)
                 remaining = length
@@ -285,21 +197,32 @@ def _curl_upload_part(file_path, presigned_url, offset, length, part_num, total_
                     dst.write(chunk)
                     remaining -= len(chunk)
 
-            # Upload using --upload-file (streams from disk, no RAM buffering)
+            # Verify part file was written correctly
+            actual_size = os.path.getsize(part_file)
+            if actual_size != length:
+                raise Exception(f"Part file size mismatch: expected {length}, got {actual_size}")
+
+            # Key fixes vs previous version:
+            #   - No -X PUT (--upload-file already implies PUT)
+            #   - No Content-Type header (not needed for upload_part, avoids signature mismatch)
+            #   - Added -H "Expect:" to suppress 100-continue (most likely culprit!)
+            #   - Added --speed-limit/--speed-time for stall detection
+            #   - Capture response body on failure for debugging
             curl_cmd = [
                 'curl', '-s', '-S',
                 '--insecure',
                 '--tlsv1.2', '--tls-max', '1.2',
-                '-X', 'PUT',
-                '-H', 'Content-Type: application/octet-stream',
                 '--upload-file', part_file,
+                '-H', 'Expect:',                  # Suppress Expect: 100-continue
                 '--retry', '2',
                 '--retry-delay', '3',
                 '--retry-all-errors',
                 '--connect-timeout', '30',
-                '--max-time', '600',
+                '--speed-limit', '1024',           # Abort if < 1KB/s
+                '--speed-time', '60',              # ... for 60 seconds
+                '--max-time', '600',               # 10 min timeout per part
                 '-D', header_file,
-                '-o', '/dev/null',
+                '-o', body_file,
                 '-w', '%{http_code}',
                 presigned_url
             ]
@@ -323,10 +246,16 @@ def _curl_upload_part(file_path, presigned_url, offset, length, part_num, total_
                 if etag:
                     return etag
                 else:
-                    raise Exception(f"HTTP 200 but no ETag in headers")
+                    raise Exception("HTTP 200 but no ETag in response headers")
 
             else:
-                raise Exception(f"HTTP {http_code} (curl exit {result.returncode}): {stderr_text}")
+                body = ''
+                try:
+                    with open(body_file, 'r') as f:
+                        body = f.read()[:500]
+                except Exception:
+                    pass
+                raise Exception(f"HTTP {http_code} (curl exit {result.returncode}): {stderr_text} | {body}")
 
         except subprocess.TimeoutExpired:
             print(f"PART_ERR:Part {part_num} attempt {attempt+1}/{MAX_RETRIES}: timeout", flush=True, file=sys.stderr)
@@ -336,14 +265,125 @@ def _curl_upload_part(file_path, presigned_url, offset, length, part_num, total_
                 return None
 
         finally:
-            for f in [part_file, header_file]:
-                if f:
-                    try: os.unlink(f)
-                    except: pass
+            for f in [part_file, header_file, body_file]:
+                try: os.unlink(f)
+                except Exception: pass
 
         time.sleep(min(2 ** attempt, 30))
 
     return None
+
+
+def upload_file(file_path, s3_key):
+    """Upload a file to S3 using presigned URLs + curl."""
+    bucket = os.getenv('UPLOAD_BUCKET', 'jetson-videos')
+    client = create_s3_client()
+
+    if not os.path.exists(file_path):
+        print(f"FAIL:File not found: {file_path}", flush=True)
+        sys.exit(1)
+
+    file_size = os.path.getsize(file_path)
+
+    print(f"PROGRESS:0", flush=True)
+
+    # For files under 4.5GB, try simple PUT first (proven to work on Jetson)
+    if file_size < SIMPLE_PUT_LIMIT:
+        try:
+            presigned_url = client.generate_presigned_url(
+                'put_object',
+                Params={
+                    'Bucket': bucket,
+                    'Key': s3_key,
+                    'ContentType': 'video/mp4'
+                },
+                ExpiresIn=7200  # 2 hours
+            )
+
+            print(f"PROGRESS:5", flush=True)
+            _curl_simple_upload(file_path, presigned_url, file_size)
+            print(f"PROGRESS:100", flush=True)
+
+            s3_uri = f"s3://{bucket}/{s3_key}"
+            print(f"OK:{s3_uri}", flush=True)
+            _cleanup_temp_dir(file_path)
+            return
+
+        except Exception as e:
+            print(f"SIMPLE_FALLBACK:Simple PUT failed ({e}), trying multipart", flush=True, file=sys.stderr)
+
+    # Multipart upload for large files (>4.5GB) or as fallback
+    num_parts = math.ceil(file_size / PART_SIZE)
+
+    # Step 1: Create multipart upload (small API call via boto3)
+    try:
+        mpu = client.create_multipart_upload(
+            Bucket=bucket,
+            Key=s3_key,
+            ContentType='video/mp4'
+        )
+        upload_id = mpu['UploadId']
+    except Exception as e:
+        print(f"FAIL:Could not create multipart upload: {e}", flush=True)
+        _cleanup_temp_dir(file_path)
+        sys.exit(1)
+
+    # Step 2: Upload each part using curl with presigned URLs
+    parts = []
+    try:
+        for part_num in range(1, num_parts + 1):
+            offset = (part_num - 1) * PART_SIZE
+            length = min(PART_SIZE, file_size - offset)
+
+            # Generate presigned URL for this part (small API call via boto3)
+            presigned_url = client.generate_presigned_url(
+                'upload_part',
+                Params={
+                    'Bucket': bucket,
+                    'Key': s3_key,
+                    'UploadId': upload_id,
+                    'PartNumber': part_num
+                },
+                ExpiresIn=3600
+            )
+
+            etag = _curl_upload_part(file_path, presigned_url, offset, length, part_num, num_parts)
+            if etag is None:
+                raise Exception(f"Part {part_num}/{num_parts} failed after retries")
+
+            parts.append({'ETag': etag, 'PartNumber': part_num})
+
+            pct = int(part_num * 100 / num_parts)
+            print(f"PROGRESS:{pct}", flush=True)
+
+    except Exception as e:
+        # Abort the multipart upload on failure
+        try:
+            client.abort_multipart_upload(
+                Bucket=bucket, Key=s3_key, UploadId=upload_id
+            )
+        except Exception:
+            pass
+        print(f"FAIL:{e}", flush=True)
+        _cleanup_temp_dir(file_path)
+        sys.exit(1)
+
+    # Step 3: Complete multipart upload (small API call via boto3)
+    try:
+        client.complete_multipart_upload(
+            Bucket=bucket,
+            Key=s3_key,
+            UploadId=upload_id,
+            MultipartUpload={'Parts': parts}
+        )
+    except Exception as e:
+        print(f"FAIL:Complete multipart failed: {e}", flush=True)
+        _cleanup_temp_dir(file_path)
+        sys.exit(1)
+
+    s3_uri = f"s3://{bucket}/{s3_key}"
+    print(f"OK:{s3_uri}", flush=True)
+    _cleanup_temp_dir(file_path)
 
 
 if __name__ == '__main__':

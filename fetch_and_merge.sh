@@ -33,7 +33,11 @@ if [ $# -lt 1 ]; then
     usage
 fi
 
-# Handle "clean" command
+# Handle help / clean commands
+if [ "$1" = "--help" ] || [ "$1" = "-h" ] || [ "$1" = "help" ]; then
+    usage
+fi
+
 if [ "$1" = "clean" ]; then
     SEGMENTS_DIR="${HOME}/gopro_videos/segments"
     if [ ! -d "$SEGMENTS_DIR" ]; then
@@ -59,7 +63,7 @@ TARGET_DATE_INPUT="$1"
 
 # Validate MM-DD format
 if [[ ! "$TARGET_DATE_INPUT" =~ ^[0-9]{2}-[0-9]{2}$ ]]; then
-    err "Invalid date format: ${TARGET_DATE_INPUT}. Expected MM-DD (e.g., 01-30)"
+    echo "ERROR: Invalid date format: ${TARGET_DATE_INPUT}. Expected MM-DD (e.g., 01-30)" >&2
     usage
 fi
 
@@ -353,8 +357,13 @@ download_file() {
         log "  Resuming ${filename} from byte ${current_size}..."
     fi
 
-    local max_retries=5
-    for attempt in $(seq 1 $max_retries); do
+    local max_stall_retries=5   # Give up after 5 retries with ZERO progress
+    local stall_count=0
+    local attempt=0
+
+    while true; do
+        attempt=$((attempt + 1))
+
         # Use curl with progress callback via --write-out and background monitoring
         if [ "$current_size" -gt 0 ]; then
             curl --connect-timeout "$CONNECT_TIMEOUT" \
@@ -403,14 +412,26 @@ download_file() {
             return 0
         fi
 
-        printf " ✗\n"
+        # Check if we made progress since last attempt
+        if [ "$actual_size" -gt "$current_size" ]; then
+            # Progress was made — reset stall counter, keep going
+            stall_count=0
+            printf " ↻\n"
+            log "  Resuming ${filename} (attempt ${attempt}, got ${actual_size}/${expected_size} bytes)"
+        else
+            # No progress — count as a stall
+            stall_count=$((stall_count + 1))
+            printf " ✗\n"
+            log "  Stall ${stall_count}/${max_stall_retries} for ${filename} (stuck at ${actual_size}/${expected_size} bytes)"
+            if [ "$stall_count" -ge "$max_stall_retries" ]; then
+                err "Failed to download ${filename} — no progress after ${max_stall_retries} retries (got ${actual_size}/${expected_size} bytes)"
+                return 1
+            fi
+        fi
+
         current_size="$actual_size"
-        log "  Retry ${attempt}/${max_retries} for ${filename} (got ${actual_size}/${expected_size} bytes)"
         sleep 2
     done
-
-    err "Failed to download ${filename} after ${max_retries} attempts"
-    return 1
 }
 
 # ======================== Download & Organize Per GoPro ========================

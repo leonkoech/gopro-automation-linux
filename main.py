@@ -98,6 +98,17 @@ import uuid
 video_processing_jobs = {}  # job_id -> job_state
 video_processing_lock = threading.Lock()
 
+# Admin Console jobs (shell script execution)
+import selectors
+import signal
+admin_jobs = {}                    # job_id -> job state dict
+admin_jobs_lock = threading.Lock()
+admin_device_locks = {}            # device_id -> Lock (one job per device)
+admin_device_locks_lock = threading.Lock()
+
+# Regex to strip ANSI escape codes and carriage returns from shell output
+_ansi_re = re.compile(r'\x1b\[[0-9;]*[a-zA-Z]|\r')
+
 def verify_video_integrity(file_path):
     """
     Quick check that video file is valid using ffprobe.
@@ -3760,6 +3771,298 @@ def get_batch_transcode_config():
             'success': False,
             'error': str(e)
         }), 500
+
+
+# ============================================================================
+# Admin Console API Endpoints
+# ============================================================================
+
+def _get_device_lock(device_id):
+    """Get or create a per-device lock for admin jobs."""
+    with admin_device_locks_lock:
+        if device_id not in admin_device_locks:
+            admin_device_locks[device_id] = threading.Lock()
+        return admin_device_locks[device_id]
+
+
+def _run_admin_job(job_id, device_id, operation, params):
+    """Execute a shell script in a background thread, capturing output line by line."""
+    device_lock = _get_device_lock(device_id)
+
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+
+    # Build command based on operation
+    if operation == 'fetch':
+        date_str = params.get('date', '')
+        cmd = ['stdbuf', '-oL', 'bash', os.path.join(script_dir, 'fetch_and_merge.sh'), date_str]
+        camera = params.get('camera')
+        if camera:
+            cmd.append(camera)
+    elif operation == 'upload':
+        target = params.get('target', 'all')
+        cmd = ['stdbuf', '-oL', 'bash', os.path.join(script_dir, 'upload_segments.sh'), target]
+        if params.get('delete_after'):
+            cmd.append('--delete')
+    elif operation == 'clean':
+        cmd = ['bash', '-c', f'echo "y" | bash {os.path.join(script_dir, "fetch_and_merge.sh")} clean']
+    else:
+        with admin_jobs_lock:
+            admin_jobs[job_id]['status'] = 'failed'
+            admin_jobs[job_id]['error'] = f'Unknown operation: {operation}'
+            admin_jobs[job_id]['completed_at'] = datetime.now().isoformat()
+        return
+
+    try:
+        with device_lock:
+            with admin_jobs_lock:
+                admin_jobs[job_id]['status'] = 'running'
+
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1,
+                encoding='utf-8',
+                errors='replace',
+                env={**os.environ, 'PYTHONUNBUFFERED': '1'}
+            )
+
+            with admin_jobs_lock:
+                admin_jobs[job_id]['pid'] = proc.pid
+
+            # Read stdout and stderr concurrently using selectors
+            sel = selectors.DefaultSelector()
+            sel.register(proc.stdout, selectors.EVENT_READ)
+            sel.register(proc.stderr, selectors.EVENT_READ)
+
+            open_streams = 2
+            while open_streams > 0:
+                # Check if job was cancelled
+                with admin_jobs_lock:
+                    if admin_jobs[job_id]['status'] == 'cancelled':
+                        proc.terminate()
+                        break
+
+                events = sel.select(timeout=0.5)
+                for key, _ in events:
+                    line = key.fileobj.readline()
+                    if line:
+                        stream = 'stdout' if key.fileobj == proc.stdout else 'stderr'
+                        cleaned = _ansi_re.sub('', line.rstrip('\n'))
+                        if cleaned:  # skip empty lines after stripping
+                            entry = {
+                                'ts': datetime.now().isoformat(),
+                                'stream': stream,
+                                'text': cleaned
+                            }
+                            with admin_jobs_lock:
+                                admin_jobs[job_id]['output_lines'].append(entry)
+                    else:
+                        sel.unregister(key.fileobj)
+                        open_streams -= 1
+
+            sel.close()
+            proc.wait(timeout=10)
+
+            with admin_jobs_lock:
+                job = admin_jobs[job_id]
+                if job['status'] != 'cancelled':
+                    job['exit_code'] = proc.returncode
+                    job['status'] = 'completed' if proc.returncode == 0 else 'failed'
+                    if proc.returncode != 0:
+                        job['error'] = f'Process exited with code {proc.returncode}'
+                job['completed_at'] = datetime.now().isoformat()
+
+    except Exception as e:
+        logger.error(f"Admin job {job_id} error: {e}")
+        with admin_jobs_lock:
+            admin_jobs[job_id]['status'] = 'failed'
+            admin_jobs[job_id]['error'] = str(e)
+            admin_jobs[job_id]['completed_at'] = datetime.now().isoformat()
+
+
+@app.route('/api/admin/jobs', methods=['POST'])
+def start_admin_job():
+    """Start a shell script operation (fetch, upload, or clean)."""
+    data = request.get_json()
+    if not data:
+        return jsonify({'success': False, 'error': 'JSON body required'}), 400
+
+    operation = data.get('operation')
+    device_id = data.get('device_id', 'local')
+    params = data.get('params', {})
+
+    if operation not in ('fetch', 'upload', 'clean'):
+        return jsonify({'success': False, 'error': 'operation must be fetch, upload, or clean'}), 400
+
+    if operation == 'fetch' and not params.get('date'):
+        return jsonify({'success': False, 'error': 'params.date is required for fetch (MM-DD format)'}), 400
+
+    # Check if device is busy
+    device_lock = _get_device_lock(device_id)
+    if not device_lock.acquire(blocking=False):
+        # Find the active job for error message
+        active_job_id = None
+        with admin_jobs_lock:
+            for jid, job in admin_jobs.items():
+                if job['device_id'] == device_id and job['status'] == 'running':
+                    active_job_id = jid
+                    break
+        return jsonify({
+            'success': False,
+            'error': 'A job is already running on this device',
+            'active_job_id': active_job_id
+        }), 409
+    else:
+        device_lock.release()  # We just checked, the thread will acquire it
+
+    job_id = str(uuid.uuid4())
+
+    with admin_jobs_lock:
+        admin_jobs[job_id] = {
+            'job_id': job_id,
+            'device_id': device_id,
+            'operation': operation,
+            'params': params,
+            'status': 'queued',
+            'exit_code': None,
+            'pid': None,
+            'output_lines': [],
+            'created_at': datetime.now().isoformat(),
+            'completed_at': None,
+            'error': None,
+        }
+
+    thread = threading.Thread(
+        target=_run_admin_job,
+        args=(job_id, device_id, operation, params),
+        daemon=True
+    )
+    thread.start()
+
+    return jsonify({
+        'success': True,
+        'job_id': job_id,
+        'message': f'{operation} job started'
+    }), 201
+
+
+@app.route('/api/admin/jobs', methods=['GET'])
+def list_admin_jobs():
+    """List recent admin jobs (last 20)."""
+    with admin_jobs_lock:
+        jobs = sorted(
+            admin_jobs.values(),
+            key=lambda j: j['created_at'],
+            reverse=True
+        )[:20]
+        result = [{
+            'job_id': j['job_id'],
+            'operation': j['operation'],
+            'device_id': j['device_id'],
+            'status': j['status'],
+            'created_at': j['created_at'],
+            'completed_at': j['completed_at'],
+        } for j in jobs]
+
+    return jsonify({'success': True, 'jobs': result})
+
+
+@app.route('/api/admin/jobs/<job_id>', methods=['GET'])
+def get_admin_job(job_id):
+    """Get status of an admin job."""
+    with admin_jobs_lock:
+        job = admin_jobs.get(job_id)
+
+    if not job:
+        return jsonify({'success': False, 'error': 'Job not found'}), 404
+
+    return jsonify({
+        'success': True,
+        'job': {
+            'job_id': job['job_id'],
+            'operation': job['operation'],
+            'device_id': job['device_id'],
+            'status': job['status'],
+            'exit_code': job['exit_code'],
+            'output_line_count': len(job['output_lines']),
+            'created_at': job['created_at'],
+            'completed_at': job['completed_at'],
+            'error': job['error'],
+        }
+    })
+
+
+@app.route('/api/admin/jobs/<job_id>/stream', methods=['GET'])
+def stream_admin_job(job_id):
+    """Stream shell job output via Server-Sent Events."""
+    with admin_jobs_lock:
+        job = admin_jobs.get(job_id)
+
+    if not job:
+        return jsonify({'success': False, 'error': 'Job not found'}), 404
+
+    def generate():
+        yield f"data: {json.dumps({'type': 'connected', 'job_id': job_id})}\n\n"
+
+        cursor = 0
+
+        while True:
+            with admin_jobs_lock:
+                current_job = admin_jobs.get(job_id)
+                if not current_job:
+                    break
+
+                new_lines = current_job['output_lines'][cursor:]
+                status = current_job['status']
+
+            for line in new_lines:
+                yield f"data: {json.dumps({'type': 'output', **line})}\n\n"
+                cursor += 1
+
+            if status in ('completed', 'failed', 'cancelled'):
+                with admin_jobs_lock:
+                    final = admin_jobs[job_id]
+                yield f"data: {json.dumps({'type': 'done', 'status': final['status'], 'exit_code': final.get('exit_code'), 'error': final.get('error')})}\n\n"
+                break
+
+            time.sleep(0.2)
+
+    return Response(
+        generate(),
+        mimetype='text/event-stream',
+        headers={
+            'Cache-Control': 'no-cache',
+            'Connection': 'keep-alive',
+            'X-Accel-Buffering': 'no'
+        }
+    )
+
+
+@app.route('/api/admin/jobs/<job_id>/cancel', methods=['POST'])
+def cancel_admin_job(job_id):
+    """Cancel a running admin job."""
+    with admin_jobs_lock:
+        job = admin_jobs.get(job_id)
+
+    if not job:
+        return jsonify({'success': False, 'error': 'Job not found'}), 404
+
+    if job['status'] != 'running':
+        return jsonify({'success': False, 'error': f'Job is not running (status: {job["status"]})'}), 400
+
+    pid = job.get('pid')
+    with admin_jobs_lock:
+        admin_jobs[job_id]['status'] = 'cancelled'
+
+    if pid:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+
+    return jsonify({'success': True, 'message': 'Job cancellation requested'})
 
 
 if __name__ == '__main__':
