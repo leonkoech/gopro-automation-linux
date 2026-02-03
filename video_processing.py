@@ -1333,6 +1333,11 @@ def process_game_videos(
 
                 logger.info(f"[AWS GPU] Streamed 4K to: {raw_s3_uri}")
 
+                # Get file size from S3 for queue selection
+                file_info = batch_transcoder.get_output_file_info(raw_s3_key)
+                file_size_bytes = file_info.get('size_bytes', 0) if file_info.get('exists') else 0
+                logger.info(f"[AWS GPU] 4K file size: {file_size_bytes / (1024**3):.2f} GB")
+
                 # 3. Submit AWS Batch transcode job
                 report_progress('batch_submit', f'Submitting Batch job for {angle_code}...', session_base_progress + 30, angle_code)
 
@@ -1341,7 +1346,8 @@ def process_game_videos(
                         input_s3_key=raw_s3_key,
                         output_s3_key=s3_key,
                         game_id=firebase_game_id,
-                        angle=angle_code
+                        angle=angle_code,
+                        file_size_bytes=file_size_bytes
                     )
 
                     logger.info(f"[AWS GPU] Batch job submitted: {job['jobId']}")
@@ -1350,12 +1356,14 @@ def process_game_videos(
                     batch_job_info = {
                         'job_id': job['jobId'],
                         'job_name': job['jobName'],
+                        'job_queue': job.get('jobQueue', 'unknown'),
                         'angle': angle_code,
                         'raw_s3_key': raw_s3_key,
                         'final_s3_key': s3_key,
                         'session_id': session['id'],
                         'filename': output_filename,
                         'duration': params['duration_seconds'],
+                        'file_size_bytes': file_size_bytes,
                         'status': 'SUBMITTED'
                     }
                     results['batch_jobs'].append(batch_job_info)
