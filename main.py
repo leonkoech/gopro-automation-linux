@@ -98,6 +98,43 @@ import uuid
 video_processing_jobs = {}  # job_id -> job_state
 video_processing_lock = threading.Lock()
 
+# Download configuration - optimized for GoPro USB connections
+DOWNLOAD_CHUNK_SIZE = 262144  # 256KB - smaller chunks for faster stall detection
+DOWNLOAD_CONNECT_TIMEOUT = 10  # seconds to establish connection
+DOWNLOAD_READ_TIMEOUT = 60  # seconds to wait for data between chunks
+DOWNLOAD_MAX_RETRIES = 20  # more retries, never delete partial files
+DOWNLOAD_KEEP_ALIVE_INTERVAL = 30  # send keep-alive every 30 seconds
+
+
+class DownloadKeepAliveThread:
+    """Background thread to send keep-alive to GoPro during download"""
+
+    def __init__(self, gopro_ip):
+        self.gopro_ip = gopro_ip
+        self.running = False
+        self.thread = None
+
+    def start(self):
+        self.running = True
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+
+    def stop(self):
+        self.running = False
+        if self.thread:
+            self.thread.join(timeout=2)
+
+    def _run(self):
+        while self.running:
+            try:
+                requests.get(
+                    f'http://{self.gopro_ip}:8080/gopro/camera/keep_alive',
+                    timeout=2
+                )
+            except:
+                pass
+            time.sleep(DOWNLOAD_KEEP_ALIVE_INTERVAL)
+
 # Admin Console jobs (shell script execution)
 import selectors
 import signal
@@ -804,122 +841,131 @@ def stop_recording(gopro_id):
                     return
 
                 # Download all chapters with integrity verification
+                # Start background keep-alive thread to prevent GoPro from sleeping
+                keep_alive_thread = DownloadKeepAliveThread(gopro_ip)
+                keep_alive_thread.start()
+                logger.info(f"[{gopro_id}] Started keep-alive thread for download")
+
                 downloaded_files = []
                 failed_chapters = []
                 total_chapters = len(new_chapters)
 
-                for i, chapter in enumerate(new_chapters):
-                    chapter_path = os.path.join(session_dir, f'chapter_{i+1:03d}_{chapter["filename"]}')
-                    download_url = f'http://{gopro_ip}:8080/videos/DCIM/{chapter["directory"]}/{chapter["filename"]}'
-                    expected_size = int(chapter.get('size', 0))
+                try:
+                    for i, chapter in enumerate(new_chapters):
+                        chapter_path = os.path.join(session_dir, f'chapter_{i+1:03d}_{chapter["filename"]}')
+                        download_url = f'http://{gopro_ip}:8080/videos/DCIM/{chapter["directory"]}/{chapter["filename"]}'
+                        expected_size = int(chapter.get('size', 0))
 
-                    logger.info(f"[{gopro_id}] Downloading chapter {i+1}/{total_chapters}: {chapter['filename']} ({expected_size / (1024**3):.2f} GB)")
+                        logger.info(f"[{gopro_id}] Downloading chapter {i+1}/{total_chapters}: {chapter['filename']} ({expected_size / (1024**3):.2f} GB)")
 
-                    # Update stage message
-                    with recording_lock:
-                        if gopro_id in recording_processes:
-                            recording_processes[gopro_id]['stage_message'] = f'Downloading chapter {i+1}/{total_chapters}...'
+                        # Update stage message
+                        with recording_lock:
+                            if gopro_id in recording_processes:
+                                recording_processes[gopro_id]['stage_message'] = f'Downloading chapter {i+1}/{total_chapters}...'
 
-                    max_download_retries = 10
-                    consecutive_failures = 0
-                    download_success = False
+                        download_success = False
 
-                    for attempt in range(max_download_retries):
-                        try:
-                            # Keep GoPro awake
+                        for attempt in range(DOWNLOAD_MAX_RETRIES):
                             try:
-                                requests.get(f'http://{gopro_ip}:8080/gopro/camera/keep_alive', timeout=2)
-                            except:
-                                pass
+                                # Check current file size for resume
+                                current_size = os.path.getsize(chapter_path) if os.path.exists(chapter_path) else 0
 
-                            # Check current file size for resume
-                            current_size = os.path.getsize(chapter_path) if os.path.exists(chapter_path) else 0
+                                # Skip if already complete
+                                if expected_size > 0 and current_size >= expected_size:
+                                    logger.info(f"[{gopro_id}] Chapter {i+1} already complete ({current_size:,} bytes)")
+                                    download_success = True
+                                    break
 
-                            # Skip if already complete
-                            if expected_size > 0 and current_size >= expected_size:
-                                logger.info(f"[{gopro_id}] Chapter {i+1} already complete ({current_size} bytes)")
-                                download_success = True
-                                break
+                                # Prepare headers for resume
+                                headers = {}
+                                if current_size > 0:
+                                    headers['Range'] = f'bytes={current_size}-'
+                                    logger.info(f"[{gopro_id}] Resuming from byte {current_size:,} ({current_size/1024/1024/1024:.2f} GB)")
 
-                            # Prepare headers for resume
-                            headers = {}
-                            if current_size > 0:
-                                headers['Range'] = f'bytes={current_size}-'
-                                logger.info(f"[{gopro_id}] Resuming from byte {current_size}")
+                                # Start download with BOTH connect and read timeout
+                                response = requests.get(
+                                    download_url,
+                                    headers=headers,
+                                    stream=True,
+                                    timeout=(DOWNLOAD_CONNECT_TIMEOUT, DOWNLOAD_READ_TIMEOUT)
+                                )
 
-                            # Start download
-                            response = requests.get(download_url, headers=headers, stream=True, timeout=600)
+                                # Handle response codes
+                                if current_size > 0 and response.status_code == 416:
+                                    # Range not satisfiable - file is likely complete
+                                    logger.info(f"[{gopro_id}] Server returned 416 - file may be complete")
+                                    download_success = True
+                                    break
 
-                            # Verify server honored Range request
-                            if current_size > 0 and response.status_code != 206:
-                                logger.warning(f"[{gopro_id}] Server returned {response.status_code} instead of 206, restarting download")
-                                if os.path.exists(chapter_path):
-                                    os.remove(chapter_path)
-                                current_size = 0
-                                response = requests.get(download_url, stream=True, timeout=600)
+                                if current_size > 0 and response.status_code != 206:
+                                    logger.warning(f"[{gopro_id}] Server returned {response.status_code} instead of 206, will append anyway")
 
-                            # Write to file
-                            mode = 'ab' if current_size > 0 and response.status_code == 206 else 'wb'
-                            bytes_written = 0
+                                # Determine write mode
+                                if current_size > 0 and response.status_code == 206:
+                                    mode = 'ab'  # Append
+                                elif current_size > 0:
+                                    mode = 'ab'  # Still try to append
+                                else:
+                                    mode = 'wb'  # Fresh start
 
-                            with open(chapter_path, mode) as f:
-                                for chunk in response.iter_content(chunk_size=1048576):  # 1MB chunks
-                                    if chunk:
-                                        f.write(chunk)
-                                        f.flush()  # Flush to disk regularly
-                                        bytes_written += len(chunk)
+                                # Write to file with smaller chunks for faster stall detection
+                                bytes_written = 0
+                                with open(chapter_path, mode) as f:
+                                    for chunk in response.iter_content(chunk_size=DOWNLOAD_CHUNK_SIZE):
+                                        if chunk:
+                                            f.write(chunk)
+                                            bytes_written += len(chunk)
 
-                            # Verify final size
-                            final_size = os.path.getsize(chapter_path)
+                                # Verify final size
+                                final_size = os.path.getsize(chapter_path)
 
-                            if expected_size > 0 and final_size >= expected_size:
-                                logger.info(f"[{gopro_id}] Chapter {i+1} download complete ({final_size / (1024**2):.1f} MB)")
-                                consecutive_failures = 0
-                                download_success = True
-                                break
+                                if expected_size > 0 and final_size >= expected_size:
+                                    logger.info(f"[{gopro_id}] Chapter {i+1} download complete ({final_size:,} bytes)")
+                                    download_success = True
+                                    break
+                                elif expected_size > 0:
+                                    logger.warning(f"[{gopro_id}] Chapter {i+1} incomplete: {final_size:,}/{expected_size:,} bytes - will retry")
+                                else:
+                                    logger.info(f"[{gopro_id}] Chapter {i+1} downloaded: {final_size:,} bytes (expected size unknown)")
+                                    download_success = True
+                                    break
+
+                            except requests.exceptions.Timeout as e:
+                                logger.warning(f"[{gopro_id}] Timeout on attempt {attempt+1}/{DOWNLOAD_MAX_RETRIES}: {e}")
+                            except requests.exceptions.ConnectionError as e:
+                                logger.warning(f"[{gopro_id}] Connection error on attempt {attempt+1}/{DOWNLOAD_MAX_RETRIES}: {e}")
+                            except Exception as e:
+                                logger.warning(f"[{gopro_id}] Error on attempt {attempt+1}/{DOWNLOAD_MAX_RETRIES}: {e}")
+
+                            # Exponential backoff (max 30 seconds) - NEVER delete partial files
+                            wait_time = min(2 ** attempt, 30)
+                            logger.info(f"[{gopro_id}] Waiting {wait_time}s before retry...")
+                            time.sleep(wait_time)
+
+                        # After retry loop - verify integrity
+                        if download_success and os.path.exists(chapter_path):
+                            # Quick integrity check with ffprobe
+                            if not verify_video_integrity(chapter_path):
+                                logger.warning(f"[{gopro_id}] Chapter {i+1} failed integrity check, marking as failed")
+                                download_success = False
+                                failed_chapters.append(chapter['filename'])
                             else:
-                                logger.warning(f"[{gopro_id}] Chapter {i+1} incomplete: {final_size}/{expected_size} bytes")
-                                consecutive_failures += 1
-
-                        except requests.exceptions.ConnectionError as e:
-                            logger.warning(f"[{gopro_id}] Connection error on attempt {attempt+1}: {e}")
-                            consecutive_failures += 1
-                        except requests.exceptions.Timeout as e:
-                            logger.warning(f"[{gopro_id}] Timeout on attempt {attempt+1}: {e}")
-                            consecutive_failures += 1
-                        except Exception as e:
-                            logger.warning(f"[{gopro_id}] Download attempt {attempt+1} failed: {e}")
-                            consecutive_failures += 1
-
-                        # Delete corrupt partial after 3 consecutive failures
-                        if consecutive_failures >= 3:
-                            logger.warning(f"[{gopro_id}] 3 consecutive failures, deleting partial file and restarting")
-                            if os.path.exists(chapter_path):
-                                os.remove(chapter_path)
-                            consecutive_failures = 0
-
-                        # Wait before retry
-                        time.sleep(2)
-
-                    # After retry loop - verify integrity
-                    if download_success and os.path.exists(chapter_path):
-                        # Quick integrity check with ffprobe
-                        if not verify_video_integrity(chapter_path):
-                            logger.warning(f"[{gopro_id}] Chapter {i+1} failed integrity check, marking as failed")
-                            download_success = False
+                                downloaded_files.append(chapter_path)
+                                logger.info(f"[{gopro_id}] Chapter {i+1} verified OK")
+                        elif not download_success:
+                            logger.error(f"[{gopro_id}] Failed to download chapter {i+1} after {DOWNLOAD_MAX_RETRIES} attempts")
                             failed_chapters.append(chapter['filename'])
-                        else:
-                            downloaded_files.append(chapter_path)
-                            logger.info(f"[{gopro_id}] Chapter {i+1} verified OK")
-                    elif not download_success:
-                        logger.error(f"[{gopro_id}] Failed to download chapter {i+1} after {max_download_retries} attempts")
-                        failed_chapters.append(chapter['filename'])
 
-                    # Update progress
-                    with recording_lock:
-                        if gopro_id in recording_processes:
-                            progress = int(((i + 1) / total_chapters) * 100)
-                            recording_processes[gopro_id]['download_progress'] = progress
+                        # Update progress
+                        with recording_lock:
+                            if gopro_id in recording_processes:
+                                progress = int(((i + 1) / total_chapters) * 100)
+                                recording_processes[gopro_id]['download_progress'] = progress
+
+                finally:
+                    # Always stop keep-alive thread
+                    keep_alive_thread.stop()
+                    logger.info(f"[{gopro_id}] Stopped keep-alive thread")
 
                 # Summary
                 if downloaded_files:
