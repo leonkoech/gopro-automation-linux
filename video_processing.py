@@ -1213,6 +1213,12 @@ def process_game_videos(
 
         logger.info(f"Found {len(overlapping_sessions)} overlapping recording sessions")
 
+        # Sort sessions to process FL/FR first (priority angles), then NL/NR
+        # This ensures the main game angles are processed before supplementary angles
+        angle_priority = {'FL': 0, 'FR': 1, 'NL': 2, 'NR': 3}
+        overlapping_sessions.sort(key=lambda s: angle_priority.get(s.get('angleCode', 'UNKNOWN'), 99))
+        logger.info(f"Processing order: {[s.get('angleCode') for s in overlapping_sessions]}")
+
         if not overlapping_sessions:
             # No overlapping sessions on this Jetson is not an error - it just means this Jetson
             # doesn't have videos for this game timeframe. Mark as completed with "skipped" status.
