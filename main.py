@@ -1714,7 +1714,7 @@ def process_game_videos_endpoint():
         }), 500
 
 
-def _run_video_processing_job(job_id: str, firebase_game_id: str, game_number: int, location: str):
+def _run_video_processing_job(job_id: str, firebase_game_id: str, game_number: int, location: str, force_local_transcode: bool = False):
     """Background worker for async video processing."""
     def update_progress(stage: str, detail: str = '', progress: float = 0, current_angle: str = ''):
         with video_processing_lock:
@@ -1738,7 +1738,8 @@ def _run_video_processing_job(job_id: str, firebase_game_id: str, game_number: i
             location=location,
             uball_client=uball_client,
             s3_bucket=UPLOAD_BUCKET,
-            progress_callback=update_progress
+            progress_callback=update_progress,
+            force_local_transcode=force_local_transcode
         )
 
         with video_processing_lock:
@@ -1779,7 +1780,8 @@ def process_game_videos_async():
     {
         "firebase_game_id": "abc123",
         "game_number": 1,
-        "location": "court-a"
+        "location": "court-a",
+        "force_local_transcode": false  // Optional: force local CPU encoding instead of AWS GPU
     }
 
     Returns immediately:
@@ -1805,6 +1807,7 @@ def process_game_videos_async():
         firebase_game_id = data.get('firebase_game_id')
         game_number = data.get('game_number', 1)
         location = data.get('location', UPLOAD_LOCATION)
+        force_local_transcode = data.get('force_local_transcode', False)
 
         if not firebase_game_id:
             return jsonify({'success': False, 'error': 'firebase_game_id required'}), 400
@@ -1814,6 +1817,7 @@ def process_game_videos_async():
 
         # Create job
         job_id = str(uuid.uuid4())
+        transcode_mode = 'local' if force_local_transcode else 'aws_gpu'
 
         with video_processing_lock:
             video_processing_jobs[job_id] = {
@@ -1821,6 +1825,7 @@ def process_game_videos_async():
                 'firebase_game_id': firebase_game_id,
                 'game_number': game_number,
                 'location': location,
+                'transcode_mode': transcode_mode,
                 'status': 'running',
                 'stage': 'queued',
                 'detail': 'Job queued',
@@ -1835,12 +1840,12 @@ def process_game_videos_async():
         # Start background thread
         thread = threading.Thread(
             target=_run_video_processing_job,
-            args=(job_id, firebase_game_id, game_number, location),
+            args=(job_id, firebase_game_id, game_number, location, force_local_transcode),
             daemon=True
         )
         thread.start()
 
-        logger.info(f"[VideoProcessing] Started async job {job_id} for game {firebase_game_id}")
+        logger.info(f"[VideoProcessing] Started async job {job_id} for game {firebase_game_id} (mode: {transcode_mode})")
 
         return jsonify({
             'success': True,

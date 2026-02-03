@@ -646,8 +646,10 @@ class VideoProcessor:
                 logger.info(f"  Uploaded final part {part_number} ({total_bytes / (1024*1024):.0f} MB total)")
 
             # Wait for FFmpeg to finish
+            # For compression, FFmpeg may still be flushing - use longer timeout
             process.stdout.close()
-            return_code = process.wait(timeout=60)
+            wait_timeout = 300 if needs_compress else 60  # 5 min for encoding, 1 min for copy
+            return_code = process.wait(timeout=wait_timeout)
             stderr_thread.join(timeout=10)
 
             if return_code != 0:
@@ -1094,7 +1096,8 @@ def process_game_videos(
     location: str = 'default-location',
     uball_client=None,
     s3_bucket: str = 'uball-videos-production',
-    progress_callback=None
+    progress_callback=None,
+    force_local_transcode: bool = False
 ) -> Dict[str, Any]:
     """
     Process videos for a specific game.
@@ -1134,9 +1137,12 @@ def process_game_videos(
         'uball_game_id': None
     }
 
-    # Check if AWS GPU transcoding is enabled
+    # Check if AWS GPU transcoding is enabled (can be overridden by force_local_transcode)
     use_aws_gpu = os.getenv('USE_AWS_GPU_TRANSCODE', 'false').lower() == 'true'
-    if use_aws_gpu:
+    if force_local_transcode:
+        use_aws_gpu = False
+        logger.info("LOCAL TRANSCODE FORCED - will encode locally and stream to S3")
+    elif use_aws_gpu:
         logger.info("AWS GPU transcoding ENABLED - will use stream copy + AWS Batch")
     else:
         logger.info("AWS GPU transcoding disabled - using local CPU encoding")
