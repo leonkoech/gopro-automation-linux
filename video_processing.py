@@ -794,6 +794,206 @@ class VideoProcessor:
             traceback.print_exc()
             return None
 
+    def extract_4k_stream_to_s3(
+        self,
+        chapters: List[Dict[str, Any]],
+        offset_seconds: float,
+        duration_seconds: float,
+        s3_upload_service,
+        s3_key: str,
+        add_buffer: float = 30.0
+    ) -> Optional[str]:
+        """
+        Extract a 4K clip with stream copy and pipe directly to S3.
+        No temp file on disk - streams FFmpeg output to S3 multipart upload.
+
+        Args:
+            chapters: List of chapter files to process
+            offset_seconds: Seek position from start of first chapter
+            duration_seconds: Length of clip to extract
+            s3_upload_service: VideoUploadService instance with S3 client
+            s3_key: S3 key (path) to upload to
+            add_buffer: Extra seconds to add before/after game (default 30s)
+
+        Returns:
+            S3 URI on success, None on failure
+        """
+        import threading
+
+        if not chapters:
+            logger.error("No chapters provided for 4K stream to S3")
+            return None
+
+        # Add buffer time (but don't go negative)
+        buffered_offset = max(0, offset_seconds - add_buffer)
+        buffered_duration = duration_seconds + (2 * add_buffer)
+
+        logger.info(f"Extracting 4K and streaming directly to S3:")
+        logger.info(f"  Chapters: {len(chapters)}")
+        logger.info(f"  Offset: {self._format_duration(buffered_offset)}")
+        logger.info(f"  Duration: {self._format_duration(buffered_duration)}")
+        logger.info(f"  S3 Key: {s3_key}")
+
+        s3_client = s3_upload_service.s3_client
+        bucket = s3_upload_service.bucket_name
+
+        try:
+            # Build FFmpeg command
+            if len(chapters) == 1:
+                # Single file extraction
+                cmd = [
+                    'ffmpeg', '-y',
+                    '-ss', str(buffered_offset),
+                    '-i', chapters[0]['path'],
+                    '-t', str(buffered_duration),
+                    '-c', 'copy',
+                    '-avoid_negative_ts', 'make_zero',
+                    '-movflags', 'frag_keyframe+empty_moov',
+                    '-f', 'mp4',
+                    'pipe:1'
+                ]
+            else:
+                # Multiple files - create concat file
+                with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
+                    concat_file = f.name
+                    for chapter in chapters:
+                        escaped_path = chapter['path'].replace("'", "'\\''")
+                        f.write(f"file '{escaped_path}'\n")
+
+                cmd = [
+                    'ffmpeg', '-y',
+                    '-ss', str(buffered_offset),
+                    '-f', 'concat', '-safe', '0',
+                    '-i', concat_file,
+                    '-t', str(buffered_duration),
+                    '-c', 'copy',
+                    '-avoid_negative_ts', 'make_zero',
+                    '-movflags', 'frag_keyframe+empty_moov',
+                    '-f', 'mp4',
+                    'pipe:1'
+                ]
+
+            logger.info(f"  FFmpeg cmd: {' '.join(cmd)}")
+
+            # Start multipart upload
+            mpu = s3_client.create_multipart_upload(
+                Bucket=bucket,
+                Key=s3_key,
+                ContentType='video/mp4'
+            )
+            upload_id = mpu['UploadId']
+            parts = []
+            part_number = 1
+            PART_SIZE = 25 * 1024 * 1024  # 25 MB parts
+            total_bytes = 0
+
+            # Start FFmpeg process
+            process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                bufsize=PART_SIZE
+            )
+
+            # Read stderr in background
+            stderr_output = []
+            def read_stderr():
+                stderr_output.append(process.stderr.read().decode('utf-8', errors='replace'))
+            stderr_thread = threading.Thread(target=read_stderr, daemon=True)
+            stderr_thread.start()
+
+            # Stream to S3
+            buffer = b''
+            while True:
+                chunk = process.stdout.read(PART_SIZE - len(buffer))
+                if not chunk:
+                    break
+                buffer += chunk
+
+                if len(buffer) >= PART_SIZE:
+                    response = s3_client.upload_part(
+                        Bucket=bucket,
+                        Key=s3_key,
+                        PartNumber=part_number,
+                        UploadId=upload_id,
+                        Body=buffer
+                    )
+                    parts.append({
+                        'ETag': response['ETag'],
+                        'PartNumber': part_number
+                    })
+                    total_bytes += len(buffer)
+                    logger.info(f"  Uploaded part {part_number} ({total_bytes / (1024*1024):.0f} MB streamed)")
+                    part_number += 1
+                    buffer = b''
+
+            # Upload remaining buffer
+            if buffer:
+                response = s3_client.upload_part(
+                    Bucket=bucket,
+                    Key=s3_key,
+                    PartNumber=part_number,
+                    UploadId=upload_id,
+                    Body=buffer
+                )
+                parts.append({
+                    'ETag': response['ETag'],
+                    'PartNumber': part_number
+                })
+                total_bytes += len(buffer)
+                logger.info(f"  Uploaded final part {part_number} ({total_bytes / (1024*1024):.0f} MB total)")
+
+            # Wait for FFmpeg
+            process.stdout.close()
+            return_code = process.wait(timeout=1800)
+            stderr_thread.join(timeout=5)
+
+            # Clean up concat file if created
+            if len(chapters) > 1:
+                try:
+                    os.unlink(concat_file)
+                except:
+                    pass
+
+            if return_code != 0:
+                stderr_text = stderr_output[0] if stderr_output else "Unknown error"
+                logger.error(f"FFmpeg failed: {stderr_text[-500:]}")
+                # Abort multipart upload
+                s3_client.abort_multipart_upload(
+                    Bucket=bucket,
+                    Key=s3_key,
+                    UploadId=upload_id
+                )
+                return None
+
+            # Complete multipart upload
+            s3_client.complete_multipart_upload(
+                Bucket=bucket,
+                Key=s3_key,
+                UploadId=upload_id,
+                MultipartUpload={'Parts': parts}
+            )
+
+            s3_uri = f"s3://{bucket}/{s3_key}"
+            size_gb = total_bytes / (1024**3)
+            logger.info(f"  Streamed 4K to S3: {s3_uri} ({size_gb:.2f} GB)")
+            return s3_uri
+
+        except Exception as e:
+            logger.error(f"Stream to S3 failed: {e}")
+            import traceback
+            traceback.print_exc()
+            # Try to abort multipart upload
+            try:
+                s3_client.abort_multipart_upload(
+                    Bucket=bucket,
+                    Key=s3_key,
+                    UploadId=upload_id
+                )
+            except:
+                pass
+            return None
+
     def generate_game_filename(
         self,
         date: str,
@@ -1097,46 +1297,29 @@ def process_game_videos(
                     results['errors'].append(f"AWS Batch init failed: {str(e)}")
                     continue
 
-                # 1. Extract 4K with stream copy (fast, no re-encoding)
-                temp_4k_filename = f"{angle_code}_4k_temp.mp4"
-                temp_4k_path = os.path.join(video_processor.output_dir, temp_4k_filename)
-
-                extracted_4k = video_processor.extract_4k_stream_copy(
-                    params['chapters_needed'],
-                    params['offset_seconds'],
-                    params['duration_seconds'],
-                    temp_4k_path,
-                    add_buffer=30.0
-                )
-
-                if not extracted_4k:
-                    results['errors'].append(f"4K stream copy extraction failed for {angle_code}")
-                    continue
-
-                # Get 4K file info
-                video_info_4k = video_processor.get_video_info(extracted_4k)
-                size_4k_gb = video_info_4k.get('size_bytes', 0) / (1024**3)
-                logger.info(f"[AWS GPU] Extracted 4K: {size_4k_gb:.2f} GB")
-
-                # 2. Upload 4K to S3 raw/ prefix
-                report_progress('uploading', f'Uploading 4K {angle_code} to S3 raw/...', session_base_progress + 15, angle_code)
-
+                # 1. Extract 4K and stream directly to S3 raw/ prefix
+                # No temp file needed - streams FFmpeg output directly to S3
                 raw_s3_key = batch_transcoder.generate_raw_s3_key(
                     location, game_date, uball_game_id, angle_code
                 )
 
-                raw_s3_uri = batch_transcoder.upload_4k_to_raw(extracted_4k, raw_s3_key)
+                logger.info(f"[AWS GPU] Streaming 4K directly to S3 (no temp file)")
+                report_progress('extracting', f'Extracting & streaming 4K {angle_code} to S3...', session_base_progress, angle_code)
+
+                raw_s3_uri = video_processor.extract_4k_stream_to_s3(
+                    params['chapters_needed'],
+                    params['offset_seconds'],
+                    params['duration_seconds'],
+                    upload_service,
+                    raw_s3_key,
+                    add_buffer=30.0
+                )
 
                 if not raw_s3_uri:
-                    results['errors'].append(f"Failed to upload 4K {angle_code} to S3 raw/")
-                    # Clean up local file
-                    try:
-                        os.remove(extracted_4k)
-                    except:
-                        pass
+                    results['errors'].append(f"4K stream to S3 failed for {angle_code}")
                     continue
 
-                logger.info(f"[AWS GPU] Uploaded 4K to: {raw_s3_uri}")
+                logger.info(f"[AWS GPU] Streamed 4K to: {raw_s3_uri}")
 
                 # 3. Submit AWS Batch transcode job
                 report_progress('batch_submit', f'Submitting Batch job for {angle_code}...', session_base_progress + 30, angle_code)
@@ -1181,12 +1364,7 @@ def process_game_videos(
                     # Clean up raw file from S3 if job submission failed
                     batch_transcoder.delete_raw_file(raw_s3_key)
 
-                # 5. Clean up local 4K file (it's now in S3)
-                try:
-                    os.remove(extracted_4k)
-                    logger.info(f"[AWS GPU] Cleaned up local 4K file: {extracted_4k}")
-                except Exception as e:
-                    logger.warning(f"Could not clean up local file: {e}")
+                # No local cleanup needed - 4K was streamed directly to S3
 
             else:
                 # ===========================================================
