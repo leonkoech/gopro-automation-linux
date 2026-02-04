@@ -4384,12 +4384,16 @@ def upload_session_chapters(session_id):
                 'angle_code': session.get('angleCode', 'UNKNOWN'),
                 'gopro_ip': gopro_ip,
                 'status': 'starting',
+                'substage': 'starting',  # NEW: Track download vs upload stage
                 'progress': 0,
                 'total_chapters': session.get('totalChapters', 0),
                 'chapters_uploaded': 0,
+                'chapters_downloaded': 0,  # NEW: Track download progress
                 'bytes_uploaded': 0,
+                'bytes_downloaded': 0,  # NEW: Track download bytes
                 's3_prefix': None,
                 'error': None,
+                'current_chapter': None,  # NEW: Current chapter info
                 'started_at': datetime.now().isoformat(),
                 'completed_at': None
             }
@@ -4418,23 +4422,64 @@ def upload_session_chapters(session_id):
                 if len(all_chapters) < expected_count:
                     with pipeline_jobs_lock:
                         pipeline_jobs[job_id]['status'] = 'failed'
+                        pipeline_jobs[job_id]['substage'] = 'failed'
                         pipeline_jobs[job_id]['error'] = f'Expected {expected_count} chapters but found {len(all_chapters)} on GoPro'
+                        pipeline_jobs[job_id]['current_chapter'] = None
                     return
 
                 # Take the last N chapters (most recent recording)
                 chapters_to_upload = all_chapters[-expected_count:] if expected_count > 0 else all_chapters
 
                 with pipeline_jobs_lock:
-                    pipeline_jobs[job_id]['status'] = 'uploading'
+                    pipeline_jobs[job_id]['status'] = 'downloading'  # Start with downloading
+                    pipeline_jobs[job_id]['substage'] = 'downloading'
                     pipeline_jobs[job_id]['total_chapters'] = len(chapters_to_upload)
 
-                # Progress callback
-                def progress_callback(stage, chapter_num, total, bytes_uploaded):
+                # Progress callback - now tracks download vs upload stages
+                def progress_callback(stage, chapter_num, total, bytes_current):
+                    """
+                    Progress callback for chapter upload service.
+                    
+                    Args:
+                        stage: 'downloading' or 'uploading'
+                        chapter_num: Current chapter number (1-based)
+                        total: Total number of chapters
+                        bytes_current: Current bytes for this stage
+                    """
                     with pipeline_jobs_lock:
                         if job_id in pipeline_jobs:
-                            pipeline_jobs[job_id]['chapters_uploaded'] = chapter_num if stage != 'streaming' else chapter_num - 1
-                            pipeline_jobs[job_id]['bytes_uploaded'] = bytes_uploaded
-                            pipeline_jobs[job_id]['progress'] = int((chapter_num / total) * 100) if total > 0 else 0
+                            job = pipeline_jobs[job_id]
+                            
+                            # Update substage
+                            job['substage'] = stage
+                            
+                            # Update status based on stage
+                            if stage == 'downloading':
+                                job['status'] = 'downloading'
+                                job['chapters_downloaded'] = chapter_num
+                                job['bytes_downloaded'] = bytes_current
+                            elif stage == 'uploading':
+                                job['status'] = 'uploading'
+                                job['chapters_uploaded'] = chapter_num
+                                job['bytes_uploaded'] = bytes_current
+                            
+                            # Update overall progress (based on total chapters)
+                            # Progress = (completed chapters / total) * 100
+                            # For downloading: chapter_num - 1 complete
+                            # For uploading: chapter_num - 1 complete + current upload progress
+                            if stage == 'downloading':
+                                completed = chapter_num - 1
+                            else:  # uploading
+                                completed = chapter_num - 1
+                            
+                            job['progress'] = int((completed / total) * 100) if total > 0 else 0
+                            
+                            # Update current chapter info (optional, for better UX)
+                            # Note: We don't have filename here, would need to pass it through
+                            job['current_chapter'] = {
+                                'number': chapter_num,
+                                'stage': stage
+                            }
 
                 # Upload chapters
                 result = chapter_service.upload_session_chapters(
@@ -4450,15 +4495,21 @@ def upload_session_chapters(session_id):
 
                     with pipeline_jobs_lock:
                         pipeline_jobs[job_id]['status'] = 'completed'
+                        pipeline_jobs[job_id]['substage'] = 'completed'
                         pipeline_jobs[job_id]['s3_prefix'] = result['s3_prefix']
                         pipeline_jobs[job_id]['chapters_uploaded'] = result['chapters_uploaded']
+                        pipeline_jobs[job_id]['chapters_downloaded'] = result['chapters_uploaded']  # Same as uploaded
                         pipeline_jobs[job_id]['bytes_uploaded'] = result['total_bytes']
+                        pipeline_jobs[job_id]['bytes_downloaded'] = result['total_bytes']  # Same as uploaded
                         pipeline_jobs[job_id]['progress'] = 100
+                        pipeline_jobs[job_id]['current_chapter'] = None
                         pipeline_jobs[job_id]['completed_at'] = datetime.now().isoformat()
                 else:
                     with pipeline_jobs_lock:
                         pipeline_jobs[job_id]['status'] = 'failed'
+                        pipeline_jobs[job_id]['substage'] = 'failed'
                         pipeline_jobs[job_id]['error'] = '; '.join(result.get('errors', ['Unknown error']))
+                        pipeline_jobs[job_id]['current_chapter'] = None
                         pipeline_jobs[job_id]['completed_at'] = datetime.now().isoformat()
 
             except Exception as e:
@@ -4467,7 +4518,9 @@ def upload_session_chapters(session_id):
                 traceback.print_exc()
                 with pipeline_jobs_lock:
                     pipeline_jobs[job_id]['status'] = 'failed'
+                    pipeline_jobs[job_id]['substage'] = 'failed'
                     pipeline_jobs[job_id]['error'] = str(e)
+                    pipeline_jobs[job_id]['current_chapter'] = None
                     pipeline_jobs[job_id]['completed_at'] = datetime.now().isoformat()
 
         threading.Thread(target=run_upload, daemon=True).start()
