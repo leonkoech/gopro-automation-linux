@@ -422,6 +422,65 @@ class FirebaseService:
             'syncedAt': datetime.utcnow().isoformat() + 'Z'
         })
 
+    # ==================== Chapter Upload Pipeline Methods ====================
+
+    def update_session_s3_prefix(self, session_id: str, s3_prefix: str) -> None:
+        """
+        Set the s3Prefix field on a recording session after chapters are uploaded to S3.
+
+        Args:
+            session_id: Document ID of the recording session
+            s3_prefix: S3 prefix where chapters are stored (e.g., "raw-chapters/enxd43260ef4d38_20250120_140530/")
+        """
+        doc_ref = self.db.collection(self.RECORDING_SESSIONS_COLLECTION).document(session_id)
+        doc_ref.update({
+            's3Prefix': s3_prefix,
+            's3UploadedAt': datetime.utcnow().isoformat() + 'Z'
+        })
+
+    def get_sessions_pending_upload(self, jetson_id: Optional[str] = None) -> List[Dict[str, Any]]:
+        """
+        Get recording sessions that need chapter upload to S3.
+
+        Sessions are pending upload if:
+        - status is 'stopped' (recording finished, chapters available)
+        - s3Prefix is not set (chapters not yet uploaded to S3)
+
+        Args:
+            jetson_id: Optional filter by Jetson ID (defaults to current Jetson)
+
+        Returns:
+            List of session documents pending upload
+        """
+        sessions_ref = self.db.collection(self.RECORDING_SESSIONS_COLLECTION)
+
+        # Query for stopped sessions
+        query = sessions_ref.where('status', '==', 'stopped')
+
+        if jetson_id:
+            query = query.where('jetsonId', '==', jetson_id)
+
+        # Filter in Python for missing s3Prefix (Firestore doesn't support "field not exists" well)
+        pending_sessions = []
+        for doc in query.stream():
+            session_data = doc.to_dict()
+            session_data['id'] = doc.id
+
+            # Skip if already has s3Prefix (already uploaded)
+            if session_data.get('s3Prefix'):
+                continue
+
+            # Skip if no chapters (nothing to upload)
+            if session_data.get('totalChapters', 0) == 0:
+                continue
+
+            pending_sessions.append(session_data)
+
+        # Sort by startedAt descending (most recent first)
+        pending_sessions.sort(key=lambda s: s.get('startedAt', ''), reverse=True)
+
+        return pending_sessions
+
 
 # Singleton instance
 _firebase_service: Optional[FirebaseService] = None

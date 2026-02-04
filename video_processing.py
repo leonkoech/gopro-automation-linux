@@ -1086,6 +1086,121 @@ class VideoProcessor:
 
         return {}
 
+    def get_session_chapters_from_s3(
+        self,
+        s3_prefix: str,
+        s3_client,
+        bucket: str,
+        url_expiration: int = 7200
+    ) -> List[Dict[str, Any]]:
+        """
+        Get list of chapter files from S3 with presigned URLs for FFmpeg.
+
+        Args:
+            s3_prefix: S3 prefix where chapters are stored (e.g., "raw-chapters/session123/")
+            s3_client: boto3 S3 client instance
+            bucket: S3 bucket name
+            url_expiration: Presigned URL expiration in seconds (default 2 hours)
+
+        Returns:
+            List of chapter info dicts with path (presigned URL), filename, size, duration
+        """
+        chapters = []
+
+        try:
+            # List all objects with the given prefix
+            paginator = s3_client.get_paginator('list_objects_v2')
+            for page in paginator.paginate(Bucket=bucket, Prefix=s3_prefix):
+                if 'Contents' not in page:
+                    continue
+
+                for obj in page['Contents']:
+                    key = obj['Key']
+                    filename = key.split('/')[-1]
+
+                    # Only include MP4 files
+                    if not filename.lower().endswith('.mp4'):
+                        continue
+
+                    # Generate presigned URL for FFmpeg to read
+                    presigned_url = s3_client.generate_presigned_url(
+                        'get_object',
+                        Params={'Bucket': bucket, 'Key': key},
+                        ExpiresIn=url_expiration
+                    )
+
+                    # Get video duration using ffprobe with presigned URL
+                    duration = self._get_video_duration(presigned_url)
+
+                    chapter_info = {
+                        'filename': filename,
+                        'path': presigned_url,  # FFmpeg can read this directly!
+                        's3_key': key,
+                        'size_bytes': obj['Size'],
+                        'size_mb': round(obj['Size'] / (1024 * 1024), 2),
+                        'duration_seconds': duration,
+                        'duration_str': self._format_duration(duration) if duration else 'unknown',
+                        'is_corrupted': False,  # Assume S3 files are valid
+                        'corruption_error': None,
+                        'source': 's3'
+                    }
+
+                    chapters.append(chapter_info)
+
+            # Sort by chapter number (extracted from filename like "chapter_001_GX010038.MP4")
+            def chapter_sort_key(ch):
+                fname = ch['filename']
+                # Try to extract chapter number from filename
+                if fname.startswith('chapter_'):
+                    try:
+                        return int(fname.split('_')[1])
+                    except (IndexError, ValueError):
+                        pass
+                return fname
+
+            chapters.sort(key=chapter_sort_key)
+
+            logger.info(f"Found {len(chapters)} chapters in S3 at {s3_prefix}")
+
+        except Exception as e:
+            logger.error(f"Error listing S3 chapters: {e}")
+
+        return chapters
+
+    def get_session_chapters_auto(
+        self,
+        session: Dict[str, Any],
+        s3_client=None,
+        bucket: str = None,
+        check_corruption: bool = False
+    ) -> List[Dict[str, Any]]:
+        """
+        Auto-select chapter source: S3 (if s3Prefix set) or local disk.
+
+        This is the recommended method for getting chapters - it automatically
+        uses the right source based on whether chapters have been uploaded to S3.
+
+        Args:
+            session: Recording session document from Firebase
+            s3_client: boto3 S3 client (required if session has s3Prefix)
+            bucket: S3 bucket name (required if session has s3Prefix)
+            check_corruption: If True, check local files for corruption
+
+        Returns:
+            List of chapter info dicts with path (local or presigned URL)
+        """
+        s3_prefix = session.get('s3Prefix')
+        session_name = session.get('segmentSession', '')
+
+        if s3_prefix and s3_client and bucket:
+            # Chapters are in S3 - use presigned URLs
+            logger.info(f"[{session_name}] Using S3 chapters from: {s3_prefix}")
+            return self.get_session_chapters_from_s3(s3_prefix, s3_client, bucket)
+        else:
+            # Fall back to local chapters
+            logger.info(f"[{session_name}] Using local chapters from disk")
+            return self.get_session_chapters(session_name, check_corruption=check_corruption)
+
 
 def process_game_videos(
     firebase_game_id: str,
@@ -1245,8 +1360,16 @@ def process_game_videos(
             logger.info(f"Processing session: {session_name} (angle: {angle_code})")
             report_progress('extracting', f'Extracting {angle_code} video...', session_base_progress, angle_code)
 
-            # Get chapter files (with corruption check)
-            chapters = video_processor.get_session_chapters(session_name, check_corruption=True)
+            # Get chapter files - auto-selects S3 or local based on s3Prefix
+            # Pass S3 client and bucket if upload_service is available
+            s3_client = upload_service.s3_client if upload_service else None
+            s3_bucket = upload_service.bucket_name if upload_service else None
+            chapters = video_processor.get_session_chapters_auto(
+                session,
+                s3_client=s3_client,
+                bucket=s3_bucket,
+                check_corruption=True
+            )
             if not chapters:
                 logger.warning(f"No chapters found for session {session_name}")
                 results['errors'].append(f"No chapters for session {session_name}")
