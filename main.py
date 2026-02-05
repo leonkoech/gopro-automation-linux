@@ -327,39 +327,38 @@ def sanitize_filename(name):
     return name.strip()
 
 
+# Only these four session/angle types (no UNKNOWN in UI).
+VALID_ANGLE_CODES = ('FL', 'FR', 'NL', 'NR')
+
+
 def _get_angle_code_from_camera_name(camera_name: str) -> str:
     """
     Extract angle code from camera name or CAMERA_ANGLE_MAP env var.
+    Returns only FL, FR, NL, or NR so sessions are always one of 4 types.
 
     Args:
         camera_name: GoPro camera name (e.g., "GoPro FL")
 
     Returns:
-        Angle code (FL, FR, NL, NR) or 'UNK' if unknown
+        Angle code: one of FL, FR, NL, NR
     """
     # Try CAMERA_ANGLE_MAP env var first
     angle_map_str = os.getenv('CAMERA_ANGLE_MAP', '{}')
-    print(f"[DEBUG] CAMERA_ANGLE_MAP env: {angle_map_str}")
-    print(f"[DEBUG] Looking up camera_name: '{camera_name}'")
     try:
         angle_map = json.loads(angle_map_str)
-        print(f"[DEBUG] Parsed angle_map: {angle_map}")
         if camera_name in angle_map:
             result = angle_map[camera_name]
-            print(f"[DEBUG] Found mapping: {camera_name} -> {result}")
-            return result
-        else:
-            print(f"[DEBUG] Camera '{camera_name}' not in angle_map keys: {list(angle_map.keys())}")
-    except json.JSONDecodeError as e:
-        print(f"[DEBUG] JSON decode error: {e}")
+            return result if result in VALID_ANGLE_CODES else 'NL'
+    except json.JSONDecodeError:
+        pass
 
     # Fallback: extract from camera name like "GoPro FL"
     if camera_name:
-        for code in ['FL', 'FR', 'NL', 'NR']:
+        for code in VALID_ANGLE_CODES:
             if code in camera_name.upper():
                 return code
 
-    return 'UNK'  # Unknown angle
+    return 'NL'  # Default so we never return UNK/UNKNOWN
 
 def get_video_list():
     """Get list of all recorded videos"""
@@ -1154,11 +1153,19 @@ def process_only():
 @app.route('/api/recording/pipeline-status', methods=['GET'])
 def get_recording_pipeline_status():
     """
-    Get combined status of recording downloads and pipeline.
+    Get combined status of recording downloads and pipeline for THIS Jetson.
 
     Returns current state for UI display:
     - Recording/download progress for each GoPro
-    - Pipeline status if running
+    - Pipeline status if running (only this Jetson's pipeline)
+
+    When multiple Jetsons are selected (e.g. Jetson 1 = NR, Jetson 2 = NL):
+    the frontend must poll this endpoint on EACH Jetson's base URL and merge
+    the results so both Jetsons' progress are visible. Each Jetson only returns
+    its own pipeline; there is no server-side aggregation.
+
+    Pipeline sessions include: display_label (e.g. "02/02/2026 NR"), session_date
+    (MM/DD/YYYY), angle_code (FL|FR|NL|NR) for the Sessions list.
     """
     from pipeline_orchestrator import get_orchestrator
 

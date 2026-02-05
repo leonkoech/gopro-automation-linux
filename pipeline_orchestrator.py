@@ -22,6 +22,52 @@ from logging_service import get_logger
 
 logger = get_logger('gopro.pipeline_orchestrator')
 
+# Sessions must display as one of these four only (no UNKNOWN in UI).
+VALID_ANGLE_CODES = ('FL', 'FR', 'NL', 'NR')
+
+
+def _normalize_angle_code(angle_code: Optional[str]) -> str:
+    """Return angle code as one of FL, FR, NL, NR for consistent UI display."""
+    if angle_code and str(angle_code).upper() in ('FL', 'FR', 'NL', 'NR'):
+        return str(angle_code).upper()
+    return 'NL'
+
+
+def _session_display_date(session: Dict[str, Any]) -> str:
+    """Return session date as MM/DD/YYYY for UI label (e.g. 02/02/2026)."""
+    started_at = session.get('startedAt') or ''
+    if started_at:
+        try:
+            dt = datetime.fromisoformat(started_at.replace('Z', '+00:00'))
+            return dt.strftime('%m/%d/%Y')
+        except (ValueError, TypeError):
+            pass
+    # Fallback: parse from segmentSession (e.g. enx..._NR_20260202_193947)
+    segment = session.get('segmentSession') or ''
+    for part in segment.split('_'):
+        if len(part) == 8 and part.isdigit() and part.startswith('20'):
+            try:
+                y, m, d = int(part[:4]), int(part[4:6]), int(part[6:8])
+                return f'{m:02d}/{d:02d}/{y}'
+            except (ValueError, TypeError):
+                break
+    return ''
+
+
+def _make_session_state(session: Dict[str, Any]) -> SessionPipelineState:
+    """Build SessionPipelineState from Firebase session doc; includes display_label for UI."""
+    angle = _normalize_angle_code(session.get('angleCode'))
+    session_date = _session_display_date(session)
+    display_label = f'{session_date} {angle}'.strip() if session_date else angle
+    return SessionPipelineState(
+        session_id=session['id'],
+        segment_session=session.get('segmentSession', ''),
+        angle_code=angle,
+        interface_id=session.get('interfaceId', ''),
+        session_date=session_date,
+        display_label=display_label
+    )
+
 
 class PipelineStage(str, Enum):
     """Pipeline execution stages."""
@@ -38,11 +84,21 @@ class PipelineStage(str, Enum):
 class SessionPipelineState:
     """State for a single session (one angle) in the pipeline."""
 
-    def __init__(self, session_id: str, segment_session: str, angle_code: str, interface_id: str):
+    def __init__(
+        self,
+        session_id: str,
+        segment_session: str,
+        angle_code: str,
+        interface_id: str,
+        session_date: str = '',
+        display_label: str = ''
+    ):
         self.session_id = session_id
         self.segment_session = segment_session
         self.angle_code = angle_code
         self.interface_id = interface_id
+        self.session_date = session_date  # MM/DD/YYYY for UI
+        self.display_label = display_label  # e.g. "02/02/2026 NR" for Sessions list
         self.status = 'pending'
         self.chapters_total = 0
         self.chapters_uploaded = 0
@@ -147,14 +203,9 @@ class PipelineOrchestrator:
                 'stage_message': 'Initializing pipeline...',
                 'progress': 0,
 
-                # Sessions
+                # Sessions (angle_code only FL, FR, NL, NR; display_label = "MM/DD/YYYY ANGLE")
                 'sessions': {
-                    s['id']: SessionPipelineState(
-                        session_id=s['id'],
-                        segment_session=s.get('segmentSession', ''),
-                        angle_code=s.get('angleCode', 'UNKNOWN'),
-                        interface_id=s.get('interfaceId', '')
-                    ).__dict__
+                    s['id']: _make_session_state(s).__dict__
                     for s in sessions
                 },
                 'sessions_total': len(sessions),
@@ -248,7 +299,7 @@ class PipelineOrchestrator:
             })
 
             self._update_pipeline(pipeline_id, {
-                'stage_message': f'Uploading {session.get("angleCode", "?")} ({i+1}/{len(sessions)})...'
+                'stage_message': f'Uploading {_normalize_angle_code(session.get("angleCode"))} ({i+1}/{len(sessions)})...'
             })
 
             try:
@@ -301,7 +352,7 @@ class PipelineOrchestrator:
                     logger.info(f"[Pipeline {pipeline_id}] Session {session_id} uploaded to {result['s3_prefix']}")
                 else:
                     error = '; '.join(result.get('errors', ['Unknown error']))
-                    upload_errors.append(f"{session.get('angleCode', '?')}: {error}")
+                    upload_errors.append(f"{_normalize_angle_code(session.get('angleCode'))}: {error}")
                     self._update_session_state(pipeline_id, session_id, {
                         'status': 'failed',
                         'error': error
@@ -309,7 +360,7 @@ class PipelineOrchestrator:
 
             except Exception as e:
                 error = str(e)
-                upload_errors.append(f"{session.get('angleCode', '?')}: {error}")
+                upload_errors.append(f"{_normalize_angle_code(session.get('angleCode'))}: {error}")
                 self._update_session_state(pipeline_id, session_id, {
                     'status': 'failed',
                     'error': error

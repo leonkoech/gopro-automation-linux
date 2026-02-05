@@ -284,6 +284,16 @@ class ChapterUploadService:
             'error': f'Failed after {MAX_DOWNLOAD_RETRIES} attempts'
         }
 
+    def s3_object_exists(self, s3_key: str) -> bool:
+        """
+        Check if an object already exists in S3 (for dev: skip re-download/re-upload).
+        """
+        try:
+            self.s3_client.head_object(Bucket=self.bucket_name, Key=s3_key)
+            return True
+        except Exception:
+            return False
+
     def upload_local_file_to_s3(
         self,
         local_path: str,
@@ -690,6 +700,24 @@ class ChapterUploadService:
                 local_path = os.path.join(local_temp_dir, filename)
 
                 logger.info(f"[{chapter_num}/{total_chapters}] Processing: {filename}")
+
+                # Skip if already in S3 (dev: avoid re-download/re-upload until cleanup)
+                if self.s3_object_exists(s3_key):
+                    results['chapters_uploaded'] += 1
+                    results['total_bytes'] += expected_size
+                    results['uploaded_chapters'].append({
+                        'filename': filename,
+                        's3_key': s3_key,
+                        'bytes': expected_size,
+                        'skipped': True
+                    })
+                    logger.info(f"[{chapter_num}/{total_chapters}] SKIPPED (already in S3): {s3_key}")
+                    if progress_callback:
+                        try:
+                            progress_callback('uploading', chapter_num, total_chapters, results['total_bytes'])
+                        except Exception:
+                            pass
+                    continue
 
                 # Report progress: downloading
                 if progress_callback:

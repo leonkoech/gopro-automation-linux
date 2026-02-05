@@ -78,27 +78,32 @@ class FirebaseService:
 
         self.db = firestore.client()
 
+    # Only these four session/angle types are supported; no UNKNOWN in UI.
+    VALID_ANGLE_CODES = ('FL', 'FR', 'NL', 'NR')
+
     def _get_angle_code(self, camera_name: str) -> str:
         """
-        Extract angle code from camera name.
+        Extract angle code from camera name. Returns only FL, FR, NL, or NR.
 
         Args:
             camera_name: GoPro camera name (e.g., "GoPro FL")
 
         Returns:
-            Angle code (FL, FR, NL, NR) or camera name suffix
+            Angle code: one of FL, FR, NL, NR (never UNKNOWN)
         """
         # Check explicit mapping first
         if camera_name in self.camera_angle_map:
-            return self.camera_angle_map[camera_name]
+            code = self.camera_angle_map[camera_name]
+            return code if code in self.VALID_ANGLE_CODES else 'NL'
 
         # Try to extract from camera name (e.g., "GoPro FL" -> "FL")
         if camera_name and ' ' in camera_name:
             suffix = camera_name.split(' ')[-1].upper()
-            if suffix in ['FL', 'FR', 'NL', 'NR']:
+            if suffix in self.VALID_ANGLE_CODES:
                 return suffix
 
-        return 'UNKNOWN'
+        # Fallback so we never persist UNKNOWN; sessions stay one of 4 types.
+        return 'NL'
 
     def register_recording_start(self, session_data: dict) -> str:
         """
