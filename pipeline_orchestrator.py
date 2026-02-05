@@ -54,6 +54,32 @@ def _session_display_date(session: Dict[str, Any]) -> str:
     return ''
 
 
+class SessionPipelineState:
+    """State for a single session (one angle) in the pipeline."""
+
+    def __init__(
+        self,
+        session_id: str,
+        segment_session: str,
+        angle_code: str,
+        interface_id: str,
+        session_date: str = '',
+        display_label: str = ''
+    ):
+        self.session_id = session_id
+        self.segment_session = segment_session
+        self.angle_code = angle_code
+        self.interface_id = interface_id
+        self.session_date = session_date  # MM/DD/YYYY for UI
+        self.display_label = display_label  # e.g. "02/02/2026 NR" for Sessions list
+        self.status = 'pending'
+        self.chapters_total = 0
+        self.chapters_uploaded = 0
+        self.bytes_uploaded = 0
+        self.s3_prefix = None
+        self.error = None
+
+
 def _make_session_state(session: Dict[str, Any]) -> SessionPipelineState:
     """Build SessionPipelineState from Firebase session doc; includes display_label for UI."""
     angle = _normalize_angle_code(session.get('angleCode'))
@@ -79,32 +105,6 @@ class PipelineStage(str, Enum):
     CLEANUP = 'cleanup'
     COMPLETED = 'completed'
     FAILED = 'failed'
-
-
-class SessionPipelineState:
-    """State for a single session (one angle) in the pipeline."""
-
-    def __init__(
-        self,
-        session_id: str,
-        segment_session: str,
-        angle_code: str,
-        interface_id: str,
-        session_date: str = '',
-        display_label: str = ''
-    ):
-        self.session_id = session_id
-        self.segment_session = segment_session
-        self.angle_code = angle_code
-        self.interface_id = interface_id
-        self.session_date = session_date  # MM/DD/YYYY for UI
-        self.display_label = display_label  # e.g. "02/02/2026 NR" for Sessions list
-        self.status = 'pending'
-        self.chapters_total = 0
-        self.chapters_uploaded = 0
-        self.bytes_uploaded = 0
-        self.s3_prefix = None
-        self.error = None
 
 
 class GameProcessingState:
