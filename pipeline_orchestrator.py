@@ -284,6 +284,21 @@ class PipelineOrchestrator:
         for i, session in enumerate(sessions):
             session_id = session['id']
             interface_id = session.get('interfaceId', '')
+            existing_s3_prefix = session.get('s3Prefix')
+
+            # Skip upload if session already has chapters in S3
+            if existing_s3_prefix:
+                logger.info(f"[Pipeline {pipeline_id}] Session {session_id} already uploaded to {existing_s3_prefix}, skipping upload")
+                self._update_session_state(pipeline_id, session_id, {
+                    'status': 'completed',
+                    's3_prefix': existing_s3_prefix,
+                    'chapters_uploaded': session.get('totalChapters', 0),
+                    'skipped': True
+                })
+                with self._lock:
+                    self._pipelines[pipeline_id]['sessions_uploaded'] += 1
+                continue
+
             gopro_ip = gopro_connections.get(interface_id)
 
             if not gopro_ip:

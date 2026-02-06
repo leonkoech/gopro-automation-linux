@@ -1036,37 +1036,53 @@ def _start_auto_pipeline_internal(auto_delete_sd: bool = True, from_background: 
         }), 503
 
     try:
-        # Get pending sessions
-        sessions = firebase_service.get_sessions_pending_upload(
-            jetson_id=firebase_service.jetson_id
+        # Get ALL stopped sessions for this Jetson (both pending and already uploaded)
+        all_sessions = firebase_service.get_recording_sessions(
+            jetson_id=firebase_service.jetson_id,
+            limit=50
         )
+
+        # Filter to stopped sessions only
+        sessions = [s for s in all_sessions if s.get('status') == 'stopped']
+
+        # Separate into pending (no s3Prefix) and already uploaded (has s3Prefix)
+        pending_sessions = [s for s in sessions if not s.get('s3Prefix')]
+        uploaded_sessions = [s for s in sessions if s.get('s3Prefix')]
+
+        logger.info(f"[Pipeline] Found {len(pending_sessions)} pending, {len(uploaded_sessions)} already uploaded")
 
         if not sessions:
             if from_background:
-                logger.warning("[Pipeline] No pending sessions found")
+                logger.warning("[Pipeline] No stopped sessions found")
                 return None
             return jsonify({
                 'success': False,
-                'error': 'No pending sessions found'
+                'error': 'No stopped sessions found'
             }), 404
 
-        # Discover GoPro connections
+        # Discover GoPro connections ONLY for pending sessions (need to upload)
         gopro_connections = {}
-        for session in sessions:
+        for session in pending_sessions:
             interface_id = session.get('interfaceId')
             if interface_id and interface_id not in gopro_connections:
                 gopro_ip = get_gopro_wired_ip(interface_id)
                 if gopro_ip:
                     gopro_connections[interface_id] = gopro_ip
 
-        if not gopro_connections:
+        # If we have pending sessions but no GoPro connections, that's an error
+        # But if ALL sessions are already uploaded, we don't need GoPro connections
+        if pending_sessions and not gopro_connections:
             if from_background:
-                logger.error("[Pipeline] No GoPro cameras found")
+                logger.error("[Pipeline] No GoPro cameras found for pending sessions")
                 return None
             return jsonify({
                 'success': False,
-                'error': 'No GoPro cameras found'
+                'error': 'No GoPro cameras found for pending sessions. Chapters need to be uploaded first.'
             }), 400
+
+        # If no pending sessions but we have uploaded sessions, proceed without GoPro
+        if not pending_sessions and uploaded_sessions:
+            logger.info("[Pipeline] All sessions already uploaded, proceeding to game detection")
 
         # Start pipeline
         pipeline_id = orchestrator.start_pipeline(
