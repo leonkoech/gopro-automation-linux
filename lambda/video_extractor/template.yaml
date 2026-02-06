@@ -1,0 +1,81 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Video Extractor Lambda - Extracts game clips from S3 video chapters
+
+Globals:
+  Function:
+    Timeout: 900  # 15 minutes max
+    MemorySize: 3008  # 3 GB for video processing
+
+Resources:
+  VideoExtractorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: uball-video-extractor
+      Description: Extracts game video clips from S3 chapters using FFmpeg
+      Handler: handler.handler
+      Runtime: python3.11
+      Architectures:
+        - x86_64
+      MemorySize: 3008  # 3 GB - good balance for video processing
+      Timeout: 900  # 15 minutes
+      EphemeralStorage:
+        Size: 10240  # 10 GB for temp video files
+
+      # FFmpeg Lambda Layer - provides /opt/bin/ffmpeg
+      Layers:
+        - !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:layer:ffmpeg:1
+        # Alternative public layer (if you don't have your own):
+        # - arn:aws:lambda:us-east-1:678705476278:layer:ffmpeg:1
+
+      Environment:
+        Variables:
+          FFMPEG_PATH: /opt/bin/ffmpeg
+          FFPROBE_PATH: /opt/bin/ffprobe
+
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - s3:GetObject
+                - s3:PutObject
+                - s3:ListBucket
+              Resource:
+                - arn:aws:s3:::uball-videos-production
+                - arn:aws:s3:::uball-videos-production/*
+                - arn:aws:s3:::uball-core-videos-production
+                - arn:aws:s3:::uball-core-videos-production/*
+            - Effect: Allow
+              Action:
+                - batch:SubmitJob
+                - batch:DescribeJobs
+              Resource: '*'
+            - Effect: Allow
+              Action:
+                - logs:CreateLogGroup
+                - logs:CreateLogStream
+                - logs:PutLogEvents
+              Resource: '*'
+
+      Tags:
+        Project: uball
+        Component: video-processing
+
+  # CloudWatch Log Group with retention
+  VideoExtractorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${VideoExtractorFunction}
+      RetentionInDays: 14
+
+Outputs:
+  FunctionArn:
+    Description: Video Extractor Lambda ARN
+    Value: !GetAtt VideoExtractorFunction.Arn
+    Export:
+      Name: UballVideoExtractorArn
+
+  FunctionName:
+    Description: Video Extractor Lambda Name
+    Value: !Ref VideoExtractorFunction

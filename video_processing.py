@@ -1167,6 +1167,114 @@ class VideoProcessor:
 
         return chapters
 
+    def download_s3_chapters_to_local(
+        self,
+        chapters: List[Dict[str, Any]],
+        s3_client,
+        bucket: str,
+        session_id: str
+    ) -> List[Dict[str, Any]]:
+        """
+        Download S3 chapters to local temp directory for FFmpeg processing.
+
+        The Jetson's FFmpeg is compiled without HTTPS protocol support, so we must
+        download S3 chapters to local disk before FFmpeg can process them.
+
+        Args:
+            chapters: List of chapter info dicts (must have 's3_key' for S3 chapters)
+            s3_client: boto3 S3 client instance
+            bucket: S3 bucket name
+            session_id: Session ID for temp directory naming
+
+        Returns:
+            Updated list of chapters with 'path' pointing to local files
+            and 'local_temp_path' for cleanup tracking
+        """
+        import shutil
+
+        # Create temp directory for this session
+        temp_dir = f"/tmp/game_extraction/{session_id}"
+        os.makedirs(temp_dir, exist_ok=True)
+        logger.info(f"Downloading S3 chapters to: {temp_dir}")
+
+        updated_chapters = []
+        for chapter in chapters:
+            # Check if this is an S3 chapter
+            s3_key = chapter.get('s3_key')
+            if not s3_key:
+                # Local chapter - keep as is
+                updated_chapters.append(chapter)
+                continue
+
+            filename = chapter.get('filename', os.path.basename(s3_key))
+            local_path = os.path.join(temp_dir, filename)
+
+            try:
+                # Download from S3 to local temp
+                logger.info(f"  Downloading: {filename} ({chapter.get('size_mb', '?')} MB)")
+                s3_client.download_file(bucket, s3_key, local_path)
+
+                # Verify file was downloaded
+                if not os.path.exists(local_path):
+                    logger.error(f"  Download failed - file not created: {local_path}")
+                    continue
+
+                local_size = os.path.getsize(local_path)
+                logger.info(f"  Downloaded: {filename} ({local_size / (1024*1024):.1f} MB)")
+
+                # Update chapter with local path
+                updated_chapter = chapter.copy()
+                updated_chapter['path'] = local_path
+                updated_chapter['local_temp_path'] = local_path  # For cleanup tracking
+                updated_chapter['source'] = 's3_downloaded'
+
+                # Get accurate duration from local file
+                duration = self._get_video_duration(local_path)
+                if duration:
+                    updated_chapter['duration_seconds'] = duration
+                    updated_chapter['duration_str'] = self._format_duration(duration)
+
+                updated_chapters.append(updated_chapter)
+
+            except Exception as e:
+                logger.error(f"  Failed to download {filename}: {e}")
+                # Keep original chapter info for error tracking
+                updated_chapters.append(chapter)
+
+        logger.info(f"Downloaded {len([c for c in updated_chapters if c.get('local_temp_path')])} of {len(chapters)} chapters")
+        return updated_chapters
+
+    def cleanup_temp_chapters(self, chapters: List[Dict[str, Any]]) -> None:
+        """
+        Clean up downloaded temp chapter files after extraction.
+
+        Args:
+            chapters: List of chapter info dicts (with 'local_temp_path' for temp files)
+        """
+        import shutil
+
+        # Find unique temp directories to clean up
+        temp_dirs = set()
+        for chapter in chapters:
+            temp_path = chapter.get('local_temp_path')
+            if temp_path and os.path.exists(temp_path):
+                temp_dir = os.path.dirname(temp_path)
+                temp_dirs.add(temp_dir)
+                try:
+                    os.remove(temp_path)
+                    logger.debug(f"Cleaned up temp file: {temp_path}")
+                except Exception as e:
+                    logger.warning(f"Failed to remove temp file {temp_path}: {e}")
+
+        # Remove temp directories if empty
+        for temp_dir in temp_dirs:
+            try:
+                if os.path.exists(temp_dir) and not os.listdir(temp_dir):
+                    os.rmdir(temp_dir)
+                    logger.info(f"Removed empty temp directory: {temp_dir}")
+            except Exception as e:
+                logger.warning(f"Failed to remove temp dir {temp_dir}: {e}")
+
     def get_session_chapters_auto(
         self,
         session: Dict[str, Any],
@@ -1357,6 +1465,25 @@ def process_game_videos(
             # Calculate progress for this session (15-90% range for processing)
             session_base_progress = 15 + (session_idx * 75 // total_sessions)
 
+            # ============================================================
+            # SKIP CHECK: Was this game already processed for this session?
+            # ============================================================
+            processed_games = session.get('processedGames', [])
+            already_processed = any(
+                pg.get('firebase_game_id') == firebase_game_id
+                for pg in processed_games
+            )
+            if already_processed:
+                logger.info(f"[SKIP] Game {firebase_game_id} already processed for session {session_name} ({angle_code})")
+                # Add to results as skipped (not an error)
+                results['processed_videos'].append({
+                    'angle': angle_code,
+                    'session_id': session['id'],
+                    'status': 'skipped',
+                    'skip_reason': 'already_processed'
+                })
+                continue
+
             logger.info(f"Processing session: {session_name} (angle: {angle_code})")
             report_progress('extracting', f'Extracting {angle_code} video...', session_base_progress, angle_code)
 
@@ -1433,22 +1560,114 @@ def process_game_videos(
                     continue
 
                 # 1. Extract 4K and stream directly to S3 raw/ prefix
-                # No temp file needed - streams FFmpeg output directly to S3
                 raw_s3_key = batch_transcoder.generate_raw_s3_key(
                     location, game_date, uball_game_id, angle_code
                 )
 
-                logger.info(f"[AWS GPU] Streaming 4K directly to S3 (no temp file)")
-                report_progress('extracting', f'Extracting & streaming 4K {angle_code} to S3...', session_base_progress, angle_code)
-
-                raw_s3_uri = video_processor.extract_4k_stream_to_s3(
-                    params['chapters_needed'],
-                    params['offset_seconds'],
-                    params['duration_seconds'],
-                    upload_service,
-                    raw_s3_key,
-                    add_buffer=30.0
+                # Check if chapters are from S3 (need Lambda extraction)
+                chapters_from_s3 = any(
+                    ch.get('source') == 's3' for ch in params['chapters_needed']
                 )
+
+                if chapters_from_s3:
+                    # =======================================================
+                    # LAMBDA PATH: Extract 4K + Submit Batch (one Lambda call)
+                    # Lambda handles: read S3 → extract → upload raw → submit Batch
+                    # =======================================================
+                    logger.info(f"[AWS GPU] Chapters in S3 - using Lambda for 4K extraction + Batch submit")
+                    report_progress('extracting', f'Lambda extracting 4K {angle_code}...', session_base_progress, angle_code)
+
+                    from lambda_extractor import get_lambda_extractor
+
+                    # Build batch config for Lambda to submit job directly
+                    batch_config = {
+                        'job_queue': batch_transcoder.job_queue,
+                        'job_definition': batch_transcoder.job_definition,
+                        'final_s3_key': s3_key,
+                        'game_id': firebase_game_id,
+                        'angle': angle_code
+                    }
+
+                    try:
+                        lambda_extractor = get_lambda_extractor()
+                        lambda_result = lambda_extractor.extract_game_clip(
+                            chapters=params['chapters_needed'],
+                            bucket=upload_service.bucket_name,
+                            offset_seconds=params['offset_seconds'],
+                            duration_seconds=params['duration_seconds'],
+                            output_s3_key=raw_s3_key,
+                            compress_to_1080p=False,  # 4K stream copy - no compression
+                            add_buffer_seconds=30.0,
+                            batch_config=batch_config  # Lambda submits Batch job
+                        )
+
+                        if not lambda_result.get('success'):
+                            error_msg = lambda_result.get('error', 'Unknown Lambda error')
+                            results['errors'].append(f"Lambda 4K extraction failed for {angle_code}: {error_msg}")
+                            continue
+
+                        raw_s3_uri = lambda_result.get('output_s3_uri')
+                        batch_job = lambda_result.get('batch_job', {})
+                        logger.info(f"[AWS GPU] Lambda extracted 4K to: {raw_s3_uri}")
+
+                        # Check if Batch job was submitted by Lambda
+                        if batch_job.get('job_id'):
+                            logger.info(f"[AWS GPU] Lambda submitted Batch job: {batch_job['job_id']}")
+
+                            # Track batch job info
+                            batch_job_info = {
+                                'job_id': batch_job['job_id'],
+                                'job_name': batch_job.get('job_name', ''),
+                                'job_queue': batch_job.get('job_queue', 'unknown'),
+                                'angle': angle_code,
+                                'raw_s3_key': raw_s3_key,
+                                'final_s3_key': s3_key,
+                                'session_id': session['id'],
+                                'filename': output_filename,
+                                'duration': params['duration_seconds'],
+                                'file_size_bytes': lambda_result.get('output_size_bytes', 0),
+                                'status': 'SUBMITTED',
+                                'submitted_by': 'lambda'
+                            }
+                            results['batch_jobs'].append(batch_job_info)
+
+                            # Update recording session with pending Batch job info
+                            firebase_service.add_processed_game(session['id'], {
+                                'firebase_game_id': firebase_game_id,
+                                'game_number': game_number,
+                                'extracted_filename': output_filename,
+                                's3_key': s3_key,
+                                'batch_job_id': batch_job['job_id'],
+                                'batch_status': 'pending',
+                                'extraction_method': 'lambda'
+                            })
+
+                            # Lambda path complete - continue to next session
+                            continue
+                        else:
+                            # Lambda extraction succeeded but Batch submit failed
+                            batch_error = batch_job.get('error', 'Unknown batch error')
+                            logger.error(f"[AWS GPU] Lambda Batch submit failed: {batch_error}")
+                            results['errors'].append(f"Batch submit failed for {angle_code}: {batch_error}")
+                            continue
+
+                    except Exception as e:
+                        logger.error(f"[AWS GPU] Lambda error for {angle_code}: {e}")
+                        results['errors'].append(f"Lambda 4K extraction error for {angle_code}: {str(e)}")
+                        continue
+                else:
+                    # Local chapters - use existing Jetson extraction
+                    logger.info(f"[AWS GPU] Streaming 4K directly to S3 (no temp file)")
+                    report_progress('extracting', f'Extracting & streaming 4K {angle_code} to S3...', session_base_progress, angle_code)
+
+                    raw_s3_uri = video_processor.extract_4k_stream_to_s3(
+                        params['chapters_needed'],
+                        params['offset_seconds'],
+                        params['duration_seconds'],
+                        upload_service,
+                        raw_s3_key,
+                        add_buffer=30.0
+                    )
 
                 if not raw_s3_uri:
                     results['errors'].append(f"4K stream to S3 failed for {angle_code}")
@@ -1511,7 +1730,120 @@ def process_game_videos(
 
             else:
                 # ===========================================================
-                # SLOW PATH: Existing Jetson CPU encoding (libx264)
+                # Check if chapters are from S3 (need Lambda extraction)
+                # ===========================================================
+                chapters_from_s3 = any(
+                    ch.get('source') == 's3' for ch in params['chapters_needed']
+                )
+
+                if chapters_from_s3 and upload_service:
+                    # ===========================================================
+                    # LAMBDA PATH: Chapters in S3 - use Lambda for extraction
+                    # Jetson FFmpeg doesn't support HTTPS protocol
+                    # ===========================================================
+                    logger.info(f"[Lambda] Chapters are in S3 - using Lambda extraction for {angle_code}")
+                    report_progress('extracting', f'Lambda extracting {angle_code}...', session_base_progress, angle_code)
+
+                    from lambda_extractor import get_lambda_extractor
+
+                    try:
+                        lambda_extractor = get_lambda_extractor()
+                        lambda_result = lambda_extractor.extract_game_clip(
+                            chapters=params['chapters_needed'],
+                            bucket=upload_service.bucket_name,
+                            offset_seconds=params['offset_seconds'],
+                            duration_seconds=params['duration_seconds'],
+                            output_s3_key=s3_key,
+                            compress_to_1080p=True,
+                            add_buffer_seconds=30.0
+                        )
+
+                        if not lambda_result.get('success'):
+                            error_msg = lambda_result.get('error', 'Unknown Lambda error')
+                            logger.error(f"[Lambda] Extraction failed for {angle_code}: {error_msg}")
+                            results['errors'].append(f"Lambda extraction failed for {angle_code}: {error_msg}")
+                            continue
+
+                        # Lambda succeeded - get result info
+                        s3_uri = lambda_result.get('output_s3_uri')
+                        output_size_bytes = lambda_result.get('output_size_bytes', 0)
+                        processing_time = lambda_result.get('processing_time_seconds', 0)
+
+                        logger.info(f"[Lambda] Extracted {angle_code} in {processing_time}s")
+                        logger.info(f"[Lambda] Output: {s3_uri} ({output_size_bytes / (1024*1024):.1f} MB)")
+
+                        video_info = {
+                            'size_bytes': output_size_bytes,
+                            'duration': params['duration_seconds'],
+                        }
+
+                        report_progress('uploaded', f'{angle_code} extracted via Lambda', session_base_progress + 25, angle_code)
+
+                        # Update recording session with processed game info
+                        firebase_service.add_processed_game(session['id'], {
+                            'firebase_game_id': firebase_game_id,
+                            'game_number': game_number,
+                            'extracted_filename': output_filename,
+                            's3_key': s3_key,
+                            'extraction_method': 'lambda'
+                        })
+
+                        video_result = {
+                            'angle': angle_code,
+                            'session_id': session['id'],
+                            'filename': output_filename,
+                            's3_key': s3_key,
+                            's3_uri': s3_uri,
+                            'duration': video_info.get('duration'),
+                            'size_bytes': video_info.get('size_bytes', 0),
+                            'size_mb': round(video_info.get('size_bytes', 0) / (1024 * 1024), 2),
+                            'extraction_method': 'lambda'
+                        }
+
+                        results['processed_videos'].append(video_result)
+
+                        # Register FL/FR videos in Uball Backend
+                        if uball_client and angle_code in ['FL', 'FR']:
+                            report_progress('registering', f'Registering {angle_code} in Uball...', session_base_progress + 30, angle_code)
+                            try:
+                                uball_result = uball_client.register_game_video(
+                                    firebase_game_id=firebase_game_id,
+                                    s3_key=s3_key,
+                                    angle_code=angle_code,
+                                    filename=output_filename,
+                                    duration=video_info.get('duration'),
+                                    file_size=video_info.get('size_bytes'),
+                                    s3_bucket=s3_bucket
+                                )
+
+                                if uball_result:
+                                    logger.info(f"Registered {angle_code} video in Uball: {uball_result.get('id')}")
+                                    results['registered_videos'].append({
+                                        'angle': angle_code,
+                                        'uball_video_id': uball_result.get('id'),
+                                        's3_key': s3_key
+                                    })
+                                else:
+                                    logger.warning(f"Failed to register {angle_code} video in Uball")
+                                    results['errors'].append(f"Uball registration failed for {angle_code}")
+
+                            except Exception as e:
+                                logger.error(f"Uball registration error for {angle_code}: {e}")
+                                results['errors'].append(f"Uball registration error for {angle_code}: {str(e)}")
+
+                        # Lambda path complete - continue to next session
+                        continue
+
+                    except Exception as e:
+                        logger.error(f"[Lambda] Error for {angle_code}: {e}")
+                        import traceback
+                        traceback.print_exc()
+                        results['errors'].append(f"Lambda extraction error for {angle_code}: {str(e)}")
+                        continue
+
+                # ===========================================================
+                # LOCAL PATH: Existing Jetson CPU encoding (libx264)
+                # Used when chapters are on local disk (not in S3)
                 # ===========================================================
 
                 # Extract the clip — streams directly to S3 if upload_service is available
