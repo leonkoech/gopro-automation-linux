@@ -31,7 +31,7 @@ Document Structure:
 
 import os
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional, List, Dict, Any
 
 import firebase_admin
@@ -198,6 +198,14 @@ class FirebaseService:
             'processedGames': firestore.ArrayUnion([processed_game])
         })
 
+    def _to_utc_iso(self, dt: datetime) -> str:
+        """Return datetime as ISO 8601 UTC string (e.g. 2026-02-02T14:09:46.000Z) for Firestore."""
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        utc = dt.astimezone(timezone.utc)
+        s = utc.isoformat().replace('+00:00', '')
+        return s + 'Z' if not s.endswith('Z') else s
+
     def get_games_in_timerange(self, start: datetime, end: datetime) -> List[Dict[str, Any]]:
         """
         Fetch games from basketball-games that overlap with the given time range.
@@ -206,18 +214,19 @@ class FirebaseService:
         - Game started before recording ended AND
         - Game ended after recording started (or game hasn't ended yet)
 
+        All timestamps must be stored in Firebase as UTC (ISO 8601 with Z) for correct matching.
+
         Args:
-            start: Start of time range (recording start time)
-            end: End of time range (recording end time)
+            start: Start of time range (recording start time, UTC)
+            end: End of time range (recording end time, UTC)
 
         Returns:
             List of game documents that overlap with the time range
         """
         games_ref = self.db.collection(self.BASKETBALL_GAMES_COLLECTION)
 
-        # Convert to ISO format strings for Firestore comparison
-        start_iso = start.isoformat() + 'Z' if not start.isoformat().endswith('Z') else start.isoformat()
-        end_iso = end.isoformat() + 'Z' if not end.isoformat().endswith('Z') else end.isoformat()
+        start_iso = self._to_utc_iso(start)
+        end_iso = self._to_utc_iso(end)
 
         # Query games that started before our recording ended
         # We'll filter further in Python for games that ended after our recording started

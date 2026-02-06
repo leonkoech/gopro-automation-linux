@@ -181,9 +181,10 @@ class PipelineOrchestrator:
         earliest_start = None
         latest_end = None
 
+        # Use startedAt/endedAt from Firebase (ISO 8601 UTC). All timestamps must be UTC for matching.
         for session in sessions:
-            start = session.get('recordingStart')
-            end = session.get('recordingEnd')
+            start = session.get('startedAt')
+            end = session.get('endedAt')
             if start:
                 start_dt = datetime.fromisoformat(start.replace('Z', '+00:00'))
                 if earliest_start is None or start_dt < earliest_start:
@@ -378,16 +379,18 @@ class PipelineOrchestrator:
             'progress': 40
         })
 
-        # Get pipeline state for timerange
+        # Get pipeline state for timerange (stored as ISO strings; parse to UTC datetime for query)
         with self._lock:
             pipeline = self._pipelines[pipeline_id]
-            recording_start = pipeline.get('recording_start')
-            recording_end = pipeline.get('recording_end')
+            recording_start_str = pipeline.get('recording_start')
+            recording_end_str = pipeline.get('recording_end')
 
         games = []
-        if recording_start and recording_end:
+        if recording_start_str and recording_end_str:
             try:
-                games = self.firebase_service.get_games_in_timerange(recording_start, recording_end)
+                start_dt = datetime.fromisoformat(recording_start_str.replace('Z', '+00:00'))
+                end_dt = datetime.fromisoformat(recording_end_str.replace('Z', '+00:00'))
+                games = self.firebase_service.get_games_in_timerange(start_dt, end_dt)
                 logger.info(f"[Pipeline {pipeline_id}] Found {len(games)} games in timerange")
             except Exception as e:
                 logger.warning(f"[Pipeline {pipeline_id}] Failed to detect games: {e}")
