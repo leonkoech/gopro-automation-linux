@@ -4652,9 +4652,10 @@ if firebase_service and upload_service:
             firebase_service=firebase_service,
             upload_service=upload_service,
             video_processor=video_processor,
+            uball_client=uball_client,
             batch_enabled=use_aws_gpu
         )
-        print(f"✓ Pipeline orchestrator initialized")
+        print(f"✓ Pipeline orchestrator initialized (uball_client: {'yes' if uball_client else 'no'})")
     except Exception as e:
         print(f"⚠ Failed to initialize pipeline orchestrator: {e}")
 

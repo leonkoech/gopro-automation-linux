@@ -151,12 +151,14 @@ class PipelineOrchestrator:
         firebase_service,
         upload_service,
         video_processor,
+        uball_client=None,
         batch_enabled: bool = True
     ):
         self.jetson_id = jetson_id
         self.firebase_service = firebase_service
         self.upload_service = upload_service
         self.video_processor = video_processor
+        self.uball_client = uball_client
         self.batch_enabled = batch_enabled
 
         # Pipeline tracking
@@ -488,7 +490,8 @@ class PipelineOrchestrator:
                     location=self.jetson_id,
                     video_processor=self.video_processor,
                     firebase_service=self.firebase_service,
-                    upload_service=self.upload_service
+                    upload_service=self.upload_service,
+                    uball_client=self.uball_client
                 )
 
                 if result.get('success'):
@@ -651,6 +654,7 @@ def init_orchestrator(
     firebase_service,
     upload_service,
     video_processor,
+    uball_client=None,
     batch_enabled: bool = True
 ) -> PipelineOrchestrator:
     """Initialize the global pipeline orchestrator."""
@@ -660,6 +664,7 @@ def init_orchestrator(
         firebase_service=firebase_service,
         upload_service=upload_service,
         video_processor=video_processor,
+        uball_client=uball_client,
         batch_enabled=batch_enabled
     )
     return _orchestrator
