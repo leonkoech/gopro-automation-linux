@@ -1484,6 +1484,20 @@ def process_game_videos(
                 })
                 continue
 
+            # ============================================================
+            # SKIP CHECK: Skip sessions with UNK/UNKNOWN angle codes
+            # These sessions don't have proper camera angle mapping configured
+            # ============================================================
+            if angle_code.upper() in ('UNK', 'UNKNOWN', 'NONE', ''):
+                logger.info(f"[SKIP] Session {session_name} has unknown angle ({angle_code}) - skipping")
+                results['processed_videos'].append({
+                    'angle': angle_code,
+                    'session_id': session['id'],
+                    'status': 'skipped',
+                    'skip_reason': 'unknown_angle'
+                })
+                continue
+
             logger.info(f"Processing session: {session_name} (angle: {angle_code})")
             report_progress('extracting', f'Extracting {angle_code} video...', session_base_progress, angle_code)
 

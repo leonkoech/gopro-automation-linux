@@ -30,7 +30,14 @@ def _normalize_angle_code(angle_code: Optional[str]) -> str:
     """Return angle code as one of FL, FR, NL, NR for consistent UI display."""
     if angle_code and str(angle_code).upper() in ('FL', 'FR', 'NL', 'NR'):
         return str(angle_code).upper()
-    return 'NL'
+    return 'UNK'
+
+
+def _is_valid_angle(angle_code: Optional[str]) -> bool:
+    """Check if angle code is a valid camera angle (FL, FR, NL, NR)."""
+    if not angle_code:
+        return False
+    return str(angle_code).upper() in ('FL', 'FR', 'NL', 'NR')
 
 
 def _session_display_date(session: Dict[str, Any]) -> str:
@@ -194,6 +201,17 @@ class PipelineOrchestrator:
                 if latest_end is None or end_dt > latest_end:
                     latest_end = end_dt
 
+        # Filter out sessions with UNK/unknown angles early
+        valid_sessions = [s for s in sessions if _is_valid_angle(s.get('angleCode'))]
+        skipped_unk_sessions = [s for s in sessions if not _is_valid_angle(s.get('angleCode'))]
+
+        if skipped_unk_sessions:
+            skipped_angles = [s.get('angleCode', 'NONE') for s in skipped_unk_sessions]
+            logger.info(f"[Pipeline {pipeline_id}] Skipping {len(skipped_unk_sessions)} sessions with unknown angles: {skipped_angles}")
+
+        # Use valid_sessions for the rest of the pipeline
+        sessions = valid_sessions
+
         # Initialize pipeline state
         with self._lock:
             self._pipelines[pipeline_id] = {
@@ -210,6 +228,7 @@ class PipelineOrchestrator:
                     for s in sessions
                 },
                 'sessions_total': len(sessions),
+                'sessions_skipped_unk': len(skipped_unk_sessions),  # Track skipped UNK sessions
                 'sessions_uploaded': 0,
 
                 # Games

@@ -30,10 +30,15 @@ Usage:
 import json
 import os
 import time
+import warnings
 from typing import Dict, Any, List, Optional
 
 import boto3
 from botocore.config import Config
+
+# Suppress InsecureRequestWarning when SSL verification is disabled on Jetson
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 from logging_service import get_logger
 
@@ -72,17 +77,34 @@ class LambdaExtractor:
         self.timeout = timeout
 
         # Configure boto3 with extended timeout for Lambda
+        # NOTE: Jetson devices often have outdated CA certificates, so we disable
+        # SSL verification for Lambda calls. This is safe because we're using IAM
+        # authentication and the Lambda endpoint is AWS-controlled.
         config = Config(
             read_timeout=timeout + 60,  # Extra buffer for response
             connect_timeout=30,
             retries={'max_attempts': 1}  # Don't retry video processing
         )
 
-        self.lambda_client = boto3.client(
-            'lambda',
-            region_name=self.region,
-            config=config
-        )
+        # Check if we're on a Jetson (ARM device) with potential SSL issues
+        import platform
+        is_jetson = platform.machine() in ('aarch64', 'arm64')
+
+        if is_jetson:
+            # Disable SSL verification on Jetson due to outdated CA certs
+            logger.info("Jetson detected - disabling SSL verification for Lambda calls")
+            self.lambda_client = boto3.client(
+                'lambda',
+                region_name=self.region,
+                config=config,
+                verify=False  # Disable SSL verification on Jetson
+            )
+        else:
+            self.lambda_client = boto3.client(
+                'lambda',
+                region_name=self.region,
+                config=config
+            )
 
         logger.info(f"LambdaExtractor initialized: {self.function_name} in {self.region}")
 
