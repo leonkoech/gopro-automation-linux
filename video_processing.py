@@ -1372,8 +1372,8 @@ def process_game_videos(
 
     report_progress('initializing', 'Loading game data...', 5)
 
-    # Get Uball game ID for S3 folder structure - REQUIRED for processing
-    # Games MUST be synced to Uball first via "Sync to Uball" button in Game Logs
+    # Get Uball game ID for S3 folder structure
+    # Auto-sync to Uball if not already synced
     uball_game_id = None
     if uball_client:
         uball_game = uball_client.get_game_by_firebase_id(firebase_game_id)
@@ -1382,9 +1382,82 @@ def process_game_videos(
             results['uball_game_id'] = uball_game_id
             logger.info(f"Found Uball game: {uball_game_id}")
         else:
-            logger.error(f"[SYNC REQUIRED] Game not synced to Uball - Firebase ID: {firebase_game_id}")
-            results['errors'].append("Game not synced to Uball - please sync via 'Sync to Uball' button in Game Logs first")
-            return results
+            # Auto-sync: Game not in Uball, create it automatically
+            logger.info(f"[AUTO-SYNC] Game not synced to Uball - syncing automatically...")
+
+            try:
+                # Get game data from Firebase for sync
+                firebase_game = firebase_service.get_game(firebase_game_id)
+                if not firebase_game:
+                    results['errors'].append(f"Game not found in Firebase: {firebase_game_id}")
+                    return results
+
+                # Check if Firebase already has uballGameId (synced but not in Uball lookup)
+                if firebase_game.get('uballGameId'):
+                    uball_game_id = firebase_game['uballGameId']
+                    results['uball_game_id'] = uball_game_id
+                    logger.info(f"[AUTO-SYNC] Found uballGameId in Firebase: {uball_game_id}")
+                else:
+                    # Create teams in Uball
+                    left_team = firebase_game.get('leftTeam', {})
+                    right_team = firebase_game.get('rightTeam', {})
+                    team1_name = left_team.get('name', 'Team 1')
+                    team2_name = right_team.get('name', 'Team 2')
+
+                    logger.info(f"[AUTO-SYNC] Creating teams: {team1_name} vs {team2_name}")
+
+                    created_team1 = uball_client.create_team(team1_name)
+                    if not created_team1:
+                        results['errors'].append(f"Failed to create team: {team1_name}")
+                        return results
+                    team1_id = str(created_team1.get('id'))
+
+                    created_team2 = uball_client.create_team(team2_name)
+                    if not created_team2:
+                        results['errors'].append(f"Failed to create team: {team2_name}")
+                        return results
+                    team2_id = str(created_team2.get('id'))
+
+                    # Create game in Uball
+                    created_at = firebase_game.get('createdAt', '')
+                    ended_at = firebase_game.get('endedAt')
+                    game_date_str = created_at[:10] if created_at else datetime.now().strftime('%Y-%m-%d')
+
+                    uball_game_data = {
+                        'firebase_game_id': firebase_game_id,
+                        'date': game_date_str,
+                        'team1_id': team1_id,
+                        'team2_id': team2_id,
+                        'start_time': created_at if created_at else None,
+                        'end_time': ended_at if ended_at else None,
+                        'source': 'firebase',
+                        'video_name': f"{team1_name} vs {team2_name}"
+                    }
+
+                    # Add scores if available
+                    if left_team.get('finalScore') is not None:
+                        uball_game_data['team1_score'] = left_team['finalScore']
+                    if right_team.get('finalScore') is not None:
+                        uball_game_data['team2_score'] = right_team['finalScore']
+
+                    logger.info(f"[AUTO-SYNC] Creating game in Uball...")
+                    uball_game = uball_client.create_game(uball_game_data)
+
+                    if not uball_game:
+                        results['errors'].append("Failed to create game in Uball Backend")
+                        return results
+
+                    uball_game_id = str(uball_game.get('id', ''))
+                    results['uball_game_id'] = uball_game_id
+
+                    # Mark game as synced in Firebase
+                    firebase_service.mark_game_synced(firebase_game_id, uball_game_id)
+                    logger.info(f"[AUTO-SYNC] SUCCESS: Firebase {firebase_game_id} -> Uball {uball_game_id}")
+
+            except Exception as e:
+                logger.error(f"[AUTO-SYNC] Failed to auto-sync game: {e}")
+                results['errors'].append(f"Auto-sync failed: {str(e)}")
+                return results
     else:
         logger.error("[SYNC REQUIRED] Uball client not available - cannot determine game ID for S3 path")
         results['errors'].append("Uball client not configured - cannot process videos")
