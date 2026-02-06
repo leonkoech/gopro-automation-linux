@@ -1372,7 +1372,8 @@ def process_game_videos(
 
     report_progress('initializing', 'Loading game data...', 5)
 
-    # Get Uball game ID for S3 folder structure
+    # Get Uball game ID for S3 folder structure - REQUIRED for processing
+    # Games MUST be synced to Uball first via "Sync to Uball" button in Game Logs
     uball_game_id = None
     if uball_client:
         uball_game = uball_client.get_game_by_firebase_id(firebase_game_id)
@@ -1381,8 +1382,13 @@ def process_game_videos(
             results['uball_game_id'] = uball_game_id
             logger.info(f"Found Uball game: {uball_game_id}")
         else:
-            logger.warning(f"Uball game not found for Firebase ID: {firebase_game_id}")
-            results['errors'].append("Game not synced to Uball - sync first before processing")
+            logger.error(f"[SYNC REQUIRED] Game not synced to Uball - Firebase ID: {firebase_game_id}")
+            results['errors'].append("Game not synced to Uball - please sync via 'Sync to Uball' button in Game Logs first")
+            return results
+    else:
+        logger.error("[SYNC REQUIRED] Uball client not available - cannot determine game ID for S3 path")
+        results['errors'].append("Uball client not configured - cannot process videos")
+        return results
 
     try:
         # 1. Get game from Firebase
@@ -1574,8 +1580,11 @@ def process_game_videos(
                     continue
 
                 # 1. Extract 4K and stream directly to S3 raw/ prefix
+                # Use COURT_LOCATION env var (default "court-a") instead of jetson_id
+                court_location = os.getenv('COURT_LOCATION', 'court-a')
+                # Use uball_game_id for S3 path (required - games must be synced first)
                 raw_s3_key = batch_transcoder.generate_raw_s3_key(
-                    location, game_date, uball_game_id, angle_code
+                    court_location, game_date, uball_game_id, angle_code
                 )
 
                 # Check if chapters are from S3 (need Lambda extraction)
@@ -1583,11 +1592,104 @@ def process_game_videos(
                     ch.get('source') == 's3' for ch in params['chapters_needed']
                 )
 
+                # =======================================================
+                # SKIP LOGIC: Check if files already exist in S3
+                # =======================================================
+                # Generate the final 1080p S3 key for skip check
+                uuid_parts = uball_game_id.split('-')[:4]
+                game_folder = '-'.join(uuid_parts)
+                final_1080p_key = f"{court_location}/{game_date}/{game_folder}/{game_date}_{game_folder}_{angle_code}.mp4"
+
+                # Check if 1080p file already exists (skip both Lambda AND Batch)
+                try:
+                    import boto3
+                    s3_client = boto3.client('s3')
+                    bucket_name = upload_service.bucket_name
+
+                    # Check 1080p output first (if exists, skip everything)
+                    try:
+                        s3_client.head_object(Bucket=bucket_name, Key=final_1080p_key)
+                        logger.info(f"[SKIP] 1080p file already exists: s3://{bucket_name}/{final_1080p_key}")
+                        results['processed_videos'].append({
+                            'angle': angle_code,
+                            'session_id': session['id'],
+                            'status': 'skipped',
+                            'skip_reason': '1080p_exists',
+                            's3_key': final_1080p_key
+                        })
+                        continue  # Skip to next session
+                    except s3_client.exceptions.ClientError as e:
+                        if e.response['Error']['Code'] != '404':
+                            raise  # Re-raise non-404 errors
+                        # 1080p doesn't exist - check raw 4K next
+
+                    # Check if raw 4K file exists (skip Lambda, but still need Batch)
+                    raw_4k_exists = False
+                    try:
+                        s3_client.head_object(Bucket=bucket_name, Key=raw_s3_key)
+                        raw_4k_exists = True
+                        logger.info(f"[SKIP LAMBDA] Raw 4K file already exists: s3://{bucket_name}/{raw_s3_key}")
+                    except s3_client.exceptions.ClientError as e:
+                        if e.response['Error']['Code'] != '404':
+                            raise  # Re-raise non-404 errors
+                        # Raw 4K doesn't exist - need to run Lambda
+
+                except Exception as e:
+                    logger.warning(f"[SKIP CHECK] Error checking S3: {e} - proceeding with processing")
+                    raw_4k_exists = False
+
                 if chapters_from_s3:
                     # =======================================================
                     # LAMBDA PATH: Extract 4K + Submit Batch (one Lambda call)
                     # Lambda handles: read S3 → extract → upload raw → submit Batch
                     # =======================================================
+
+                    # Skip Lambda if raw 4K already exists, but still submit Batch
+                    if raw_4k_exists:
+                        logger.info(f"[AWS GPU] Skipping Lambda - raw 4K exists, submitting Batch directly")
+                        report_progress('encoding', f'Submitting Batch for {angle_code}...', session_base_progress, angle_code)
+
+                        # Submit Batch job directly (Lambda would normally do this)
+                        try:
+                            batch_job_result = batch_transcoder.submit_transcode_job(
+                                input_s3_key=raw_s3_key,
+                                output_s3_key=s3_key,
+                                game_id=firebase_game_id,
+                                angle=angle_code
+                            )
+
+                            if batch_job_result:
+                                batch_job_info = {
+                                    'job_id': batch_job_result['job_id'],
+                                    'job_name': batch_job_result.get('job_name', ''),
+                                    'job_queue': batch_transcoder.job_queue,
+                                    'angle': angle_code,
+                                    'raw_s3_key': raw_s3_key,
+                                    'final_s3_key': s3_key,
+                                    'session_id': session['id'],
+                                    'filename': output_filename,
+                                    'status': 'SUBMITTED',
+                                    'submitted_by': 'direct_skip'
+                                }
+                                results['batch_jobs'].append(batch_job_info)
+
+                                firebase_service.add_processed_game(session['id'], {
+                                    'firebase_game_id': firebase_game_id,
+                                    'game_number': game_number,
+                                    'extracted_filename': output_filename,
+                                    's3_key': s3_key,
+                                    'batch_job_id': batch_job_result['job_id'],
+                                    'batch_status': 'pending',
+                                    'extraction_method': 'skip_lambda'
+                                })
+                                continue  # Skip to next session
+                            else:
+                                logger.error(f"[AWS GPU] Direct Batch submit failed for {angle_code}")
+                        except Exception as e:
+                            logger.error(f"[AWS GPU] Direct Batch submit error: {e}")
+                            results['errors'].append(f"Direct Batch submit failed for {angle_code}: {str(e)}")
+                            continue
+
                     logger.info(f"[AWS GPU] Chapters in S3 - using Lambda for 4K extraction + Batch submit")
                     report_progress('extracting', f'Lambda extracting 4K {angle_code}...', session_base_progress, angle_code)
 

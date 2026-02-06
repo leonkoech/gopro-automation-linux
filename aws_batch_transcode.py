@@ -415,12 +415,13 @@ class AWSBatchTranscoder:
         """
         Generate S3 key for raw 4K file in raw/ prefix.
 
-        Format: raw/{location}/{date}/{game_uuid}/{angle}_4k.mp4
+        Format: raw/{location}/{date}/{game_folder}/{date}_{game_folder}_{angle}.mp4
+        Example: raw/court-a/2026-01-20/3cdc8667-bc9c-4bf6-9050/2026-01-20_3cdc8667-bc9c-4bf6-9050_NL.mp4
 
         Args:
-            location: Court/location identifier
+            location: Court/location identifier (e.g., "court-a")
             game_date: Game date (YYYY-MM-DD)
-            uball_game_id: Uball game UUID
+            uball_game_id: Uball game UUID (game must be synced to Uball first)
             angle_code: Camera angle (FL, FR, NL, NR)
 
         Returns:
@@ -431,9 +432,12 @@ class AWSBatchTranscoder:
             uuid_parts = uball_game_id.split('-')[:4]
             folder = '-'.join(uuid_parts)
         else:
+            # This shouldn't happen - games should be synced before processing
             folder = f"unknown-{game_date}"
 
-        return f"raw/{location}/{game_date}/{folder}/{angle_code}_4k.mp4"
+        # Format: {date}_{game_folder}_{angle}.mp4
+        filename = f"{game_date}_{folder}_{angle_code}.mp4"
+        return f"raw/{location}/{game_date}/{folder}/{filename}"
 
 
 def is_aws_gpu_transcode_enabled() -> bool:
