@@ -387,8 +387,8 @@ class UballClient:
                 "last_modified": int(time.time() * 1000)  # Current time in milliseconds
             }
 
-            if duration is not None:
-                payload["duration"] = duration
+            # Duration is required by video_metadata table - default to 0.0 if not provided
+            payload["duration"] = duration if duration is not None else 0.0
 
             logger.info(f"[UballClient] Registering video with payload: {payload}")
 

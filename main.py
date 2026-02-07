@@ -2288,6 +2288,129 @@ def preview_game_extraction(game_id):
         }), 500
 
 
+@app.route('/api/batch/register-completed', methods=['POST'])
+def register_completed_batch_jobs():
+    """
+    Scan recent AWS Batch jobs and register completed FL/FR videos in Uball.
+
+    This endpoint:
+    1. Lists recent SUCCEEDED Batch jobs from the transcode queue
+    2. For each FL/FR video, registers it in Uball if not already registered
+    3. Returns counts of registered videos
+
+    Call this periodically (e.g., every 5 minutes) to ensure videos are registered.
+
+    Returns:
+        { success: true, registered: 5, already_registered: 10, errors: [] }
+    """
+    if not uball_client:
+        return jsonify({
+            'success': False,
+            'error': 'Uball Backend client not configured'
+        }), 503
+
+    try:
+        import boto3
+        from botocore.config import Config as BotoConfig
+
+        # Initialize AWS clients
+        boto_config = BotoConfig(retries={'max_attempts': 3})
+        batch_client = boto3.client('batch', region_name='us-east-1', config=boto_config)
+        s3_client = boto3.client('s3', region_name='us-east-1', config=boto_config)
+
+        bucket = os.getenv('UPLOAD_BUCKET', 'uball-videos-production')
+        job_queue = os.getenv('AWS_BATCH_JOB_QUEUE', 'gpu-transcode-queue')
+
+        # Get recent succeeded jobs
+        response = batch_client.list_jobs(
+            jobQueue=job_queue,
+            jobStatus='SUCCEEDED',
+            maxResults=100
+        )
+
+        jobs = response.get('jobSummaryList', [])
+        logger.info(f"[BatchRegister] Found {len(jobs)} succeeded Batch jobs")
+
+        registered = 0
+        already_registered = 0
+        errors = []
+
+        for job_summary in jobs:
+            job_id = job_summary['jobId']
+
+            # Get job details to find output S3 key
+            job_detail = batch_client.describe_jobs(jobs=[job_id])
+            if not job_detail.get('jobs'):
+                continue
+
+            job = job_detail['jobs'][0]
+            env_vars = {e['name']: e['value'] for e in job.get('container', {}).get('environment', [])}
+
+            output_key = env_vars.get('OUTPUT_S3_KEY', '')
+            angle = env_vars.get('ANGLE', '')
+
+            # Only register FL and FR
+            if angle not in ['FL', 'FR']:
+                continue
+
+            if not output_key:
+                continue
+
+            # Check if file exists in S3
+            try:
+                s3_client.head_object(Bucket=bucket, Key=output_key)
+            except:
+                continue  # File doesn't exist
+
+            # Parse game folder from key: court-a/date/game_folder/filename
+            parts = output_key.split('/')
+            if len(parts) < 4:
+                continue
+
+            game_folder = parts[2]  # Partial UUID
+            filename = parts[3]
+            uball_angle = 'LEFT' if angle == 'FL' else 'RIGHT'
+
+            # Try to register (will fail gracefully if already registered)
+            try:
+                result = uball_client.register_video(
+                    game_id=game_folder,
+                    s3_key=output_key,
+                    angle=uball_angle,
+                    filename=filename,
+                    duration=0.0
+                )
+
+                if result:
+                    registered += 1
+                    logger.info(f"[BatchRegister] Registered: {output_key}")
+                else:
+                    already_registered += 1
+            except Exception as e:
+                error_msg = str(e)
+                if 'duplicate' in error_msg.lower() or 'already exists' in error_msg.lower():
+                    already_registered += 1
+                else:
+                    errors.append({'key': output_key, 'error': error_msg})
+
+        return jsonify({
+            'success': True,
+            'registered': registered,
+            'already_registered': already_registered,
+            'total_jobs_checked': len(jobs),
+            'errors': errors
+        })
+
+    except Exception as e:
+        logger.error(f"[BatchRegister] Error: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+
 @app.route('/api/games/register-video', methods=['POST'])
 def register_video_in_uball():
     """

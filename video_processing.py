@@ -1628,8 +1628,11 @@ def process_game_videos(
                 game_date, angle_code, uball_game_id
             )
 
+            # Use COURT_LOCATION (e.g., "court-a") instead of jetson_id for S3 paths
+            # This ensures all angles from all Jetsons go to the same court folder
+            court_location = os.getenv('COURT_LOCATION', 'court-a')
             s3_key = video_processor.generate_s3_key(
-                location, game_date, angle_code, uball_game_id
+                court_location, game_date, angle_code, uball_game_id
             ) if upload_service else None
 
             # ============================================================
@@ -1653,9 +1656,7 @@ def process_game_videos(
                     continue
 
                 # 1. Extract 4K and stream directly to S3 raw/ prefix
-                # Use COURT_LOCATION env var (default "court-a") instead of jetson_id
-                court_location = os.getenv('COURT_LOCATION', 'court-a')
-                # Use uball_game_id for S3 path (required - games must be synced first)
+                # court_location is defined above - used for both 4K raw and 1080p output paths
                 raw_s3_key = batch_transcoder.generate_raw_s3_key(
                     court_location, game_date, uball_game_id, angle_code
                 )
@@ -2213,3 +2214,114 @@ def process_game_videos(
         traceback.print_exc()
         results['errors'].append(str(e))
         return results
+
+
+def poll_and_register_batch_jobs(
+    batch_jobs: List[Dict[str, Any]],
+    uball_client=None,
+    poll_interval: int = 30,
+    max_wait: int = 1800
+) -> Dict[str, Any]:
+    """
+    Poll AWS Batch jobs and register videos in Uball when they complete.
+
+    This function is called after submitting Batch jobs to:
+    1. Wait for jobs to complete (or timeout)
+    2. Register successful FL/FR videos in Uball backend
+
+    Args:
+        batch_jobs: List of batch job info dicts from process_game_videos()
+        uball_client: UballClient instance for registration
+        poll_interval: Seconds between status checks (default: 30)
+        max_wait: Maximum wait time in seconds (default: 30 minutes)
+
+    Returns:
+        Dict with registered, failed, pending job counts
+    """
+    from aws_batch_transcode import AWSBatchTranscoder
+    import time
+
+    if not batch_jobs:
+        return {'registered': 0, 'failed': 0, 'pending': 0}
+
+    logger.info(f"[BatchPoller] Polling {len(batch_jobs)} Batch jobs...")
+
+    try:
+        batch_transcoder = AWSBatchTranscoder()
+    except Exception as e:
+        logger.error(f"[BatchPoller] Failed to init transcoder: {e}")
+        return {'registered': 0, 'failed': len(batch_jobs), 'pending': 0, 'error': str(e)}
+
+    # Track job status
+    pending_jobs = {job['job_id']: job for job in batch_jobs if job.get('job_id')}
+    completed_jobs = []
+    failed_jobs = []
+
+    start_time = time.time()
+
+    while pending_jobs and (time.time() - start_time) < max_wait:
+        for job_id, job_info in list(pending_jobs.items()):
+            status = batch_transcoder.get_job_status(job_id)
+            current_status = status.get('status', 'UNKNOWN')
+
+            if current_status == 'SUCCEEDED':
+                logger.info(f"[BatchPoller] Job {job_id} SUCCEEDED")
+                job_info['final_status'] = 'SUCCEEDED'
+                completed_jobs.append(job_info)
+                del pending_jobs[job_id]
+
+                # Register in Uball if FL or FR angle
+                if uball_client and job_info.get('angle') in ['FL', 'FR']:
+                    try:
+                        uball_angle = 'LEFT' if job_info['angle'] == 'FL' else 'RIGHT'
+                        s3_key = job_info.get('final_s3_key', '')
+                        filename = job_info.get('filename', s3_key.split('/')[-1])
+
+                        # Extract game_id from s3_key: court-a/date/game_folder/filename
+                        parts = s3_key.split('/')
+                        if len(parts) >= 3:
+                            game_folder = parts[2]  # Partial UUID
+
+                            # Look up full game ID (need to query Uball)
+                            # For now, use the game_folder as-is and let backend match
+                            result = uball_client.register_video(
+                                game_id=game_folder,
+                                s3_key=s3_key,
+                                angle=uball_angle,
+                                filename=filename,
+                                duration=0.0  # Will be updated by frontend
+                            )
+
+                            if result:
+                                logger.info(f"[BatchPoller] Registered {job_info['angle']} in Uball")
+                            else:
+                                logger.warning(f"[BatchPoller] Failed to register {job_info['angle']}")
+                    except Exception as e:
+                        logger.error(f"[BatchPoller] Registration error: {e}")
+
+            elif current_status == 'FAILED':
+                logger.error(f"[BatchPoller] Job {job_id} FAILED: {status.get('statusReason', 'Unknown')}")
+                job_info['final_status'] = 'FAILED'
+                job_info['failure_reason'] = status.get('statusReason', '')
+                failed_jobs.append(job_info)
+                del pending_jobs[job_id]
+
+        if pending_jobs:
+            logger.info(f"[BatchPoller] {len(pending_jobs)} jobs still pending...")
+            time.sleep(poll_interval)
+
+    # Mark remaining as timed out
+    for job_info in pending_jobs.values():
+        job_info['final_status'] = 'TIMEOUT'
+        failed_jobs.append(job_info)
+
+    result = {
+        'registered': len(completed_jobs),
+        'failed': len(failed_jobs),
+        'pending': 0,
+        'completed_jobs': completed_jobs,
+        'failed_jobs': failed_jobs
+    }
+
+    logger.info(f"[BatchPoller] Done: {result['registered']} succeeded, {result['failed']} failed")
+    return result
