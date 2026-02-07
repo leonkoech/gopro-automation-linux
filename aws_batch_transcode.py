@@ -194,6 +194,120 @@ class AWSBatchTranscoder:
             logger.error(f"Failed to submit Batch job: {e}")
             raise
 
+    def submit_extract_transcode_job(
+        self,
+        chapters: List[Dict],
+        bucket: str,
+        offset_seconds: float,
+        duration_seconds: float,
+        output_s3_key: str,
+        game_id: str,
+        angle: str,
+        add_buffer_seconds: float = 30.0
+    ) -> Dict[str, Any]:
+        """
+        Submit single Batch job that extracts from chapters AND transcodes to 1080p.
+        No Lambda, no intermediate 4K file.
+
+        Args:
+            chapters: List of chapter dicts with 's3_key' field
+            bucket: S3 bucket name
+            offset_seconds: Seek position in concatenated chapters
+            duration_seconds: Duration to extract
+            output_s3_key: Final 1080p output path (e.g., "court-a/2026-01-20/uuid/video.mp4")
+            game_id: Game identifier for tracking
+            angle: Camera angle code (FL, FR, NL, NR)
+            add_buffer_seconds: Buffer to add to duration (default: 30)
+
+        Returns:
+            Dict with jobId, jobName, and submission details
+        """
+        import json
+
+        # Extract S3 keys from chapters
+        chapter_keys = []
+        for ch in chapters:
+            if isinstance(ch, dict) and 's3_key' in ch:
+                chapter_keys.append(ch['s3_key'])
+            elif isinstance(ch, str):
+                chapter_keys.append(ch)
+            else:
+                logger.warning(f"Unexpected chapter format: {ch}")
+
+        if not chapter_keys:
+            raise ValueError("No valid chapter S3 keys found")
+
+        chapters_json = json.dumps(chapter_keys)
+
+        # Generate unique job name
+        timestamp = int(time.time())
+        job_name = f"extract-transcode-{angle}-{timestamp}"
+
+        # Get job definition for extract+transcode
+        extract_job_definition = os.getenv(
+            'AWS_BATCH_JOB_DEFINITION_EXTRACT',
+            'ffmpeg-extract-transcode:1'
+        )
+
+        # Use large queue for extraction jobs (they process multiple chapters)
+        selected_queue = self.job_queue_large
+
+        logger.info(f"[BATCH-ONLY] Submitting extract+transcode job: {job_name}")
+        logger.info(f"  Queue: {selected_queue}")
+        logger.info(f"  Definition: {extract_job_definition}")
+        logger.info(f"  Chapters: {len(chapter_keys)}")
+        logger.info(f"  Offset: {offset_seconds}s, Duration: {duration_seconds}s (+{add_buffer_seconds}s buffer)")
+        logger.info(f"  Output: s3://{bucket}/{output_s3_key}")
+
+        try:
+            response = self.batch_client.submit_job(
+                jobName=job_name,
+                jobQueue=selected_queue,
+                jobDefinition=extract_job_definition,
+                containerOverrides={
+                    'environment': [
+                        {'name': 'CHAPTERS_JSON', 'value': chapters_json},
+                        {'name': 'BUCKET', 'value': bucket},
+                        {'name': 'OFFSET_SECONDS', 'value': str(offset_seconds)},
+                        {'name': 'DURATION_SECONDS', 'value': str(duration_seconds)},
+                        {'name': 'ADD_BUFFER_SECONDS', 'value': str(add_buffer_seconds)},
+                        {'name': 'OUTPUT_S3_KEY', 'value': output_s3_key},
+                        {'name': 'GAME_ID', 'value': game_id},
+                        {'name': 'ANGLE', 'value': angle}
+                    ]
+                },
+                tags={
+                    'game_id': game_id,
+                    'angle': angle,
+                    'service': 'gopro-automation',
+                    'pipeline': 'batch-only'
+                }
+            )
+
+            job_id = response['jobId']
+            logger.info(f"[BATCH-ONLY] Job submitted: {job_id}")
+
+            return {
+                'job_id': job_id,
+                'jobId': job_id,  # Alias for compatibility
+                'jobName': job_name,
+                'jobQueue': selected_queue,
+                'jobDefinition': extract_job_definition,
+                'chapters_count': len(chapter_keys),
+                'offset_seconds': offset_seconds,
+                'duration_seconds': duration_seconds,
+                'output_s3_key': output_s3_key,
+                'game_id': game_id,
+                'angle': angle,
+                'status': 'SUBMITTED',
+                'submitted_at': time.time(),
+                'pipeline': 'batch-only'
+            }
+
+        except ClientError as e:
+            logger.error(f"[BATCH-ONLY] Failed to submit extract+transcode job: {e}")
+            raise
+
     def get_job_status(self, job_id: str) -> Dict[str, Any]:
         """
         Get status of an AWS Batch job.

@@ -1764,6 +1764,75 @@ def process_game_videos(
                             results['errors'].append(f"Direct Batch submit failed for {angle_code}: {str(e)}")
                             continue
 
+                    # Check for batch-only pipeline (bypasses Lambda, no 4K intermediate)
+                    use_batch_only = os.getenv('USE_BATCH_ONLY_PIPELINE', 'false').lower() == 'true'
+
+                    if use_batch_only:
+                        # =======================================================
+                        # BATCH-ONLY PATH: Direct extraction + transcoding in one job
+                        # No Lambda, no intermediate 4K file - outputs directly to 1080p
+                        # =======================================================
+                        logger.info(f"[BATCH-ONLY] Submitting direct extract+transcode job for {angle_code}")
+                        report_progress('extracting', f'Batch extracting+transcoding {angle_code}...', session_base_progress, angle_code)
+
+                        try:
+                            batch_result = batch_transcoder.submit_extract_transcode_job(
+                                chapters=params['chapters_needed'],
+                                bucket=upload_service.bucket_name,
+                                offset_seconds=params['offset_seconds'],
+                                duration_seconds=params['duration_seconds'],
+                                output_s3_key=s3_key,  # Direct to final 1080p path
+                                game_id=firebase_game_id,
+                                angle=angle_code,
+                                add_buffer_seconds=30.0
+                            )
+
+                            if batch_result and batch_result.get('job_id'):
+                                logger.info(f"[BATCH-ONLY] Job submitted: {batch_result['job_id']}")
+
+                                # Track batch job info
+                                batch_job_info = {
+                                    'job_id': batch_result['job_id'],
+                                    'job_name': batch_result.get('jobName', ''),
+                                    'job_queue': batch_result.get('jobQueue', 'unknown'),
+                                    'angle': angle_code,
+                                    'raw_s3_key': None,  # No intermediate file
+                                    'final_s3_key': s3_key,
+                                    'session_id': session['id'],
+                                    'filename': output_filename,
+                                    'duration': params['duration_seconds'],
+                                    'status': 'SUBMITTED',
+                                    'submitted_by': 'batch_only',
+                                    'pipeline': 'batch-only'
+                                }
+                                results['batch_jobs'].append(batch_job_info)
+
+                                # Update recording session with pending Batch job info
+                                firebase_service.add_processed_game(session['id'], {
+                                    'firebase_game_id': firebase_game_id,
+                                    'game_number': game_number,
+                                    'extracted_filename': output_filename,
+                                    's3_key': s3_key,
+                                    'batch_job_id': batch_result['job_id'],
+                                    'batch_status': 'pending',
+                                    'extraction_method': 'batch_only'
+                                })
+
+                                # Batch-only path complete - continue to next session
+                                continue
+                            else:
+                                logger.error(f"[BATCH-ONLY] Job submission failed for {angle_code}")
+                                results['errors'].append(f"Batch-only job submission failed for {angle_code}")
+                                continue
+
+                        except Exception as e:
+                            logger.error(f"[BATCH-ONLY] Error submitting job for {angle_code}: {e}")
+                            results['errors'].append(f"Batch-only error for {angle_code}: {str(e)}")
+                            continue
+
+                    # =======================================================
+                    # LAMBDA PATH: Extract 4K + Submit Batch (original flow)
+                    # =======================================================
                     logger.info(f"[AWS GPU] Chapters in S3 - using Lambda for 4K extraction + Batch submit")
                     report_progress('extracting', f'Lambda extracting 4K {angle_code}...', session_base_progress, angle_code)
 
