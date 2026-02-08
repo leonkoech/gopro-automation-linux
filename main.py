@@ -2362,19 +2362,24 @@ def register_completed_batch_jobs():
             except:
                 continue  # File doesn't exist
 
-            # Parse game folder from key: court-a/date/game_folder/filename
-            parts = output_key.split('/')
-            if len(parts) < 4:
-                continue
+            # Get game_id from Batch job environment (full UUID)
+            game_id = env_vars.get('GAME_ID', '')
+            if not game_id:
+                # Fallback: parse from S3 path (less reliable)
+                parts = output_key.split('/')
+                if len(parts) >= 4:
+                    game_id = parts[2]  # Partial UUID from path
+                else:
+                    continue
 
-            game_folder = parts[2]  # Partial UUID
-            filename = parts[3]
+            # Get filename from S3 path
+            filename = output_key.split('/')[-1]
             uball_angle = 'LEFT' if angle == 'FL' else 'RIGHT'
 
             # Try to register (will fail gracefully if already registered)
             try:
                 result = uball_client.register_video(
-                    game_id=game_folder,
+                    game_id=game_id,
                     s3_key=output_key,
                     angle=uball_angle,
                     filename=filename,
@@ -2383,7 +2388,7 @@ def register_completed_batch_jobs():
 
                 if result:
                     registered += 1
-                    logger.info(f"[BatchRegister] Registered: {output_key}")
+                    logger.info(f"[BatchRegister] Registered {angle} for game {game_id}: {output_key}")
                 else:
                     already_registered += 1
             except Exception as e:

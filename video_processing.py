@@ -1687,6 +1687,45 @@ def process_game_videos(
                     try:
                         s3_client.head_object(Bucket=bucket_name, Key=final_1080p_key)
                         logger.info(f"[SKIP] 1080p file already exists: s3://{bucket_name}/{final_1080p_key}")
+
+                        # For FL/FR angles, check if video is registered in Uball annotation tool
+                        # If not registered, register it now before skipping
+                        if angle_code in ['FL', 'FR'] and uball_client:
+                            try:
+                                # Check if this angle is already registered
+                                existing_videos = uball_client.get_videos_for_game(uball_game_id)
+                                uball_angle = 'LEFT' if angle_code == 'FL' else 'RIGHT'
+
+                                already_registered = any(
+                                    v.get('angle') == uball_angle for v in existing_videos
+                                )
+
+                                if not already_registered:
+                                    logger.info(f"[AUTO-REGISTER] {angle_code} not registered in Uball, registering now...")
+                                    filename = final_1080p_key.split('/')[-1]
+
+                                    reg_result = uball_client.register_video(
+                                        game_id=uball_game_id,
+                                        s3_key=final_1080p_key,
+                                        angle=uball_angle,
+                                        filename=filename,
+                                        duration=0.0  # Will be updated by frontend
+                                    )
+
+                                    if reg_result:
+                                        logger.info(f"[AUTO-REGISTER] SUCCESS: {angle_code} registered for game {uball_game_id}")
+                                        results.setdefault('registered_videos', []).append({
+                                            'angle': angle_code,
+                                            'uball_game_id': uball_game_id,
+                                            's3_key': final_1080p_key
+                                        })
+                                    else:
+                                        logger.warning(f"[AUTO-REGISTER] FAILED: Could not register {angle_code}")
+                                else:
+                                    logger.info(f"[SKIP] {angle_code} already registered in Uball for game {uball_game_id}")
+                            except Exception as reg_err:
+                                logger.error(f"[AUTO-REGISTER] Error checking/registering {angle_code}: {reg_err}")
+
                         results['processed_videos'].append({
                             'angle': angle_code,
                             'session_id': session['id'],
@@ -1731,7 +1770,7 @@ def process_game_videos(
                             batch_job_result = batch_transcoder.submit_transcode_job(
                                 input_s3_key=raw_s3_key,
                                 output_s3_key=s3_key,
-                                game_id=firebase_game_id,
+                                game_id=uball_game_id,  # Use Uball game ID for registration
                                 angle=angle_code
                             )
 
@@ -1741,6 +1780,7 @@ def process_game_videos(
                                     'job_name': batch_job_result.get('job_name', ''),
                                     'job_queue': batch_transcoder.job_queue,
                                     'angle': angle_code,
+                                    'game_id': uball_game_id,  # Uball game ID for registration
                                     'raw_s3_key': raw_s3_key,
                                     'final_s3_key': s3_key,
                                     'session_id': session['id'],
@@ -1785,7 +1825,7 @@ def process_game_videos(
                                 offset_seconds=params['offset_seconds'],
                                 duration_seconds=params['duration_seconds'],
                                 output_s3_key=s3_key,  # Direct to final 1080p path
-                                game_id=firebase_game_id,
+                                game_id=uball_game_id,  # Use Uball game ID for registration
                                 angle=angle_code,
                                 add_buffer_seconds=30.0
                             )
@@ -1799,6 +1839,7 @@ def process_game_videos(
                                     'job_name': batch_result.get('jobName', ''),
                                     'job_queue': batch_result.get('jobQueue', 'unknown'),
                                     'angle': angle_code,
+                                    'game_id': uball_game_id,  # Uball game ID for registration
                                     'raw_s3_key': None,  # No intermediate file
                                     'final_s3_key': s3_key,
                                     'session_id': session['id'],
@@ -1846,7 +1887,7 @@ def process_game_videos(
                         'job_queue': batch_transcoder.job_queue,
                         'job_definition': batch_transcoder.job_definition,
                         'final_s3_key': s3_key,
-                        'game_id': firebase_game_id,
+                        'game_id': uball_game_id,  # Use Uball game ID for registration
                         'angle': angle_code
                     }
 
@@ -1882,6 +1923,7 @@ def process_game_videos(
                                 'job_name': batch_job.get('job_name', ''),
                                 'job_queue': batch_job.get('job_queue', 'unknown'),
                                 'angle': angle_code,
+                                'game_id': uball_game_id,  # Uball game ID for registration
                                 'raw_s3_key': raw_s3_key,
                                 'final_s3_key': s3_key,
                                 'session_id': session['id'],
@@ -2349,15 +2391,28 @@ def poll_and_register_batch_jobs(
                         s3_key = job_info.get('final_s3_key', '')
                         filename = job_info.get('filename', s3_key.split('/')[-1])
 
-                        # Extract game_id from s3_key: court-a/date/game_folder/filename
-                        parts = s3_key.split('/')
-                        if len(parts) >= 3:
-                            game_folder = parts[2]  # Partial UUID
+                        # Get game_id from job_info (set during submission)
+                        game_id = job_info.get('game_id', '')
 
-                            # Look up full game ID (need to query Uball)
-                            # For now, use the game_folder as-is and let backend match
+                        # Fallback: try to get from Batch job environment
+                        if not game_id:
+                            job_details = batch_transcoder.get_job_status(job_id)
+                            if job_details:
+                                env_vars = job_details.get('container', {}).get('environment', [])
+                                for env_var in env_vars:
+                                    if env_var.get('name') == 'GAME_ID':
+                                        game_id = env_var.get('value', '')
+                                        break
+
+                        # Final fallback: parse from S3 path
+                        if not game_id:
+                            parts = s3_key.split('/')
+                            if len(parts) >= 3:
+                                game_id = parts[2]  # Partial UUID from path
+
+                        if game_id:
                             result = uball_client.register_video(
-                                game_id=game_folder,
+                                game_id=game_id,
                                 s3_key=s3_key,
                                 angle=uball_angle,
                                 filename=filename,
@@ -2365,9 +2420,11 @@ def poll_and_register_batch_jobs(
                             )
 
                             if result:
-                                logger.info(f"[BatchPoller] Registered {job_info['angle']} in Uball")
+                                logger.info(f"[BatchPoller] Registered {job_info['angle']} for game {game_id} in Uball")
                             else:
-                                logger.warning(f"[BatchPoller] Failed to register {job_info['angle']}")
+                                logger.warning(f"[BatchPoller] Failed to register {job_info['angle']} for game {game_id}")
+                        else:
+                            logger.warning(f"[BatchPoller] No game_id found for job {job_id}")
                     except Exception as e:
                         logger.error(f"[BatchPoller] Registration error: {e}")
 
