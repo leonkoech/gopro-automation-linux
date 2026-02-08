@@ -1677,7 +1677,10 @@ def process_game_videos(
                 # Check if 1080p file already exists (skip both Lambda AND Batch)
                 try:
                     import boto3
-                    s3_client = boto3.client('s3')
+                    from botocore.config import Config as BotoConfig
+                    # Use verify=False for Jetson SSL compatibility
+                    boto_config = BotoConfig(retries={'max_attempts': 2, 'mode': 'adaptive'})
+                    s3_client = boto3.client('s3', config=boto_config, verify=False)
                     bucket_name = upload_service.bucket_name
 
                     # Check 1080p output first (if exists, skip everything)
