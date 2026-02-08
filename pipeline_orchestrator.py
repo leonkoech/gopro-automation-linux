@@ -501,6 +501,7 @@ class PipelineOrchestrator:
                     self._update_game_state(pipeline_id, game_id, {
                         'status': 'batch_submitted' if batch_jobs else 'completed',
                         'batch_jobs': [j.get('job_id') for j in batch_jobs],
+                        'batch_jobs_info': batch_jobs,  # Full info for polling/registration
                         'angles_processed': {
                             v.get('angle'): {
                                 'status': 'batch_submitted' if batch_jobs else 'completed',
@@ -540,6 +541,10 @@ class PipelineOrchestrator:
         # ==================== PHASE 4: Wait for Batch Jobs (if any) ====================
         with self._lock:
             batch_jobs_count = self._pipelines[pipeline_id]['batch_jobs_submitted']
+            # Collect all batch job info for polling
+            all_batch_jobs = []
+            for game_state in self._pipelines[pipeline_id].get('games', {}).values():
+                all_batch_jobs.extend(game_state.get('batch_jobs_info', []))
 
         if batch_jobs_count > 0:
             self._update_pipeline(pipeline_id, {
@@ -548,9 +553,27 @@ class PipelineOrchestrator:
                 'progress': 90
             })
 
-            # Note: Batch job completion is handled by a separate polling mechanism
-            # or webhook. For now, mark pipeline as waiting for batch.
-            logger.info(f"[Pipeline {pipeline_id}] Waiting for {batch_jobs_count} batch jobs")
+            logger.info(f"[Pipeline {pipeline_id}] Starting background poller for {batch_jobs_count} batch jobs")
+
+            # Start background thread to poll batch jobs and auto-register videos
+            if all_batch_jobs and self.uball_client:
+                from video_processing import poll_and_register_batch_jobs
+
+                def poll_and_register():
+                    try:
+                        result = poll_and_register_batch_jobs(
+                            batch_jobs=all_batch_jobs,
+                            uball_client=self.uball_client,
+                            poll_interval=30,
+                            max_wait=3600  # 1 hour max wait
+                        )
+                        logger.info(f"[Pipeline {pipeline_id}] Batch poller complete: {result.get('registered', 0)} registered, {result.get('failed', 0)} failed")
+                    except Exception as e:
+                        logger.error(f"[Pipeline {pipeline_id}] Batch poller error: {e}")
+
+                threading.Thread(target=poll_and_register, daemon=True).start()
+            else:
+                logger.info(f"[Pipeline {pipeline_id}] Waiting for {batch_jobs_count} batch jobs (no auto-registration)")
 
         # ==================== PHASE 5: Cleanup ====================
         with self._lock:
