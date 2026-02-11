@@ -235,6 +235,20 @@ def get_connected_gopros():
                 if gopro_ip:
                     gopro_ip_cache[current_interface] = gopro_ip
 
+                # Check actual camera recording state (not just internal dict)
+                actual_recording = False
+                if gopro_ip:
+                    try:
+                        state_resp = requests.get(f'http://{gopro_ip}:8080/gopro/camera/state', timeout=2)
+                        if state_resp.status_code == 200:
+                            state = state_resp.json()
+                            actual_recording = state.get('status', {}).get('8', 0) == 1
+                    except:
+                        # Fall back to internal dict if camera query fails
+                        actual_recording = current_interface in recording_processes
+                else:
+                    actual_recording = current_interface in recording_processes
+
                 gopro_info = {
                     'id': current_interface,
                     'name': f'GoPro-{current_interface[-4:]}',
@@ -242,7 +256,7 @@ def get_connected_gopros():
                     'ip': current_ip,
                     'gopro_ip': gopro_ip,
                     'status': 'connected',
-                    'is_recording': current_interface in recording_processes
+                    'is_recording': actual_recording
                 }
                 gopros.append(gopro_info)
                 current_interface = None
