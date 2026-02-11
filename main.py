@@ -959,7 +959,7 @@ def stop_all_and_process():
         logger.info("[Stop All] No recordings in internal state, checking actual GoPro state...")
 
         # Discover all connected GoPros
-        discovered_gopros = discover_gopros()
+        discovered_gopros = get_connected_gopros()
 
         for gopro in discovered_gopros:
             gopro_id = gopro.get('interface')
