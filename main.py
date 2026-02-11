@@ -823,14 +823,27 @@ def stop_recording(gopro_id):
                 logger.info(f"[{gopro_id}] Session has {len(new_chapters)} chapters ({total_size_gb:.2f} GB)")
 
                 # Update Firebase with recording stop info
-                if firebase_service and firebase_session_id:
+                if firebase_service:
                     try:
-                        stop_data = {
-                            'total_chapters': len(new_chapters),
-                            'total_size_bytes': total_size_bytes
-                        }
-                        firebase_service.register_recording_stop(firebase_session_id, stop_data)
-                        logger.info(f"[{gopro_id}] ✓ Firebase session updated: {firebase_session_id}")
+                        # If we don't have firebase_session_id (e.g., discovered externally),
+                        # look it up by interface_id and status='recording'
+                        session_id_to_update = firebase_session_id
+                        if not session_id_to_update:
+                            logger.info(f"[{gopro_id}] Looking up Firebase session by interface_id...")
+                            session = firebase_service.find_recording_session_by_interface(gopro_id, 'recording')
+                            if session:
+                                session_id_to_update = session['id']
+                                logger.info(f"[{gopro_id}] Found Firebase session: {session_id_to_update}")
+                            else:
+                                logger.warning(f"[{gopro_id}] No recording session found in Firebase for interface {gopro_id}")
+
+                        if session_id_to_update:
+                            stop_data = {
+                                'total_chapters': len(new_chapters),
+                                'total_size_bytes': total_size_bytes
+                            }
+                            firebase_service.register_recording_stop(session_id_to_update, stop_data)
+                            logger.info(f"[{gopro_id}] ✓ Firebase session updated: {session_id_to_update}")
                     except Exception as e:
                         logger.warning(f"[{gopro_id}] Failed to update Firebase: {e}")
 

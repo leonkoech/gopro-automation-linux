@@ -317,6 +317,34 @@ class FirebaseService:
 
         return None
 
+    def find_recording_session_by_interface(self, interface_id: str, status: str = 'recording') -> Optional[Dict[str, Any]]:
+        """
+        Find a recording session by interface ID and status.
+
+        Used to look up the Firebase session when we don't have the session ID
+        (e.g., when recording was discovered externally).
+
+        Args:
+            interface_id: USB interface ID (e.g., 'enxd43260ddac87')
+            status: Session status to filter by (default: 'recording')
+
+        Returns:
+            Most recent matching session or None if not found
+        """
+        sessions_ref = self.db.collection(self.RECORDING_SESSIONS_COLLECTION)
+        query = (sessions_ref
+                 .where('interfaceId', '==', interface_id)
+                 .where('status', '==', status)
+                 .order_by('startedAt', direction=firestore.Query.DESCENDING)
+                 .limit(1))
+
+        for doc in query.stream():
+            data = doc.to_dict()
+            data['id'] = doc.id
+            return data
+
+        return None
+
     # ==================== Basketball Games Methods ====================
 
     def get_game(self, game_id: str) -> Optional[Dict[str, Any]]:
