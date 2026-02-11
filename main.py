@@ -1209,9 +1209,9 @@ def get_recording_pipeline_status():
         pipelines = orchestrator.list_pipelines(limit=1)
         if pipelines:
             latest_pipeline = pipelines[0]
-            # Only include if recent (within last hour) or still running
-            if latest_pipeline.get('status') == 'running':
-                result['pipeline'] = latest_pipeline
+            # Include pipeline in ANY status while it's in memory
+            # The 5-minute retention in pipeline_orchestrator handles cleanup
+            result['pipeline'] = latest_pipeline
 
     return jsonify(result)
 
