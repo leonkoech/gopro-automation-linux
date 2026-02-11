@@ -521,14 +521,44 @@ def start_recording(gopro_id):
     if not gopro:
         return jsonify({'success': False, 'error': 'GoPro not found'}), 404
 
-    with recording_lock:
-        if gopro_id in recording_processes:
-            return jsonify({'success': False, 'error': 'Already recording'}), 400
-
     gopro_ip = gopro.get('gopro_ip') or get_gopro_wired_ip(gopro_id)
     if not gopro_ip:
         return jsonify({'success': False, 'error': f'Could not find GoPro IP for {gopro_id}'}), 500
 
+    # Check ACTUAL camera state before rejecting
+    actual_recording = False
+    try:
+        state_resp = requests.get(f'http://{gopro_ip}:8080/gopro/camera/state', timeout=3)
+        if state_resp.status_code == 200:
+            state = state_resp.json()
+            actual_recording = state.get('status', {}).get('8', 0) == 1
+    except Exception as e:
+        logger.warning(f"Could not check camera state for {gopro_id}: {e}")
+
+    with recording_lock:
+        if gopro_id in recording_processes:
+            if actual_recording:
+                # Camera is actually recording - reject
+                return jsonify({'success': False, 'error': 'Already recording'}), 400
+            else:
+                # Stale entry - camera stopped but dict wasn't cleaned up
+                logger.info(f"[Start Recording] Cleaning stale entry for {gopro_id}")
+                del recording_processes[gopro_id]
+        elif actual_recording:
+            # Camera is recording but not tracked - add to dict for tracking
+            logger.info(f"[Start Recording] Camera {gopro_id} already recording but not tracked, adding to dict")
+            recording_processes[gopro_id] = {
+                'gopro_ip': gopro_ip,
+                'is_recording': True,
+                'started_externally': True
+            }
+            return jsonify({
+                'success': True,
+                'message': 'Camera was already recording, now tracked',
+                'gopro_id': gopro_id
+            })
+
+    # Continue with starting recording (gopro_ip already validated above)
     try:
         # Enable USB control first - required for wired control
         print(f"Enabling USB control on {gopro_id} ({gopro_ip})...")
