@@ -332,10 +332,10 @@ class FirebaseService:
             Most recent matching session or None if not found
         """
         sessions_ref = self.db.collection(self.RECORDING_SESSIONS_COLLECTION)
+        # Simple query without order_by to avoid requiring composite index
         query = (sessions_ref
                  .where('interfaceId', '==', interface_id)
                  .where('status', '==', status)
-                 .order_by('startedAt', direction=firestore.Query.DESCENDING)
                  .limit(1))
 
         for doc in query.stream():
