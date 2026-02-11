@@ -892,12 +892,49 @@ def stop_all_and_process():
     data = request.get_json() or {}
     auto_delete_sd = data.get('auto_delete_sd', True)
 
-    # Find all recording GoPros
+    # Find all recording GoPros from internal state
     with recording_lock:
         recording_gopros = list(recording_processes.keys())
 
+    # If no recordings in internal state, check actual GoPro state
+    # This handles cases where recordings were started externally or after server restart
     if not recording_gopros:
-        # No active recordings - check for pending sessions and start pipeline
+        logger.info("[Stop All] No recordings in internal state, checking actual GoPro state...")
+
+        # Discover all connected GoPros
+        discovered_gopros = discover_gopros()
+
+        for gopro in discovered_gopros:
+            gopro_id = gopro.get('interface')
+            gopro_ip = gopro.get('gopro_ip')
+
+            if gopro_ip:
+                try:
+                    # Check actual recording state from GoPro
+                    state_response = requests.get(
+                        f'http://{gopro_ip}:8080/gopro/camera/state',
+                        timeout=3
+                    )
+                    if state_response.status_code == 200:
+                        state = state_response.json()
+                        # Status 8 = is_recording (1 = true, 0 = false)
+                        is_recording = state.get('status', {}).get('8', 0) == 1
+
+                        if is_recording:
+                            logger.info(f"[Stop All] Found recording GoPro: {gopro_id} (from camera state)")
+                            recording_gopros.append(gopro_id)
+                            # Add to internal state for tracking
+                            with recording_lock:
+                                recording_processes[gopro_id] = {
+                                    'gopro_ip': gopro_ip,
+                                    'is_recording': True,
+                                    'discovered_externally': True
+                                }
+                except Exception as e:
+                    logger.warning(f"[Stop All] Could not check state for {gopro_id}: {e}")
+
+    if not recording_gopros:
+        # Still no recordings - check for pending sessions and start pipeline
         logger.info("[Stop All] No active recordings, checking for pending sessions...")
 
         if firebase_service:
