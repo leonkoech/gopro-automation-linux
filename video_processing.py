@@ -1661,7 +1661,7 @@ def process_game_videos(
                     court_location, game_date, uball_game_id, angle_code
                 )
 
-                # Check if chapters are from S3 (need Lambda extraction)
+                # Check if chapters are from S3 (need cloud extraction via AWS Batch)
                 chapters_from_s3 = any(
                     ch.get('source') == 's3' for ch in params['chapters_needed']
                 )
@@ -1674,7 +1674,7 @@ def process_game_videos(
                 game_folder = '-'.join(uuid_parts)
                 final_1080p_key = f"{court_location}/{game_date}/{game_folder}/{game_date}_{game_folder}_{angle_code}.mp4"
 
-                # Check if 1080p file already exists (skip both Lambda AND Batch)
+                # Check if 1080p file already exists (skip processing)
                 try:
                     import boto3
                     from botocore.config import Config as BotoConfig
@@ -1739,7 +1739,7 @@ def process_game_videos(
                             raise  # Re-raise non-404 errors
                         # 1080p doesn't exist - check raw 4K next
 
-                    # Check if raw 4K file exists (skip Lambda, but still need Batch)
+                    # Check if raw 4K file exists (can skip extract, just need Batch transcode)
                     raw_4k_exists = False
                     try:
                         s3_client.head_object(Bucket=bucket_name, Key=raw_s3_key)
@@ -1748,7 +1748,7 @@ def process_game_videos(
                     except s3_client.exceptions.ClientError as e:
                         if e.response['Error']['Code'] != '404':
                             raise  # Re-raise non-404 errors
-                        # Raw 4K doesn't exist - need to run Lambda
+                        # Raw 4K doesn't exist - need to extract
 
                 except Exception as e:
                     logger.warning(f"[SKIP CHECK] Error checking S3: {e} - proceeding with processing")
@@ -1756,16 +1756,16 @@ def process_game_videos(
 
                 if chapters_from_s3:
                     # =======================================================
-                    # LAMBDA PATH: Extract 4K + Submit Batch (one Lambda call)
-                    # Lambda handles: read S3 → extract → upload raw → submit Batch
+                    # SKIP PATH: Raw 4K exists in S3, submit Batch directly
+                    # Skip extraction, just need to transcode 4K → 1080p
                     # =======================================================
 
-                    # Skip Lambda if raw 4K already exists, but still submit Batch
+                    # Skip extraction if raw 4K already exists, just submit Batch transcode
                     if raw_4k_exists:
-                        logger.info(f"[AWS GPU] Skipping Lambda - raw 4K exists, submitting Batch directly")
+                        logger.info(f"[AWS GPU] Raw 4K exists - submitting Batch transcode directly")
                         report_progress('encoding', f'Submitting Batch for {angle_code}...', session_base_progress, angle_code)
 
-                        # Submit Batch job directly (Lambda would normally do this)
+                        # Submit Batch transcode job directly
                         try:
                             batch_job_result = batch_transcoder.submit_transcode_job(
                                 input_s3_key=raw_s3_key,
@@ -1797,7 +1797,7 @@ def process_game_videos(
                                     's3_key': s3_key,
                                     'batch_job_id': batch_job_result['job_id'],
                                     'batch_status': 'pending',
-                                    'extraction_method': 'skip_lambda'
+                                    'extraction_method': 'skip_extract'
                                 })
                                 continue  # Skip to next session
                             else:
@@ -1807,131 +1807,43 @@ def process_game_videos(
                             results['errors'].append(f"Direct Batch submit failed for {angle_code}: {str(e)}")
                             continue
 
-                    # Check for batch-only pipeline (bypasses Lambda, no 4K intermediate)
-                    use_batch_only = os.getenv('USE_BATCH_ONLY_PIPELINE', 'false').lower() == 'true'
-
-                    if use_batch_only:
-                        # =======================================================
-                        # BATCH-ONLY PATH: Direct extraction + transcoding in one job
-                        # No Lambda, no intermediate 4K file - outputs directly to 1080p
-                        # =======================================================
-                        logger.info(f"[BATCH-ONLY] Submitting direct extract+transcode job for {angle_code}")
-                        report_progress('extracting', f'Batch extracting+transcoding {angle_code}...', session_base_progress, angle_code)
-
-                        try:
-                            batch_result = batch_transcoder.submit_extract_transcode_job(
-                                chapters=params['chapters_needed'],
-                                bucket=upload_service.bucket_name,
-                                offset_seconds=params['offset_seconds'],
-                                duration_seconds=params['duration_seconds'],
-                                output_s3_key=s3_key,  # Direct to final 1080p path
-                                game_id=uball_game_id,  # Use Uball game ID for registration
-                                angle=angle_code,
-                                add_buffer_seconds=30.0
-                            )
-
-                            if batch_result and batch_result.get('job_id'):
-                                logger.info(f"[BATCH-ONLY] Job submitted: {batch_result['job_id']}")
-
-                                # Track batch job info
-                                batch_job_info = {
-                                    'job_id': batch_result['job_id'],
-                                    'job_name': batch_result.get('jobName', ''),
-                                    'job_queue': batch_result.get('jobQueue', 'unknown'),
-                                    'angle': angle_code,
-                                    'game_id': uball_game_id,  # Uball game ID for registration
-                                    'raw_s3_key': None,  # No intermediate file
-                                    'final_s3_key': s3_key,
-                                    'session_id': session['id'],
-                                    'filename': output_filename,
-                                    'duration': params['duration_seconds'],
-                                    'status': 'SUBMITTED',
-                                    'submitted_by': 'batch_only',
-                                    'pipeline': 'batch-only'
-                                }
-                                results['batch_jobs'].append(batch_job_info)
-
-                                # Update recording session with pending Batch job info
-                                firebase_service.add_processed_game(session['id'], {
-                                    'firebase_game_id': firebase_game_id,
-                                    'game_number': game_number,
-                                    'extracted_filename': output_filename,
-                                    's3_key': s3_key,
-                                    'batch_job_id': batch_result['job_id'],
-                                    'batch_status': 'pending',
-                                    'extraction_method': 'batch_only'
-                                })
-
-                                # Batch-only path complete - continue to next session
-                                continue
-                            else:
-                                logger.error(f"[BATCH-ONLY] Job submission failed for {angle_code}")
-                                results['errors'].append(f"Batch-only job submission failed for {angle_code}")
-                                continue
-
-                        except Exception as e:
-                            logger.error(f"[BATCH-ONLY] Error submitting job for {angle_code}: {e}")
-                            results['errors'].append(f"Batch-only error for {angle_code}: {str(e)}")
-                            continue
-
                     # =======================================================
-                    # LAMBDA PATH: Extract 4K + Submit Batch (original flow)
+                    # BATCH-ONLY PATH: Direct extraction + transcoding in one job
+                    # No intermediate 4K file - outputs directly to 1080p
                     # =======================================================
-                    logger.info(f"[AWS GPU] Chapters in S3 - using Lambda for 4K extraction + Batch submit")
-                    report_progress('extracting', f'Lambda extracting 4K {angle_code}...', session_base_progress, angle_code)
-
-                    from lambda_extractor import get_lambda_extractor
-
-                    # Build batch config for Lambda to submit job directly
-                    batch_config = {
-                        'job_queue': batch_transcoder.job_queue,
-                        'job_definition': batch_transcoder.job_definition,
-                        'final_s3_key': s3_key,
-                        'game_id': uball_game_id,  # Use Uball game ID for registration
-                        'angle': angle_code
-                    }
+                    logger.info(f"[BATCH-ONLY] Submitting direct extract+transcode job for {angle_code}")
+                    report_progress('extracting', f'Batch extracting+transcoding {angle_code}...', session_base_progress, angle_code)
 
                     try:
-                        lambda_extractor = get_lambda_extractor()
-                        lambda_result = lambda_extractor.extract_game_clip(
+                        batch_result = batch_transcoder.submit_extract_transcode_job(
                             chapters=params['chapters_needed'],
                             bucket=upload_service.bucket_name,
                             offset_seconds=params['offset_seconds'],
                             duration_seconds=params['duration_seconds'],
-                            output_s3_key=raw_s3_key,
-                            compress_to_1080p=False,  # 4K stream copy - no compression
-                            add_buffer_seconds=30.0,
-                            batch_config=batch_config  # Lambda submits Batch job
+                            output_s3_key=s3_key,  # Direct to final 1080p path
+                            game_id=uball_game_id,  # Use Uball game ID for registration
+                            angle=angle_code,
+                            add_buffer_seconds=30.0
                         )
 
-                        if not lambda_result.get('success'):
-                            error_msg = lambda_result.get('error', 'Unknown Lambda error')
-                            results['errors'].append(f"Lambda 4K extraction failed for {angle_code}: {error_msg}")
-                            continue
-
-                        raw_s3_uri = lambda_result.get('output_s3_uri')
-                        batch_job = lambda_result.get('batch_job', {})
-                        logger.info(f"[AWS GPU] Lambda extracted 4K to: {raw_s3_uri}")
-
-                        # Check if Batch job was submitted by Lambda
-                        if batch_job.get('job_id'):
-                            logger.info(f"[AWS GPU] Lambda submitted Batch job: {batch_job['job_id']}")
+                        if batch_result and batch_result.get('job_id'):
+                            logger.info(f"[BATCH-ONLY] Job submitted: {batch_result['job_id']}")
 
                             # Track batch job info
                             batch_job_info = {
-                                'job_id': batch_job['job_id'],
-                                'job_name': batch_job.get('job_name', ''),
-                                'job_queue': batch_job.get('job_queue', 'unknown'),
+                                'job_id': batch_result['job_id'],
+                                'job_name': batch_result.get('jobName', ''),
+                                'job_queue': batch_result.get('jobQueue', 'unknown'),
                                 'angle': angle_code,
                                 'game_id': uball_game_id,  # Uball game ID for registration
-                                'raw_s3_key': raw_s3_key,
+                                'raw_s3_key': None,  # No intermediate file
                                 'final_s3_key': s3_key,
                                 'session_id': session['id'],
                                 'filename': output_filename,
                                 'duration': params['duration_seconds'],
-                                'file_size_bytes': lambda_result.get('output_size_bytes', 0),
                                 'status': 'SUBMITTED',
-                                'submitted_by': 'lambda'
+                                'submitted_by': 'batch_only',
+                                'pipeline': 'batch-only'
                             }
                             results['batch_jobs'].append(batch_job_info)
 
@@ -1941,24 +1853,23 @@ def process_game_videos(
                                 'game_number': game_number,
                                 'extracted_filename': output_filename,
                                 's3_key': s3_key,
-                                'batch_job_id': batch_job['job_id'],
+                                'batch_job_id': batch_result['job_id'],
                                 'batch_status': 'pending',
-                                'extraction_method': 'lambda'
+                                'extraction_method': 'batch_only'
                             })
 
-                            # Lambda path complete - continue to next session
+                            # Batch-only path complete - continue to next session
                             continue
                         else:
-                            # Lambda extraction succeeded but Batch submit failed
-                            batch_error = batch_job.get('error', 'Unknown batch error')
-                            logger.error(f"[AWS GPU] Lambda Batch submit failed: {batch_error}")
-                            results['errors'].append(f"Batch submit failed for {angle_code}: {batch_error}")
+                            logger.error(f"[BATCH-ONLY] Job submission failed for {angle_code}")
+                            results['errors'].append(f"Batch-only job submission failed for {angle_code}")
                             continue
 
                     except Exception as e:
-                        logger.error(f"[AWS GPU] Lambda error for {angle_code}: {e}")
-                        results['errors'].append(f"Lambda 4K extraction error for {angle_code}: {str(e)}")
+                        logger.error(f"[BATCH-ONLY] Error submitting job for {angle_code}: {e}")
+                        results['errors'].append(f"Batch-only error for {angle_code}: {str(e)}")
                         continue
+
                 else:
                     # Local chapters - use existing Jetson extraction
                     logger.info(f"[AWS GPU] Streaming 4K directly to S3 (no temp file)")
@@ -2034,7 +1945,7 @@ def process_game_videos(
 
             else:
                 # ===========================================================
-                # Check if chapters are from S3 (need Lambda extraction)
+                # Check if chapters are from S3 (need cloud extraction via AWS Batch)
                 # ===========================================================
                 chapters_from_s3 = any(
                     ch.get('source') == 's3' for ch in params['chapters_needed']
@@ -2042,107 +1953,72 @@ def process_game_videos(
 
                 if chapters_from_s3 and upload_service:
                     # ===========================================================
-                    # LAMBDA PATH: Chapters in S3 - use Lambda for extraction
-                    # Jetson FFmpeg doesn't support HTTPS protocol
+                    # BATCH-ONLY PATH: Chapters in S3 - use AWS Batch for extraction
+                    # Jetson FFmpeg doesn't support HTTPS, so use cloud processing
                     # ===========================================================
-                    logger.info(f"[Lambda] Chapters are in S3 - using Lambda extraction for {angle_code}")
-                    report_progress('extracting', f'Lambda extracting {angle_code}...', session_base_progress, angle_code)
-
-                    from lambda_extractor import get_lambda_extractor
+                    logger.info(f"[BATCH-ONLY] Chapters are in S3 - using Batch extraction for {angle_code}")
+                    report_progress('extracting', f'Batch extracting+transcoding {angle_code}...', session_base_progress, angle_code)
 
                     try:
-                        lambda_extractor = get_lambda_extractor()
-                        lambda_result = lambda_extractor.extract_game_clip(
+                        from aws_batch_transcode import get_batch_transcoder
+                        batch_transcoder = get_batch_transcoder()
+
+                        if not batch_transcoder:
+                            logger.error(f"[BATCH-ONLY] Batch transcoder not available for {angle_code}")
+                            results['errors'].append(f"Batch transcoder not available for {angle_code}")
+                            continue
+
+                        batch_result = batch_transcoder.submit_extract_transcode_job(
                             chapters=params['chapters_needed'],
                             bucket=upload_service.bucket_name,
                             offset_seconds=params['offset_seconds'],
                             duration_seconds=params['duration_seconds'],
                             output_s3_key=s3_key,
-                            compress_to_1080p=True,
+                            game_id=uball_game_id,
+                            angle=angle_code,
                             add_buffer_seconds=30.0
                         )
 
-                        if not lambda_result.get('success'):
-                            error_msg = lambda_result.get('error', 'Unknown Lambda error')
-                            logger.error(f"[Lambda] Extraction failed for {angle_code}: {error_msg}")
-                            results['errors'].append(f"Lambda extraction failed for {angle_code}: {error_msg}")
+                        if batch_result and batch_result.get('job_id'):
+                            logger.info(f"[BATCH-ONLY] Job submitted: {batch_result['job_id']}")
+
+                            batch_job_info = {
+                                'job_id': batch_result['job_id'],
+                                'job_name': batch_result.get('jobName', ''),
+                                'job_queue': batch_result.get('jobQueue', 'unknown'),
+                                'angle': angle_code,
+                                'game_id': uball_game_id,
+                                'raw_s3_key': None,
+                                'final_s3_key': s3_key,
+                                'session_id': session['id'],
+                                'filename': output_filename,
+                                'duration': params['duration_seconds'],
+                                'status': 'SUBMITTED',
+                                'submitted_by': 'batch_only',
+                                'pipeline': 'batch-only'
+                            }
+                            results['batch_jobs'].append(batch_job_info)
+
+                            firebase_service.add_processed_game(session['id'], {
+                                'firebase_game_id': firebase_game_id,
+                                'game_number': game_number,
+                                'extracted_filename': output_filename,
+                                's3_key': s3_key,
+                                'batch_job_id': batch_result['job_id'],
+                                'batch_status': 'pending',
+                                'extraction_method': 'batch_only'
+                            })
+                            continue
+                        else:
+                            logger.error(f"[BATCH-ONLY] Job submission failed for {angle_code}")
+                            results['errors'].append(f"Batch-only job submission failed for {angle_code}")
                             continue
 
-                        # Lambda succeeded - get result info
-                        s3_uri = lambda_result.get('output_s3_uri')
-                        output_size_bytes = lambda_result.get('output_size_bytes', 0)
-                        processing_time = lambda_result.get('processing_time_seconds', 0)
-
-                        logger.info(f"[Lambda] Extracted {angle_code} in {processing_time}s")
-                        logger.info(f"[Lambda] Output: {s3_uri} ({output_size_bytes / (1024*1024):.1f} MB)")
-
-                        video_info = {
-                            'size_bytes': output_size_bytes,
-                            'duration': params['duration_seconds'],
-                        }
-
-                        report_progress('uploaded', f'{angle_code} extracted via Lambda', session_base_progress + 25, angle_code)
-
-                        # Update recording session with processed game info
-                        firebase_service.add_processed_game(session['id'], {
-                            'firebase_game_id': firebase_game_id,
-                            'game_number': game_number,
-                            'extracted_filename': output_filename,
-                            's3_key': s3_key,
-                            'extraction_method': 'lambda'
-                        })
-
-                        video_result = {
-                            'angle': angle_code,
-                            'session_id': session['id'],
-                            'filename': output_filename,
-                            's3_key': s3_key,
-                            's3_uri': s3_uri,
-                            'duration': video_info.get('duration'),
-                            'size_bytes': video_info.get('size_bytes', 0),
-                            'size_mb': round(video_info.get('size_bytes', 0) / (1024 * 1024), 2),
-                            'extraction_method': 'lambda'
-                        }
-
-                        results['processed_videos'].append(video_result)
-
-                        # Register FL/FR videos in Uball Backend
-                        if uball_client and angle_code in ['FL', 'FR']:
-                            report_progress('registering', f'Registering {angle_code} in Uball...', session_base_progress + 30, angle_code)
-                            try:
-                                uball_result = uball_client.register_game_video(
-                                    firebase_game_id=firebase_game_id,
-                                    s3_key=s3_key,
-                                    angle_code=angle_code,
-                                    filename=output_filename,
-                                    duration=video_info.get('duration'),
-                                    file_size=video_info.get('size_bytes'),
-                                    s3_bucket=s3_bucket
-                                )
-
-                                if uball_result:
-                                    logger.info(f"Registered {angle_code} video in Uball: {uball_result.get('id')}")
-                                    results['registered_videos'].append({
-                                        'angle': angle_code,
-                                        'uball_video_id': uball_result.get('id'),
-                                        's3_key': s3_key
-                                    })
-                                else:
-                                    logger.warning(f"Failed to register {angle_code} video in Uball")
-                                    results['errors'].append(f"Uball registration failed for {angle_code}")
-
-                            except Exception as e:
-                                logger.error(f"Uball registration error for {angle_code}: {e}")
-                                results['errors'].append(f"Uball registration error for {angle_code}: {str(e)}")
-
-                        # Lambda path complete - continue to next session
-                        continue
-
                     except Exception as e:
-                        logger.error(f"[Lambda] Error for {angle_code}: {e}")
+                        logger.error(f"[BATCH-ONLY] Error for {angle_code}: {e}")
                         import traceback
                         traceback.print_exc()
-                        results['errors'].append(f"Lambda extraction error for {angle_code}: {str(e)}")
+                        results['errors'].append(f"Batch extraction error for {angle_code}: {str(e)}")
                         continue
 
                 # ===========================================================
