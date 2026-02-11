@@ -625,6 +625,18 @@ class PipelineOrchestrator:
 
         logger.info(f"[Pipeline {pipeline_id}] Completed successfully")
 
+        # Keep pipeline in memory for 5 minutes so frontend can poll final status
+        # This prevents race condition where pipeline completes before frontend polls
+        def cleanup_after_delay():
+            import time
+            time.sleep(300)  # 5 minutes
+            with self._lock:
+                if pipeline_id in self._pipelines:
+                    del self._pipelines[pipeline_id]
+                    logger.info(f"[Pipeline {pipeline_id}] Removed from memory after 5 minute retention")
+
+        threading.Thread(target=cleanup_after_delay, daemon=True).start()
+
     def _delete_gopro_files(self, gopro_ip: str):
         """Delete all files from GoPro SD card."""
         import requests
