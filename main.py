@@ -1084,7 +1084,27 @@ def stop_all_and_process():
             if elapsed >= max_wait:
                 logger.warning("[Stop All] Timeout waiting for finalization, starting pipeline anyway")
 
-            # Give a small delay for Firebase to update
+            # IMPORTANT: Update Firebase sessions to "stopped" before starting pipeline
+            # This is needed for externally discovered recordings that don't go through stop_recording
+            if firebase_service:
+                logger.info("[Stop All] Updating Firebase sessions to stopped...")
+                for gopro_id in stopped_gopros:
+                    try:
+                        # Find the recording session by interface_id
+                        session = firebase_service.find_recording_session_by_interface(gopro_id, 'recording')
+                        if session:
+                            stop_data = {
+                                'total_chapters': 0,  # Will be updated by pipeline
+                                'total_size_bytes': 0
+                            }
+                            firebase_service.register_recording_stop(session['id'], stop_data)
+                            logger.info(f"[Stop All] Updated Firebase session {session['id']} to stopped")
+                        else:
+                            logger.warning(f"[Stop All] No recording session found for {gopro_id}")
+                    except Exception as e:
+                        logger.warning(f"[Stop All] Failed to update session for {gopro_id}: {e}")
+
+            # Give a small delay for Firebase to sync
             time.sleep(2)
 
             # Start the pipeline (streams chapters directly from GoPro HTTP to S3)
