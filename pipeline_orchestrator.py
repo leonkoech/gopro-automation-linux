@@ -117,9 +117,19 @@ class PipelineStage(str, Enum):
 class GameProcessingState:
     """State for a single game being processed."""
 
-    def __init__(self, firebase_game_id: str, game_number: int):
+    def __init__(
+        self,
+        firebase_game_id: str,
+        game_number: int,
+        team_a_name: str = '',
+        team_b_name: str = '',
+        video_name: str = ''
+    ):
         self.firebase_game_id = firebase_game_id
         self.game_number = game_number
+        self.team_a_name = team_a_name
+        self.team_b_name = team_b_name
+        self.video_name = video_name or f'{team_a_name} vs {team_b_name}'.strip() or f'Game {game_number}'
         self.status = 'pending'  # pending, extracting, batch_submitted, completed, failed
         self.angles_processed = {}  # angle_code -> { status, batch_job_id, s3_key }
         self.batch_jobs = []  # List of AWS Batch job IDs
@@ -448,9 +458,17 @@ class PipelineOrchestrator:
             self._pipelines[pipeline_id]['games_total'] = len(games)
             for i, game in enumerate(games):
                 game_id = game['id']
+                # Extract team names from Firebase game data
+                left_team = game.get('leftTeam', {}) or {}
+                right_team = game.get('rightTeam', {}) or {}
+                team_a_name = left_team.get('name', '') or ''
+                team_b_name = right_team.get('name', '') or ''
+
                 self._pipelines[pipeline_id]['games'][game_id] = GameProcessingState(
                     firebase_game_id=game_id,
-                    game_number=i + 1
+                    game_number=i + 1,
+                    team_a_name=team_a_name,
+                    team_b_name=team_b_name
                 ).__dict__
 
         self._update_pipeline(pipeline_id, {
