@@ -1996,7 +1996,7 @@ def process_game_videos_endpoint():
         }), 500
 
 
-def _run_video_processing_job(job_id: str, firebase_game_id: str, game_number: int, location: str, force_local_transcode: bool = False):
+def _run_video_processing_job(job_id: str, firebase_game_id: str, game_number: int, location: str):
     """Background worker for async video processing."""
     def update_progress(stage: str, detail: str = '', progress: float = 0, current_angle: str = ''):
         with video_processing_lock:
@@ -2020,8 +2020,7 @@ def _run_video_processing_job(job_id: str, firebase_game_id: str, game_number: i
             location=location,
             uball_client=uball_client,
             s3_bucket=UPLOAD_BUCKET,
-            progress_callback=update_progress,
-            force_local_transcode=force_local_transcode
+            progress_callback=update_progress
         )
 
         with video_processing_lock:
@@ -2062,8 +2061,7 @@ def process_game_videos_async():
     {
         "firebase_game_id": "abc123",
         "game_number": 1,
-        "location": "court-a",
-        "force_local_transcode": false  // Optional: force local CPU encoding instead of AWS GPU
+        "location": "court-a"
     }
 
     Returns immediately:
@@ -2089,7 +2087,6 @@ def process_game_videos_async():
         firebase_game_id = data.get('firebase_game_id')
         game_number = data.get('game_number', 1)
         location = data.get('location', UPLOAD_LOCATION)
-        force_local_transcode = data.get('force_local_transcode', False)
 
         if not firebase_game_id:
             return jsonify({'success': False, 'error': 'firebase_game_id required'}), 400
@@ -2099,7 +2096,6 @@ def process_game_videos_async():
 
         # Create job
         job_id = str(uuid.uuid4())
-        transcode_mode = 'local' if force_local_transcode else 'aws_gpu'
 
         with video_processing_lock:
             video_processing_jobs[job_id] = {
@@ -2107,7 +2103,7 @@ def process_game_videos_async():
                 'firebase_game_id': firebase_game_id,
                 'game_number': game_number,
                 'location': location,
-                'transcode_mode': transcode_mode,
+                'transcode_mode': 'aws_batch',
                 'status': 'running',
                 'stage': 'queued',
                 'detail': 'Job queued',
@@ -2122,12 +2118,12 @@ def process_game_videos_async():
         # Start background thread
         thread = threading.Thread(
             target=_run_video_processing_job,
-            args=(job_id, firebase_game_id, game_number, location, force_local_transcode),
+            args=(job_id, firebase_game_id, game_number, location),
             daemon=True
         )
         thread.start()
 
-        logger.info(f"[VideoProcessing] Started async job {job_id} for game {firebase_game_id} (mode: {transcode_mode})")
+        logger.info(f"[VideoProcessing] Started async job {job_id} for game {firebase_game_id} (mode: aws_batch)")
 
         return jsonify({
             'success': True,
@@ -3990,13 +3986,7 @@ def get_batch_transcode_status(job_id):
         }
     """
     try:
-        from aws_batch_transcode import AWSBatchTranscoder, is_aws_gpu_transcode_enabled
-
-        if not is_aws_gpu_transcode_enabled():
-            return jsonify({
-                'success': False,
-                'error': 'AWS GPU transcoding is not enabled. Set USE_AWS_GPU_TRANSCODE=true'
-            }), 503
+        from aws_batch_transcode import AWSBatchTranscoder
 
         transcoder = AWSBatchTranscoder()
         status = transcoder.get_job_status(job_id)
@@ -4044,13 +4034,7 @@ def complete_batch_transcode(job_id):
         }
     """
     try:
-        from aws_batch_transcode import AWSBatchTranscoder, is_aws_gpu_transcode_enabled
-
-        if not is_aws_gpu_transcode_enabled():
-            return jsonify({
-                'success': False,
-                'error': 'AWS GPU transcoding is not enabled. Set USE_AWS_GPU_TRANSCODE=true'
-            }), 503
+        from aws_batch_transcode import AWSBatchTranscoder
 
         data = request.get_json()
         if not data:
@@ -4156,13 +4140,7 @@ def wait_for_batch_transcode(job_id):
         Final job status (same as GET /api/batch/transcode/{job_id}/status)
     """
     try:
-        from aws_batch_transcode import AWSBatchTranscoder, is_aws_gpu_transcode_enabled
-
-        if not is_aws_gpu_transcode_enabled():
-            return jsonify({
-                'success': False,
-                'error': 'AWS GPU transcoding is not enabled. Set USE_AWS_GPU_TRANSCODE=true'
-            }), 503
+        from aws_batch_transcode import AWSBatchTranscoder
 
         data = request.get_json() or {}
         timeout = data.get('timeout', 1800)  # 30 min default
@@ -4209,10 +4187,6 @@ def get_batch_transcode_config():
         }
     """
     try:
-        from aws_batch_transcode import is_aws_gpu_transcode_enabled
-
-        enabled = is_aws_gpu_transcode_enabled()
-
         config = {
             'job_queue': os.getenv('AWS_BATCH_JOB_QUEUE', 'gpu-transcode-queue'),
             'job_definition': os.getenv('AWS_BATCH_JOB_DEFINITION', 'ffmpeg-nvenc-transcode'),
@@ -4222,7 +4196,7 @@ def get_batch_transcode_config():
 
         return jsonify({
             'success': True,
-            'enabled': enabled,
+            'enabled': True,
             'config': config
         })
 
@@ -4888,14 +4862,12 @@ from pipeline_orchestrator import init_orchestrator, get_orchestrator
 pipeline_orchestrator = None
 if firebase_service and upload_service:
     try:
-        use_aws_gpu = os.getenv('USE_AWS_GPU_TRANSCODE', 'false').lower() == 'true'
         pipeline_orchestrator = init_orchestrator(
             jetson_id=firebase_service.jetson_id,
             firebase_service=firebase_service,
             upload_service=upload_service,
             video_processor=video_processor,
-            uball_client=uball_client,
-            batch_enabled=use_aws_gpu
+            uball_client=uball_client
         )
         print(f"✓ Pipeline orchestrator initialized (uball_client: {'yes' if uball_client else 'no'})")
     except Exception as e:
@@ -5081,14 +5053,9 @@ if __name__ == '__main__':
     logger.info(f"API endpoint: http://0.0.0.0:5000")
     logger.info("Make sure GoPros are connected via USB")
 
-    # Check AWS GPU transcoding status
-    use_aws_gpu = os.getenv('USE_AWS_GPU_TRANSCODE', 'false').lower() == 'true'
-    if use_aws_gpu:
-        logger.info("AWS GPU Transcoding: ENABLED")
-        logger.info(f"  Job Queue: {os.getenv('AWS_BATCH_JOB_QUEUE', 'gpu-transcode-queue')}")
-        logger.info(f"  Job Definition: {os.getenv('AWS_BATCH_JOB_DEFINITION', 'ffmpeg-nvenc-transcode')}")
-    else:
-        logger.info("AWS GPU Transcoding: DISABLED (using local CPU encoding)")
+    logger.info("AWS Batch Transcoding: ENABLED")
+    logger.info(f"  Job Queue: {os.getenv('AWS_BATCH_JOB_QUEUE', 'gpu-transcode-queue')}")
+    logger.info(f"  Job Definition: {os.getenv('AWS_BATCH_JOB_DEFINITION', 'ffmpeg-nvenc-transcode')}")
 
     logger.info("=" * 60)
 

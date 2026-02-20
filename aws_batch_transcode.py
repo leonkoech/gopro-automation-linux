@@ -22,7 +22,6 @@ Encoding Specs (h264_nvenc GPU):
     - movflags: +faststart
 
 Environment Variables:
-    USE_AWS_GPU_TRANSCODE: Enable GPU transcoding (true/false)
     AWS_BATCH_JOB_QUEUE: Batch job queue name (default for small files)
     AWS_BATCH_JOB_QUEUE_LARGE: Batch job queue for large files (>=14GB)
     AWS_BATCH_JOB_DEFINITION: Batch job definition name
@@ -554,21 +553,13 @@ class AWSBatchTranscoder:
         return f"raw/{location}/{game_date}/{folder}/{filename}"
 
 
-def is_aws_gpu_transcode_enabled() -> bool:
-    """Check if AWS GPU transcoding is enabled via environment variable."""
-    return os.getenv('USE_AWS_GPU_TRANSCODE', 'false').lower() == 'true'
-
-
 def get_batch_transcoder() -> Optional[AWSBatchTranscoder]:
     """
-    Get AWSBatchTranscoder instance if GPU transcoding is enabled.
+    Get AWSBatchTranscoder instance.
 
     Returns:
-        AWSBatchTranscoder instance or None if not enabled
+        AWSBatchTranscoder instance or None on error
     """
-    if not is_aws_gpu_transcode_enabled():
-        return None
-
     try:
         return AWSBatchTranscoder()
     except Exception as e:

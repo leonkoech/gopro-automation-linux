@@ -464,6 +464,113 @@ class FirebaseService:
             'syncedAt': datetime.utcnow().isoformat() + 'Z'
         })
 
+    # ==================== Pipeline Run Tracking Methods ====================
+
+    PIPELINE_RUNS_COLLECTION = 'pipeline-runs'
+
+    def create_pipeline_run(self, pipeline_data: Dict[str, Any]) -> Optional[str]:
+        """
+        Create a pipeline-run document in Firebase when a pipeline starts.
+
+        This makes the Jetson backend the source of truth for pipeline state,
+        so the dashboard shows correct status even if the browser is closed.
+
+        Args:
+            pipeline_data: Dictionary containing pipeline state (pipeline_id, jetson_id,
+                          sessions info, stage, status, timestamps, etc.)
+
+        Returns:
+            Firebase document ID, or None if write failed
+        """
+        try:
+            doc_data = {
+                'pipeline_id': pipeline_data.get('pipeline_id'),
+                'jetson_id': pipeline_data.get('jetson_id'),
+                'status': pipeline_data.get('status', 'running'),
+                'stage': pipeline_data.get('stage', 'initializing'),
+                'stage_message': pipeline_data.get('stage_message', 'Initializing pipeline...'),
+                'progress': pipeline_data.get('progress', 0),
+                'sessions_total': pipeline_data.get('sessions_total', 0),
+                'sessions_uploaded': pipeline_data.get('sessions_uploaded', 0),
+                'sessions_skipped_unk': pipeline_data.get('sessions_skipped_unk', 0),
+                'games_total': pipeline_data.get('games_total', 0),
+                'games_completed': pipeline_data.get('games_completed', 0),
+                'batch_jobs_submitted': pipeline_data.get('batch_jobs_submitted', 0),
+                'batch_jobs_completed': pipeline_data.get('batch_jobs_completed', 0),
+                'recording_start': pipeline_data.get('recording_start'),
+                'recording_end': pipeline_data.get('recording_end'),
+                'started_at': pipeline_data.get('started_at', datetime.utcnow().isoformat() + 'Z'),
+                'completed_at': None,
+                'errors': [],
+                'sessions': pipeline_data.get('sessions', {}),
+                'games': pipeline_data.get('games', {}),
+            }
+
+            doc_ref = self.db.collection(self.PIPELINE_RUNS_COLLECTION).document(pipeline_data['pipeline_id'])
+            doc_ref.set(doc_data)
+            return doc_ref.id
+        except Exception as e:
+            import logging
+            logging.getLogger('gopro.firebase').error(f"Failed to create pipeline-run doc: {e}")
+            return None
+
+    def update_pipeline_run(self, pipeline_id: str, updates: Dict[str, Any]) -> bool:
+        """
+        Update specific fields on an existing pipeline-run document.
+
+        Called at stage transitions, session completions, and game completions.
+        Failures are logged but do not crash the pipeline.
+
+        Args:
+            pipeline_id: The pipeline ID (used as document ID)
+            updates: Dictionary of fields to update
+
+        Returns:
+            True if update succeeded, False otherwise
+        """
+        try:
+            doc_ref = self.db.collection(self.PIPELINE_RUNS_COLLECTION).document(pipeline_id)
+            doc_ref.update(updates)
+            return True
+        except Exception as e:
+            import logging
+            logging.getLogger('gopro.firebase').error(f"Failed to update pipeline-run {pipeline_id}: {e}")
+            return False
+
+    def complete_pipeline_run(self, pipeline_id: str, final_data: Dict[str, Any]) -> bool:
+        """
+        Mark a pipeline-run as completed or failed with final stats.
+
+        Args:
+            pipeline_id: The pipeline ID (used as document ID)
+            final_data: Dictionary containing final status, stage, message,
+                       completed_at, and any final counts
+
+        Returns:
+            True if update succeeded, False otherwise
+        """
+        try:
+            doc_ref = self.db.collection(self.PIPELINE_RUNS_COLLECTION).document(pipeline_id)
+            update_data = {
+                'status': final_data.get('status', 'completed'),
+                'stage': final_data.get('stage', 'completed'),
+                'stage_message': final_data.get('stage_message', 'Pipeline complete.'),
+                'progress': final_data.get('progress', 100),
+                'completed_at': final_data.get('completed_at', datetime.utcnow().isoformat() + 'Z'),
+                'sessions_uploaded': final_data.get('sessions_uploaded', 0),
+                'games_total': final_data.get('games_total', 0),
+                'games_completed': final_data.get('games_completed', 0),
+                'batch_jobs_submitted': final_data.get('batch_jobs_submitted', 0),
+                'batch_jobs_completed': final_data.get('batch_jobs_completed', 0),
+                'errors': final_data.get('errors', []),
+            }
+            doc_ref.update(update_data)
+            return True
+        except Exception as e:
+            import logging
+            logging.getLogger('gopro.firebase').error(f"Failed to complete pipeline-run {pipeline_id}: {e}")
+            return False
+
     # ==================== Chapter Upload Pipeline Methods ====================
 
     def update_session_s3_prefix(self, session_id: str, s3_prefix: str) -> None:

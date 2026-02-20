@@ -796,205 +796,6 @@ class VideoProcessor:
             traceback.print_exc()
             return None
 
-    def extract_4k_stream_to_s3(
-        self,
-        chapters: List[Dict[str, Any]],
-        offset_seconds: float,
-        duration_seconds: float,
-        s3_upload_service,
-        s3_key: str,
-        add_buffer: float = 30.0
-    ) -> Optional[str]:
-        """
-        Extract a 4K clip with stream copy and pipe directly to S3.
-        No temp file on disk - streams FFmpeg output to S3 multipart upload.
-
-        Args:
-            chapters: List of chapter files to process
-            offset_seconds: Seek position from start of first chapter
-            duration_seconds: Length of clip to extract
-            s3_upload_service: VideoUploadService instance with S3 client
-            s3_key: S3 key (path) to upload to
-            add_buffer: Extra seconds to add before/after game (default 30s)
-
-        Returns:
-            S3 URI on success, None on failure
-        """
-        import threading
-
-        if not chapters:
-            logger.error("No chapters provided for 4K stream to S3")
-            return None
-
-        # Add buffer time (but don't go negative)
-        buffered_offset = max(0, offset_seconds - add_buffer)
-        buffered_duration = duration_seconds + (2 * add_buffer)
-
-        logger.info(f"Extracting 4K and streaming directly to S3:")
-        logger.info(f"  Chapters: {len(chapters)}")
-        logger.info(f"  Offset: {self._format_duration(buffered_offset)}")
-        logger.info(f"  Duration: {self._format_duration(buffered_duration)}")
-        logger.info(f"  S3 Key: {s3_key}")
-
-        s3_client = s3_upload_service.s3_client
-        bucket = s3_upload_service.bucket_name
-
-        try:
-            # Build FFmpeg command
-            if len(chapters) == 1:
-                # Single file extraction
-                cmd = [
-                    'ffmpeg', '-y',
-                    '-ss', str(buffered_offset),
-                    '-i', chapters[0]['path'],
-                    '-t', str(buffered_duration),
-                    '-c', 'copy',
-                    '-avoid_negative_ts', 'make_zero',
-                    '-movflags', 'frag_keyframe+empty_moov',
-                    '-f', 'mp4',
-                    'pipe:1'
-                ]
-            else:
-                # Multiple files - create concat file
-                with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
-                    concat_file = f.name
-                    for chapter in chapters:
-                        escaped_path = chapter['path'].replace("'", "'\\''")
-                        f.write(f"file '{escaped_path}'\n")
-
-                cmd = [
-                    'ffmpeg', '-y',
-                    '-ss', str(buffered_offset),
-                    '-f', 'concat', '-safe', '0',
-                    '-i', concat_file,
-                    '-t', str(buffered_duration),
-                    '-c', 'copy',
-                    '-avoid_negative_ts', 'make_zero',
-                    '-movflags', 'frag_keyframe+empty_moov',
-                    '-f', 'mp4',
-                    'pipe:1'
-                ]
-
-            logger.info(f"  FFmpeg cmd: {' '.join(cmd)}")
-
-            # Start multipart upload
-            mpu = s3_client.create_multipart_upload(
-                Bucket=bucket,
-                Key=s3_key,
-                ContentType='video/mp4'
-            )
-            upload_id = mpu['UploadId']
-            parts = []
-            part_number = 1
-            PART_SIZE = 25 * 1024 * 1024  # 25 MB parts
-            total_bytes = 0
-
-            # Start FFmpeg process
-            process = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                bufsize=PART_SIZE
-            )
-
-            # Read stderr in background
-            stderr_output = []
-            def read_stderr():
-                stderr_output.append(process.stderr.read().decode('utf-8', errors='replace'))
-            stderr_thread = threading.Thread(target=read_stderr, daemon=True)
-            stderr_thread.start()
-
-            # Stream to S3
-            buffer = b''
-            while True:
-                chunk = process.stdout.read(PART_SIZE - len(buffer))
-                if not chunk:
-                    break
-                buffer += chunk
-
-                if len(buffer) >= PART_SIZE:
-                    response = s3_client.upload_part(
-                        Bucket=bucket,
-                        Key=s3_key,
-                        PartNumber=part_number,
-                        UploadId=upload_id,
-                        Body=buffer
-                    )
-                    parts.append({
-                        'ETag': response['ETag'],
-                        'PartNumber': part_number
-                    })
-                    total_bytes += len(buffer)
-                    logger.info(f"  Uploaded part {part_number} ({total_bytes / (1024*1024):.0f} MB streamed)")
-                    part_number += 1
-                    buffer = b''
-
-            # Upload remaining buffer
-            if buffer:
-                response = s3_client.upload_part(
-                    Bucket=bucket,
-                    Key=s3_key,
-                    PartNumber=part_number,
-                    UploadId=upload_id,
-                    Body=buffer
-                )
-                parts.append({
-                    'ETag': response['ETag'],
-                    'PartNumber': part_number
-                })
-                total_bytes += len(buffer)
-                logger.info(f"  Uploaded final part {part_number} ({total_bytes / (1024*1024):.0f} MB total)")
-
-            # Wait for FFmpeg
-            process.stdout.close()
-            return_code = process.wait(timeout=1800)
-            stderr_thread.join(timeout=5)
-
-            # Clean up concat file if created
-            if len(chapters) > 1:
-                try:
-                    os.unlink(concat_file)
-                except:
-                    pass
-
-            if return_code != 0:
-                stderr_text = stderr_output[0] if stderr_output else "Unknown error"
-                logger.error(f"FFmpeg failed: {stderr_text[-500:]}")
-                # Abort multipart upload
-                s3_client.abort_multipart_upload(
-                    Bucket=bucket,
-                    Key=s3_key,
-                    UploadId=upload_id
-                )
-                return None
-
-            # Complete multipart upload
-            s3_client.complete_multipart_upload(
-                Bucket=bucket,
-                Key=s3_key,
-                UploadId=upload_id,
-                MultipartUpload={'Parts': parts}
-            )
-
-            s3_uri = f"s3://{bucket}/{s3_key}"
-            size_gb = total_bytes / (1024**3)
-            logger.info(f"  Streamed 4K to S3: {s3_uri} ({size_gb:.2f} GB)")
-            return s3_uri
-
-        except Exception as e:
-            logger.error(f"Stream to S3 failed: {e}")
-            import traceback
-            traceback.print_exc()
-            # Try to abort multipart upload
-            try:
-                s3_client.abort_multipart_upload(
-                    Bucket=bucket,
-                    Key=s3_key,
-                    UploadId=upload_id
-                )
-            except:
-                pass
-            return None
 
     def generate_game_filename(
         self,
@@ -1319,8 +1120,7 @@ def process_game_videos(
     location: str = 'default-location',
     uball_client=None,
     s3_bucket: str = 'uball-videos-production',
-    progress_callback=None,
-    force_local_transcode: bool = False
+    progress_callback=None
 ) -> Dict[str, Any]:
     """
     Process videos for a specific game.
@@ -1355,20 +1155,10 @@ def process_game_videos(
         'success': False,
         'processed_videos': [],
         'registered_videos': [],  # Videos registered in Uball (FL/FR only)
-        'batch_jobs': [],  # AWS Batch transcode jobs (when USE_AWS_GPU_TRANSCODE=true)
+        'batch_jobs': [],  # AWS Batch transcode jobs
         'errors': [],
         'uball_game_id': None
     }
-
-    # Check if AWS GPU transcoding is enabled (can be overridden by force_local_transcode)
-    use_aws_gpu = os.getenv('USE_AWS_GPU_TRANSCODE', 'false').lower() == 'true'
-    if force_local_transcode:
-        use_aws_gpu = False
-        logger.info("LOCAL TRANSCODE FORCED - will encode locally and stream to S3")
-    elif use_aws_gpu:
-        logger.info("AWS GPU transcoding ENABLED - will use stream copy + AWS Batch")
-    else:
-        logger.info("AWS GPU transcoding disabled - using local CPU encoding")
 
     report_progress('initializing', 'Loading game data...', 5)
 
@@ -1636,520 +1426,218 @@ def process_game_videos(
             ) if upload_service else None
 
             # ============================================================
-            # BRANCHING: AWS GPU vs Local CPU encoding
+            # AWS Batch Processing
             # ============================================================
-            if use_aws_gpu and upload_service:
-                # ===========================================================
-                # FAST PATH: 4K stream copy + AWS Batch GPU transcoding
-                # ===========================================================
-                logger.info(f"[AWS GPU] Using stream copy + Batch for {angle_code}")
-                report_progress('extracting', f'Stream copying 4K {angle_code}...', session_base_progress, angle_code)
+            from aws_batch_transcode import AWSBatchTranscoder
 
-                # Import AWS Batch transcoder
-                from aws_batch_transcode import AWSBatchTranscoder
+            try:
+                batch_transcoder = AWSBatchTranscoder(bucket=upload_service.bucket_name)
+            except Exception as e:
+                logger.error(f"Failed to initialize AWS Batch transcoder: {e}")
+                results['errors'].append(f"AWS Batch init failed: {str(e)}")
+                continue
 
+            raw_s3_key = batch_transcoder.generate_raw_s3_key(
+                court_location, game_date, uball_game_id, angle_code
+            )
+
+            # Check if chapters are from S3 (need cloud extraction via AWS Batch)
+            chapters_from_s3 = any(
+                ch.get('source') == 's3' for ch in params['chapters_needed']
+            )
+
+            # =======================================================
+            # SKIP LOGIC: Check if files already exist in S3
+            # =======================================================
+            # Generate the final 1080p S3 key for skip check
+            uuid_parts = uball_game_id.split('-')[:4]
+            game_folder = '-'.join(uuid_parts)
+            final_1080p_key = f"{court_location}/{game_date}/{game_folder}/{game_date}_{game_folder}_{angle_code}.mp4"
+
+            # Check if 1080p file already exists (skip processing)
+            try:
+                import boto3
+                from botocore.config import Config as BotoConfig
+                boto_config = BotoConfig(retries={'max_attempts': 2, 'mode': 'adaptive'})
+                s3_client = boto3.client('s3', config=boto_config, verify=False)
+                bucket_name = upload_service.bucket_name
+
+                # Check 1080p output first (if exists, skip everything)
                 try:
-                    batch_transcoder = AWSBatchTranscoder(bucket=upload_service.bucket_name)
-                except Exception as e:
-                    logger.error(f"Failed to initialize AWS Batch transcoder: {e}")
-                    results['errors'].append(f"AWS Batch init failed: {str(e)}")
-                    continue
+                    s3_client.head_object(Bucket=bucket_name, Key=final_1080p_key)
+                    logger.info(f"[SKIP] 1080p file already exists: s3://{bucket_name}/{final_1080p_key}")
 
-                # 1. Extract 4K and stream directly to S3 raw/ prefix
-                # court_location is defined above - used for both 4K raw and 1080p output paths
-                raw_s3_key = batch_transcoder.generate_raw_s3_key(
-                    court_location, game_date, uball_game_id, angle_code
-                )
-
-                # Check if chapters are from S3 (need cloud extraction via AWS Batch)
-                chapters_from_s3 = any(
-                    ch.get('source') == 's3' for ch in params['chapters_needed']
-                )
-
-                # =======================================================
-                # SKIP LOGIC: Check if files already exist in S3
-                # =======================================================
-                # Generate the final 1080p S3 key for skip check
-                uuid_parts = uball_game_id.split('-')[:4]
-                game_folder = '-'.join(uuid_parts)
-                final_1080p_key = f"{court_location}/{game_date}/{game_folder}/{game_date}_{game_folder}_{angle_code}.mp4"
-
-                # Check if 1080p file already exists (skip processing)
-                try:
-                    import boto3
-                    from botocore.config import Config as BotoConfig
-                    # Use verify=False for Jetson SSL compatibility
-                    boto_config = BotoConfig(retries={'max_attempts': 2, 'mode': 'adaptive'})
-                    s3_client = boto3.client('s3', config=boto_config, verify=False)
-                    bucket_name = upload_service.bucket_name
-
-                    # Check 1080p output first (if exists, skip everything)
-                    try:
-                        s3_client.head_object(Bucket=bucket_name, Key=final_1080p_key)
-                        logger.info(f"[SKIP] 1080p file already exists: s3://{bucket_name}/{final_1080p_key}")
-
-                        # For FL/FR angles, check if video is registered in Uball annotation tool
-                        # If not registered, register it now before skipping
-                        if angle_code in ['FL', 'FR'] and uball_client:
-                            try:
-                                # Check if this angle is already registered
-                                existing_videos = uball_client.get_videos_for_game(uball_game_id)
-                                uball_angle = 'LEFT' if angle_code == 'FL' else 'RIGHT'
-
-                                already_registered = any(
-                                    v.get('angle') == uball_angle for v in existing_videos
-                                )
-
-                                if not already_registered:
-                                    logger.info(f"[AUTO-REGISTER] {angle_code} not registered in Uball, registering now...")
-                                    filename = final_1080p_key.split('/')[-1]
-
-                                    reg_result = uball_client.register_video(
-                                        game_id=uball_game_id,
-                                        s3_key=final_1080p_key,
-                                        angle=uball_angle,
-                                        filename=filename,
-                                        duration=0.0  # Will be updated by frontend
-                                    )
-
-                                    if reg_result:
-                                        logger.info(f"[AUTO-REGISTER] SUCCESS: {angle_code} registered for game {uball_game_id}")
-                                        results.setdefault('registered_videos', []).append({
-                                            'angle': angle_code,
-                                            'uball_game_id': uball_game_id,
-                                            's3_key': final_1080p_key
-                                        })
-                                    else:
-                                        logger.warning(f"[AUTO-REGISTER] FAILED: Could not register {angle_code}")
-                                else:
-                                    logger.info(f"[SKIP] {angle_code} already registered in Uball for game {uball_game_id}")
-                            except Exception as reg_err:
-                                logger.error(f"[AUTO-REGISTER] Error checking/registering {angle_code}: {reg_err}")
-
-                        results['processed_videos'].append({
-                            'angle': angle_code,
-                            'session_id': session['id'],
-                            'status': 'skipped',
-                            'skip_reason': '1080p_exists',
-                            's3_key': final_1080p_key
-                        })
-                        continue  # Skip to next session
-                    except s3_client.exceptions.ClientError as e:
-                        if e.response['Error']['Code'] != '404':
-                            raise  # Re-raise non-404 errors
-                        # 1080p doesn't exist - check raw 4K next
-
-                    # Check if raw 4K file exists (can skip extract, just need Batch transcode)
-                    raw_4k_exists = False
-                    try:
-                        s3_client.head_object(Bucket=bucket_name, Key=raw_s3_key)
-                        raw_4k_exists = True
-                        logger.info(f"[SKIP LAMBDA] Raw 4K file already exists: s3://{bucket_name}/{raw_s3_key}")
-                    except s3_client.exceptions.ClientError as e:
-                        if e.response['Error']['Code'] != '404':
-                            raise  # Re-raise non-404 errors
-                        # Raw 4K doesn't exist - need to extract
-
-                except Exception as e:
-                    logger.warning(f"[SKIP CHECK] Error checking S3: {e} - proceeding with processing")
-                    raw_4k_exists = False
-
-                if chapters_from_s3:
-                    # =======================================================
-                    # SKIP PATH: Raw 4K exists in S3, submit Batch directly
-                    # Skip extraction, just need to transcode 4K → 1080p
-                    # =======================================================
-
-                    # Skip extraction if raw 4K already exists, just submit Batch transcode
-                    if raw_4k_exists:
-                        logger.info(f"[AWS GPU] Raw 4K exists - submitting Batch transcode directly")
-                        report_progress('encoding', f'Submitting Batch for {angle_code}...', session_base_progress, angle_code)
-
-                        # Submit Batch transcode job directly
+                    # For FL/FR angles, check if video is registered in Uball annotation tool
+                    # If not registered, register it now before skipping
+                    if angle_code in ['FL', 'FR'] and uball_client:
                         try:
-                            batch_job_result = batch_transcoder.submit_transcode_job(
-                                input_s3_key=raw_s3_key,
-                                output_s3_key=s3_key,
-                                game_id=uball_game_id,  # Use Uball game ID for registration
-                                angle=angle_code
+                            existing_videos = uball_client.get_videos_for_game(uball_game_id)
+                            uball_angle = 'LEFT' if angle_code == 'FL' else 'RIGHT'
+
+                            already_registered = any(
+                                v.get('angle') == uball_angle for v in existing_videos
                             )
 
-                            if batch_job_result:
-                                batch_job_info = {
-                                    'job_id': batch_job_result['job_id'],
-                                    'job_name': batch_job_result.get('job_name', ''),
-                                    'job_queue': batch_transcoder.job_queue,
-                                    'angle': angle_code,
-                                    'game_id': uball_game_id,  # Uball game ID for registration
-                                    'raw_s3_key': raw_s3_key,
-                                    'final_s3_key': s3_key,
-                                    'session_id': session['id'],
-                                    'filename': output_filename,
-                                    'status': 'SUBMITTED',
-                                    'submitted_by': 'direct_skip'
-                                }
-                                results['batch_jobs'].append(batch_job_info)
+                            if not already_registered:
+                                logger.info(f"[AUTO-REGISTER] {angle_code} not registered in Uball, registering now...")
+                                filename = final_1080p_key.split('/')[-1]
 
-                                firebase_service.add_processed_game(session['id'], {
-                                    'firebase_game_id': firebase_game_id,
-                                    'game_number': game_number,
-                                    'extracted_filename': output_filename,
-                                    's3_key': s3_key,
-                                    'batch_job_id': batch_job_result['job_id'],
-                                    'batch_status': 'pending',
-                                    'extraction_method': 'skip_extract'
-                                })
-                                continue  # Skip to next session
+                                reg_result = uball_client.register_video(
+                                    game_id=uball_game_id,
+                                    s3_key=final_1080p_key,
+                                    angle=uball_angle,
+                                    filename=filename,
+                                    duration=0.0  # Will be updated by frontend
+                                )
+
+                                if reg_result:
+                                    logger.info(f"[AUTO-REGISTER] SUCCESS: {angle_code} registered for game {uball_game_id}")
+                                    results.setdefault('registered_videos', []).append({
+                                        'angle': angle_code,
+                                        'uball_game_id': uball_game_id,
+                                        's3_key': final_1080p_key
+                                    })
+                                else:
+                                    logger.warning(f"[AUTO-REGISTER] FAILED: Could not register {angle_code}")
                             else:
-                                logger.error(f"[AWS GPU] Direct Batch submit failed for {angle_code}")
-                        except Exception as e:
-                            logger.error(f"[AWS GPU] Direct Batch submit error: {e}")
-                            results['errors'].append(f"Direct Batch submit failed for {angle_code}: {str(e)}")
-                            continue
+                                logger.info(f"[SKIP] {angle_code} already registered in Uball for game {uball_game_id}")
+                        except Exception as reg_err:
+                            logger.error(f"[AUTO-REGISTER] Error checking/registering {angle_code}: {reg_err}")
 
-                    # =======================================================
-                    # BATCH-ONLY PATH: Direct extraction + transcoding in one job
-                    # No intermediate 4K file - outputs directly to 1080p
-                    # =======================================================
-                    logger.info(f"[BATCH-ONLY] Submitting direct extract+transcode job for {angle_code}")
-                    report_progress('extracting', f'Batch extracting+transcoding {angle_code}...', session_base_progress, angle_code)
+                    results['processed_videos'].append({
+                        'angle': angle_code,
+                        'session_id': session['id'],
+                        'status': 'skipped',
+                        'skip_reason': '1080p_exists',
+                        's3_key': final_1080p_key
+                    })
+                    continue  # Skip to next session
+                except s3_client.exceptions.ClientError as e:
+                    if e.response['Error']['Code'] != '404':
+                        raise  # Re-raise non-404 errors
+                    # 1080p doesn't exist - check raw 4K next
 
-                    try:
-                        batch_result = batch_transcoder.submit_extract_transcode_job(
-                            chapters=params['chapters_needed'],
-                            bucket=upload_service.bucket_name,
-                            offset_seconds=params['offset_seconds'],
-                            duration_seconds=params['duration_seconds'],
-                            output_s3_key=s3_key,  # Direct to final 1080p path
-                            game_id=uball_game_id,  # Use Uball game ID for registration
-                            angle=angle_code,
-                            add_buffer_seconds=30.0
-                        )
+                # Check if raw 4K file exists (can skip extract, just need Batch transcode)
+                raw_4k_exists = False
+                try:
+                    s3_client.head_object(Bucket=bucket_name, Key=raw_s3_key)
+                    raw_4k_exists = True
+                    logger.info(f"[SKIP] Raw 4K file already exists: s3://{bucket_name}/{raw_s3_key}")
+                except s3_client.exceptions.ClientError as e:
+                    if e.response['Error']['Code'] != '404':
+                        raise  # Re-raise non-404 errors
+                    # Raw 4K doesn't exist - need to extract
 
-                        if batch_result and batch_result.get('job_id'):
-                            logger.info(f"[BATCH-ONLY] Job submitted: {batch_result['job_id']}")
+            except Exception as e:
+                logger.warning(f"[SKIP CHECK] Error checking S3: {e} - proceeding with processing")
+                raw_4k_exists = False
 
-                            # Track batch job info
-                            batch_job_info = {
-                                'job_id': batch_result['job_id'],
-                                'job_name': batch_result.get('jobName', ''),
-                                'job_queue': batch_result.get('jobQueue', 'unknown'),
-                                'angle': angle_code,
-                                'game_id': uball_game_id,  # Uball game ID for registration
-                                'raw_s3_key': None,  # No intermediate file
-                                'final_s3_key': s3_key,
-                                'session_id': session['id'],
-                                'filename': output_filename,
-                                'duration': params['duration_seconds'],
-                                'status': 'SUBMITTED',
-                                'submitted_by': 'batch_only',
-                                'pipeline': 'batch-only'
-                            }
-                            results['batch_jobs'].append(batch_job_info)
-
-                            # Update recording session with pending Batch job info
-                            firebase_service.add_processed_game(session['id'], {
-                                'firebase_game_id': firebase_game_id,
-                                'game_number': game_number,
-                                'extracted_filename': output_filename,
-                                's3_key': s3_key,
-                                'batch_job_id': batch_result['job_id'],
-                                'batch_status': 'pending',
-                                'extraction_method': 'batch_only'
-                            })
-
-                            # Batch-only path complete - continue to next session
-                            continue
-                        else:
-                            logger.error(f"[BATCH-ONLY] Job submission failed for {angle_code}")
-                            results['errors'].append(f"Batch-only job submission failed for {angle_code}")
-                            continue
-
-                    except Exception as e:
-                        logger.error(f"[BATCH-ONLY] Error submitting job for {angle_code}: {e}")
-                        results['errors'].append(f"Batch-only error for {angle_code}: {str(e)}")
-                        continue
-
-                else:
-                    # Local chapters - use existing Jetson extraction
-                    logger.info(f"[AWS GPU] Streaming 4K directly to S3 (no temp file)")
-                    report_progress('extracting', f'Extracting & streaming 4K {angle_code} to S3...', session_base_progress, angle_code)
-
-                    raw_s3_uri = video_processor.extract_4k_stream_to_s3(
-                        params['chapters_needed'],
-                        params['offset_seconds'],
-                        params['duration_seconds'],
-                        upload_service,
-                        raw_s3_key,
-                        add_buffer=30.0
-                    )
-
-                if not raw_s3_uri:
-                    results['errors'].append(f"4K stream to S3 failed for {angle_code}")
-                    continue
-
-                logger.info(f"[AWS GPU] Streamed 4K to: {raw_s3_uri}")
-
-                # Get file size from S3 for queue selection
-                file_info = batch_transcoder.get_output_file_info(raw_s3_key)
-                file_size_bytes = file_info.get('size_bytes', 0) if file_info.get('exists') else 0
-                logger.info(f"[AWS GPU] 4K file size: {file_size_bytes / (1024**3):.2f} GB")
-
-                # 3. Submit AWS Batch transcode job
-                report_progress('batch_submit', f'Submitting Batch job for {angle_code}...', session_base_progress + 30, angle_code)
+            # =======================================================
+            # SKIP PATH: Raw 4K exists in S3, submit Batch directly
+            # =======================================================
+            if raw_4k_exists:
+                logger.info(f"[BATCH] Raw 4K exists - submitting Batch transcode directly")
+                report_progress('encoding', f'Submitting Batch for {angle_code}...', session_base_progress, angle_code)
 
                 try:
-                    job = batch_transcoder.submit_transcode_job(
+                    batch_job_result = batch_transcoder.submit_transcode_job(
                         input_s3_key=raw_s3_key,
                         output_s3_key=s3_key,
-                        game_id=firebase_game_id,
-                        angle=angle_code,
-                        file_size_bytes=file_size_bytes
+                        game_id=uball_game_id,
+                        angle=angle_code
                     )
 
-                    logger.info(f"[AWS GPU] Batch job submitted: {job['jobId']}")
+                    if batch_job_result:
+                        batch_job_info = {
+                            'job_id': batch_job_result['job_id'],
+                            'job_name': batch_job_result.get('job_name', ''),
+                            'job_queue': batch_transcoder.job_queue,
+                            'angle': angle_code,
+                            'game_id': uball_game_id,
+                            'raw_s3_key': raw_s3_key,
+                            'final_s3_key': s3_key,
+                            'session_id': session['id'],
+                            'filename': output_filename,
+                            'status': 'SUBMITTED',
+                            'submitted_by': 'direct_skip'
+                        }
+                        results['batch_jobs'].append(batch_job_info)
 
-                    # 4. Track job info for later completion
+                        firebase_service.add_processed_game(session['id'], {
+                            'firebase_game_id': firebase_game_id,
+                            'game_number': game_number,
+                            'extracted_filename': output_filename,
+                            's3_key': s3_key,
+                            'batch_job_id': batch_job_result['job_id'],
+                            'batch_status': 'pending',
+                            'extraction_method': 'skip_extract'
+                        })
+                        continue  # Skip to next session
+                    else:
+                        logger.error(f"[BATCH] Direct Batch submit failed for {angle_code}")
+                except Exception as e:
+                    logger.error(f"[BATCH] Direct Batch submit error: {e}")
+                    results['errors'].append(f"Direct Batch submit failed for {angle_code}: {str(e)}")
+                    continue
+
+            # =======================================================
+            # BATCH-ONLY PATH: Direct extraction + transcoding in one job
+            # No intermediate 4K file - outputs directly to 1080p
+            # =======================================================
+            logger.info(f"[BATCH-ONLY] Submitting direct extract+transcode job for {angle_code}")
+            report_progress('extracting', f'Batch extracting+transcoding {angle_code}...', session_base_progress, angle_code)
+
+            try:
+                batch_result = batch_transcoder.submit_extract_transcode_job(
+                    chapters=params['chapters_needed'],
+                    bucket=upload_service.bucket_name,
+                    offset_seconds=params['offset_seconds'],
+                    duration_seconds=params['duration_seconds'],
+                    output_s3_key=s3_key,
+                    game_id=uball_game_id,
+                    angle=angle_code,
+                    add_buffer_seconds=30.0
+                )
+
+                if batch_result and batch_result.get('job_id'):
+                    logger.info(f"[BATCH-ONLY] Job submitted: {batch_result['job_id']}")
+
                     batch_job_info = {
-                        'job_id': job['jobId'],
-                        'job_name': job['jobName'],
-                        'job_queue': job.get('jobQueue', 'unknown'),
+                        'job_id': batch_result['job_id'],
+                        'job_name': batch_result.get('jobName', ''),
+                        'job_queue': batch_result.get('jobQueue', 'unknown'),
                         'angle': angle_code,
-                        'raw_s3_key': raw_s3_key,
+                        'game_id': uball_game_id,
+                        'raw_s3_key': None,
                         'final_s3_key': s3_key,
                         'session_id': session['id'],
                         'filename': output_filename,
                         'duration': params['duration_seconds'],
-                        'file_size_bytes': file_size_bytes,
-                        'status': 'SUBMITTED'
+                        'status': 'SUBMITTED',
+                        'submitted_by': 'batch_only',
+                        'pipeline': 'batch-only'
                     }
                     results['batch_jobs'].append(batch_job_info)
 
-                    # Update recording session with pending Batch job info
                     firebase_service.add_processed_game(session['id'], {
                         'firebase_game_id': firebase_game_id,
                         'game_number': game_number,
                         'extracted_filename': output_filename,
                         's3_key': s3_key,
-                        'batch_job_id': job['jobId'],
-                        'batch_status': 'pending'
+                        'batch_job_id': batch_result['job_id'],
+                        'batch_status': 'pending',
+                        'extraction_method': 'batch_only'
                     })
-
-                except Exception as e:
-                    logger.error(f"[AWS GPU] Failed to submit Batch job for {angle_code}: {e}")
-                    results['errors'].append(f"Batch job submission failed for {angle_code}: {str(e)}")
-                    # Clean up raw file from S3 if job submission failed
-                    batch_transcoder.delete_raw_file(raw_s3_key)
-
-                # No local cleanup needed - 4K was streamed directly to S3
-
-            else:
-                # ===========================================================
-                # Check if chapters are from S3 (need cloud extraction via AWS Batch)
-                # ===========================================================
-                chapters_from_s3 = any(
-                    ch.get('source') == 's3' for ch in params['chapters_needed']
-                )
-
-                if chapters_from_s3 and upload_service:
-                    # ===========================================================
-                    # BATCH-ONLY PATH: Chapters in S3 - use AWS Batch for extraction
-                    # Jetson FFmpeg doesn't support HTTPS, so use cloud processing
-                    # ===========================================================
-                    logger.info(f"[BATCH-ONLY] Chapters are in S3 - using Batch extraction for {angle_code}")
-                    report_progress('extracting', f'Batch extracting+transcoding {angle_code}...', session_base_progress, angle_code)
-
-                    try:
-                        from aws_batch_transcode import get_batch_transcoder
-                        batch_transcoder = get_batch_transcoder()
-
-                        if not batch_transcoder:
-                            logger.error(f"[BATCH-ONLY] Batch transcoder not available for {angle_code}")
-                            results['errors'].append(f"Batch transcoder not available for {angle_code}")
-                            continue
-
-                        batch_result = batch_transcoder.submit_extract_transcode_job(
-                            chapters=params['chapters_needed'],
-                            bucket=upload_service.bucket_name,
-                            offset_seconds=params['offset_seconds'],
-                            duration_seconds=params['duration_seconds'],
-                            output_s3_key=s3_key,
-                            game_id=uball_game_id,
-                            angle=angle_code,
-                            add_buffer_seconds=30.0
-                        )
-
-                        if batch_result and batch_result.get('job_id'):
-                            logger.info(f"[BATCH-ONLY] Job submitted: {batch_result['job_id']}")
-
-                            batch_job_info = {
-                                'job_id': batch_result['job_id'],
-                                'job_name': batch_result.get('jobName', ''),
-                                'job_queue': batch_result.get('jobQueue', 'unknown'),
-                                'angle': angle_code,
-                                'game_id': uball_game_id,
-                                'raw_s3_key': None,
-                                'final_s3_key': s3_key,
-                                'session_id': session['id'],
-                                'filename': output_filename,
-                                'duration': params['duration_seconds'],
-                                'status': 'SUBMITTED',
-                                'submitted_by': 'batch_only',
-                                'pipeline': 'batch-only'
-                            }
-                            results['batch_jobs'].append(batch_job_info)
-
-                            firebase_service.add_processed_game(session['id'], {
-                                'firebase_game_id': firebase_game_id,
-                                'game_number': game_number,
-                                'extracted_filename': output_filename,
-                                's3_key': s3_key,
-                                'batch_job_id': batch_result['job_id'],
-                                'batch_status': 'pending',
-                                'extraction_method': 'batch_only'
-                            })
-                            continue
-                        else:
-                            logger.error(f"[BATCH-ONLY] Job submission failed for {angle_code}")
-                            results['errors'].append(f"Batch-only job submission failed for {angle_code}")
-                            continue
-
-                    except Exception as e:
-                        logger.error(f"[BATCH-ONLY] Error for {angle_code}: {e}")
-                        import traceback
-                        traceback.print_exc()
-                        results['errors'].append(f"Batch extraction error for {angle_code}: {str(e)}")
-                        continue
-
-                # ===========================================================
-                # LOCAL PATH: Existing Jetson CPU encoding (libx264)
-                # Used when chapters are on local disk (not in S3)
-                # ===========================================================
-
-                # Extract the clip — streams directly to S3 if upload_service is available
-                report_progress('extracting', f'Encoding & streaming {angle_code} to S3...', session_base_progress, angle_code)
-
-                extracted_path = video_processor.extract_game_clip(
-                    params['chapters_needed'],
-                    params['offset_seconds'],
-                    params['duration_seconds'],
-                    output_filename,
-                    add_buffer=30.0,
-                    s3_upload_service=upload_service,
-                    s3_key=s3_key
-                )
-
-                if not extracted_path:
-                    results['errors'].append(f"Extraction failed for {angle_code}")
+                    continue
+                else:
+                    logger.error(f"[BATCH-ONLY] Job submission failed for {angle_code}")
+                    results['errors'].append(f"Batch-only job submission failed for {angle_code}")
                     continue
 
-                # When streamed to S3, file is not on disk — get info from S3 instead
-                streamed_to_s3 = upload_service and s3_key
-                if streamed_to_s3:
-                    # Get file size from S3
-                    try:
-                        s3_head = upload_service.s3_client.head_object(
-                            Bucket=upload_service.bucket_name, Key=s3_key
-                        )
-                        video_info = {
-                            'size_bytes': s3_head.get('ContentLength', 0),
-                            'duration': params['duration_seconds'],
-                        }
-                    except Exception as e:
-                        logger.warning(f"Could not get S3 object info: {e}")
-                        video_info = {'size_bytes': 0, 'duration': params['duration_seconds']}
-
-                    s3_uri = f"s3://{upload_service.bucket_name}/{s3_key}"
-                    logger.info(f"Streamed to S3: {s3_uri}")
-                else:
-                    video_info = video_processor.get_video_info(extracted_path)
-
-                # 4. Upload to S3 (only if NOT already streamed)
-                if upload_service:
-                    try:
-                        upload_progress = session_base_progress + 25
-
-                        if not streamed_to_s3:
-                            # Fallback: separate upload (only if streaming was not used)
-                            report_progress('uploading', f'Uploading {angle_code} to S3...', upload_progress, angle_code)
-                            s3_uri = upload_service.upload_video_with_key(
-                                video_path=extracted_path,
-                                s3_key=s3_key
-                            )
-                            logger.info(f"Uploaded to S3: {s3_uri}")
-
-                        report_progress('uploaded', f'{angle_code} uploaded successfully', upload_progress + 10, angle_code)
-
-                        # Update recording session with processed game info
-                        firebase_service.add_processed_game(session['id'], {
-                            'firebase_game_id': firebase_game_id,
-                            'game_number': game_number,
-                            'extracted_filename': output_filename,
-                            's3_key': s3_key
-                        })
-
-                        video_result = {
-                            'angle': angle_code,
-                            'session_id': session['id'],
-                            'filename': output_filename,
-                            's3_key': s3_key,
-                            's3_uri': s3_uri,
-                            'duration': video_info.get('duration'),
-                            'size_bytes': video_info.get('size_bytes', 0),
-                            'size_mb': round(video_info.get('size_bytes', 0) / (1024 * 1024), 2)
-                        }
-
-                        results['processed_videos'].append(video_result)
-
-                        # 5. Register FL/FR videos in Uball Backend
-                        if uball_client and angle_code in ['FL', 'FR']:
-                            report_progress('registering', f'Registering {angle_code} in Uball...', upload_progress + 15, angle_code)
-                            try:
-                                uball_result = uball_client.register_game_video(
-                                    firebase_game_id=firebase_game_id,
-                                    s3_key=s3_key,
-                                    angle_code=angle_code,
-                                    filename=output_filename,
-                                    duration=video_info.get('duration'),
-                                    file_size=video_info.get('size_bytes'),
-                                    s3_bucket=s3_bucket
-                                )
-
-                                if uball_result:
-                                    logger.info(f"Registered {angle_code} video in Uball: {uball_result.get('id')}")
-                                    results['registered_videos'].append({
-                                        'angle': angle_code,
-                                        'uball_video_id': uball_result.get('id'),
-                                        's3_key': s3_key
-                                    })
-                                else:
-                                    logger.warning(f"Failed to register {angle_code} video in Uball")
-                                    results['errors'].append(f"Uball registration failed for {angle_code}")
-
-                            except Exception as e:
-                                logger.error(f"Uball registration error for {angle_code}: {e}")
-                                results['errors'].append(f"Uball registration error for {angle_code}: {str(e)}")
-
-                        # Clean up local file after upload (skip if streamed to S3)
-                        if not streamed_to_s3:
-                            try:
-                                os.remove(extracted_path)
-                            except:
-                                pass
-
-                    except Exception as e:
-                        logger.error(f"Upload failed for {angle_code}: {e}")
-                        results['errors'].append(f"Upload failed for {angle_code}: {str(e)}")
-                else:
-                    # No upload service, just record local file
-                    results['processed_videos'].append({
-                        'angle': angle_code,
-                        'session_id': session['id'],
-                        'filename': output_filename,
-                        'local_path': extracted_path,
-                        'duration': video_info.get('duration'),
-                        'size_mb': round(video_info.get('size_bytes', 0) / (1024 * 1024), 2)
-                    })
+            except Exception as e:
+                logger.error(f"[BATCH-ONLY] Error submitting job for {angle_code}: {e}")
+                results['errors'].append(f"Batch-only error for {angle_code}: {str(e)}")
+                continue
 
         # Success if we processed videos directly OR submitted batch jobs
         batch_jobs_count = len(results.get('batch_jobs', []))
@@ -2159,9 +1647,6 @@ def process_game_videos(
         # Build detailed status message
         corrupted_count = len(results.get('corrupted_sessions', []))
         error_count = len(results.get('errors', []))
-
-        # Add GPU transcode flag to results
-        results['gpu_transcode_enabled'] = use_aws_gpu
 
         if results['success']:
             if batch_jobs_count > 0:

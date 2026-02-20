@@ -161,15 +161,13 @@ class PipelineOrchestrator:
         firebase_service,
         upload_service,
         video_processor,
-        uball_client=None,
-        batch_enabled: bool = True
+        uball_client=None
     ):
         self.jetson_id = jetson_id
         self.firebase_service = firebase_service
         self.upload_service = upload_service
         self.video_processor = video_processor
         self.uball_client = uball_client
-        self.batch_enabled = batch_enabled
 
         # Pipeline tracking
         self._pipelines: Dict[str, Dict[str, Any]] = {}
@@ -268,6 +266,19 @@ class PipelineOrchestrator:
                 'errors': []
             }
 
+        # Write initial pipeline-run doc to Firebase (source of truth)
+        with self._lock:
+            initial_state = dict(self._pipelines[pipeline_id])
+            # Convert PipelineStage enum to string for Firebase
+            initial_state['stage'] = initial_state['stage'].value if isinstance(initial_state.get('stage'), PipelineStage) else str(initial_state.get('stage', ''))
+            # Remove non-serializable fields
+            initial_state.pop('gopro_connections', None)
+        firebase_doc_id = self.firebase_service.create_pipeline_run(initial_state)
+        if firebase_doc_id:
+            logger.info(f"[Pipeline {pipeline_id}] Created Firebase pipeline-run doc: {firebase_doc_id}")
+        else:
+            logger.warning(f"[Pipeline {pipeline_id}] Failed to create Firebase pipeline-run doc (will continue)")
+
         # Run pipeline in background thread
         def run_pipeline():
             try:
@@ -280,6 +291,15 @@ class PipelineOrchestrator:
                     'status': 'failed',
                     'stage': PipelineStage.FAILED,
                     'stage_message': f'Pipeline failed: {str(e)}',
+                    'errors': [str(e)]
+                })
+                # Update Firebase on fatal failure
+                self._firebase_update_pipeline(pipeline_id, {
+                    'status': 'failed',
+                    'stage': PipelineStage.FAILED.value,
+                    'stage_message': f'Pipeline failed: {str(e)}',
+                    'progress': 0,
+                    'completed_at': datetime.now().isoformat(),
                     'errors': [str(e)]
                 })
 
@@ -300,6 +320,11 @@ class PipelineOrchestrator:
         # ==================== PHASE 1: Upload Chapters to S3 ====================
         self._update_pipeline(pipeline_id, {
             'stage': PipelineStage.UPLOADING_CHAPTERS,
+            'stage_message': f'Uploading chapters from {len(sessions)} sessions...',
+            'progress': 5
+        })
+        self._firebase_update_pipeline(pipeline_id, {
+            'stage': PipelineStage.UPLOADING_CHAPTERS.value,
             'stage_message': f'Uploading chapters from {len(sessions)} sessions...',
             'progress': 5
         })
@@ -327,7 +352,13 @@ class PipelineOrchestrator:
                     'skipped': True
                 })
                 with self._lock:
-                    self._pipelines[pipeline_id]['sessions_uploaded'] += 1
+                    count = self._pipelines[pipeline_id]['sessions_uploaded'] + 1
+                    self._pipelines[pipeline_id]['sessions_uploaded'] = count
+                # Firebase: update session upload count
+                self._firebase_update_pipeline(pipeline_id, {
+                    'sessions_uploaded': count,
+                    'stage_message': f'Uploading chapters ({count}/{len(sessions)})...'
+                })
                 continue
 
             gopro_ip = gopro_connections.get(interface_id)
@@ -394,7 +425,13 @@ class PipelineOrchestrator:
                     })
 
                     with self._lock:
-                        self._pipelines[pipeline_id]['sessions_uploaded'] += 1
+                        count = self._pipelines[pipeline_id]['sessions_uploaded'] + 1
+                        self._pipelines[pipeline_id]['sessions_uploaded'] = count
+                    # Firebase: update session upload count
+                    self._firebase_update_pipeline(pipeline_id, {
+                        'sessions_uploaded': count,
+                        'stage_message': f'Uploading chapters ({count}/{len(sessions)})...'
+                    })
 
                     logger.info(f"[Pipeline {pipeline_id}] Session {session_id} uploaded to {result['s3_prefix']}")
                 else:
@@ -424,6 +461,11 @@ class PipelineOrchestrator:
             'stage_message': 'Detecting games from Firebase...',
             'progress': 40
         })
+        self._firebase_update_pipeline(pipeline_id, {
+            'stage': PipelineStage.DETECTING_GAMES.value,
+            'stage_message': 'Detecting games from Firebase...',
+            'progress': 40
+        })
 
         # Get pipeline state for timerange (stored as ISO strings; parse to UTC datetime for query)
         with self._lock:
@@ -443,12 +485,29 @@ class PipelineOrchestrator:
 
         if not games:
             # No games found - pipeline complete (chapters uploaded successfully)
+            completed_at = datetime.now().isoformat()
+            with self._lock:
+                sessions_uploaded = self._pipelines[pipeline_id]['sessions_uploaded']
             self._update_pipeline(pipeline_id, {
                 'status': 'completed',
                 'stage': PipelineStage.COMPLETED,
                 'stage_message': 'Chapters uploaded. No games found to process.',
                 'progress': 100,
-                'completed_at': datetime.now().isoformat()
+                'completed_at': completed_at
+            })
+            # Firebase: mark pipeline complete
+            self.firebase_service.complete_pipeline_run(pipeline_id, {
+                'status': 'completed',
+                'stage': PipelineStage.COMPLETED.value,
+                'stage_message': 'Chapters uploaded. No games found to process.',
+                'progress': 100,
+                'completed_at': completed_at,
+                'sessions_uploaded': sessions_uploaded,
+                'games_total': 0,
+                'games_completed': 0,
+                'batch_jobs_submitted': 0,
+                'batch_jobs_completed': 0,
+                'errors': []
             })
             logger.info(f"[Pipeline {pipeline_id}] Completed - no games to process")
             return
@@ -481,6 +540,12 @@ class PipelineOrchestrator:
             'stage': PipelineStage.PROCESSING_GAMES,
             'stage_message': f'Processing 0/{len(games)} games...',
             'progress': 50
+        })
+        self._firebase_update_pipeline(pipeline_id, {
+            'stage': PipelineStage.PROCESSING_GAMES.value,
+            'stage_message': f'Processing 0/{len(games)} games...',
+            'progress': 50,
+            'games_total': len(games)
         })
 
         from video_processing import process_game_videos
@@ -533,6 +598,15 @@ class PipelineOrchestrator:
                         self._pipelines[pipeline_id]['batch_jobs_submitted'] += len(batch_jobs)
                         if not batch_jobs:
                             self._pipelines[pipeline_id]['games_completed'] += 1
+                        games_completed = self._pipelines[pipeline_id]['games_completed']
+                        batch_submitted = self._pipelines[pipeline_id]['batch_jobs_submitted']
+
+                    # Firebase: update game completion + batch count
+                    self._firebase_update_pipeline(pipeline_id, {
+                        'games_completed': games_completed,
+                        'batch_jobs_submitted': batch_submitted,
+                        'stage_message': f'Processing game {game_number}/{len(games)}...'
+                    })
 
                     logger.info(f"[Pipeline {pipeline_id}] Game {game_number} processed ({len(batch_jobs)} batch jobs)")
                 else:
@@ -569,6 +643,12 @@ class PipelineOrchestrator:
                 'stage': PipelineStage.WAITING_BATCH,
                 'stage_message': f'Waiting for {batch_jobs_count} encoding jobs...',
                 'progress': 90
+            })
+            self._firebase_update_pipeline(pipeline_id, {
+                'stage': PipelineStage.WAITING_BATCH.value,
+                'stage_message': f'Waiting for {batch_jobs_count} encoding jobs...',
+                'progress': 90,
+                'batch_jobs_submitted': batch_jobs_count
             })
 
             logger.info(f"[Pipeline {pipeline_id}] Starting background poller for {batch_jobs_count} batch jobs")
@@ -615,12 +695,37 @@ class PipelineOrchestrator:
                     logger.warning(f"[Pipeline {pipeline_id}] Failed to delete files from {gopro_ip}: {e}")
 
         # ==================== Complete ====================
+        completed_at = datetime.now().isoformat()
+        final_status = 'completed' if not processing_errors else 'completed_with_errors'
         self._update_pipeline(pipeline_id, {
-            'status': 'completed' if not processing_errors else 'completed_with_errors',
+            'status': final_status,
             'stage': PipelineStage.COMPLETED,
             'stage_message': f'Pipeline complete. {len(games)} games processed.',
             'progress': 100,
-            'completed_at': datetime.now().isoformat()
+            'completed_at': completed_at
+        })
+
+        # Firebase: mark pipeline complete with final stats
+        with self._lock:
+            p = self._pipelines[pipeline_id]
+            final_errors = list(p.get('errors', []))
+            sessions_uploaded = p.get('sessions_uploaded', 0)
+            games_completed = p.get('games_completed', 0)
+            batch_submitted = p.get('batch_jobs_submitted', 0)
+            batch_completed = p.get('batch_jobs_completed', 0)
+
+        self.firebase_service.complete_pipeline_run(pipeline_id, {
+            'status': final_status,
+            'stage': PipelineStage.COMPLETED.value,
+            'stage_message': f'Pipeline complete. {len(games)} games processed.',
+            'progress': 100,
+            'completed_at': completed_at,
+            'sessions_uploaded': sessions_uploaded,
+            'games_total': len(games),
+            'games_completed': games_completed,
+            'batch_jobs_submitted': batch_submitted,
+            'batch_jobs_completed': batch_completed,
+            'errors': final_errors
         })
 
         logger.info(f"[Pipeline {pipeline_id}] Completed successfully")
@@ -651,6 +756,13 @@ class PipelineOrchestrator:
         except Exception as e:
             logger.warning(f"Failed to delete files from GoPro at {gopro_ip}: {e}")
             raise
+
+    def _firebase_update_pipeline(self, pipeline_id: str, updates: Dict[str, Any]):
+        """Write pipeline updates to Firebase. Failures are logged but don't crash the pipeline."""
+        try:
+            self.firebase_service.update_pipeline_run(pipeline_id, updates)
+        except Exception as e:
+            logger.warning(f"[Pipeline {pipeline_id}] Firebase update failed (non-fatal): {e}")
 
     def _update_pipeline(self, pipeline_id: str, updates: Dict[str, Any]):
         """Update pipeline state."""
@@ -707,8 +819,7 @@ def init_orchestrator(
     firebase_service,
     upload_service,
     video_processor,
-    uball_client=None,
-    batch_enabled: bool = True
+    uball_client=None
 ) -> PipelineOrchestrator:
     """Initialize the global pipeline orchestrator."""
     global _orchestrator
@@ -717,7 +828,6 @@ def init_orchestrator(
         firebase_service=firebase_service,
         upload_service=upload_service,
         video_processor=video_processor,
-        uball_client=uball_client,
-        batch_enabled=batch_enabled
+        uball_client=uball_client
     )
     return _orchestrator
