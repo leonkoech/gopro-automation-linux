@@ -1577,6 +1577,87 @@ def get_game(game_id):
         }), 500
 
 
+SHOT_LABELS = {
+    '2PT_MAKE': '2-Pointer Made',  '2PT_MISS': '2-Pointer Missed',
+    '3PT_MAKE': '3-Pointer Made',  '3PT_MISS': '3-Pointer Missed',
+    'FT_MAKE':  'Free Throw Made', 'FT_MISS':  'Free Throw Missed',
+    'FOUL':     'Foul',            'TIPOFF':   'Tipoff',
+}
+
+
+def _create_plays_from_firebase_logs(client, uball_game_id, firebase_game):
+    """Create plays in annotation tool from Firebase game logs.
+
+    Returns:
+        int: Number of plays successfully created
+    """
+    logs = firebase_game.get('logs', [])
+    if not logs:
+        return 0
+
+    left_name  = firebase_game.get('leftTeam', {}).get('name', 'Team 1')
+    right_name = firebase_game.get('rightTeam', {}).get('name', 'Team 2')
+    game_start = datetime.fromisoformat(firebase_game['createdAt'].replace('Z', '+00:00'))
+
+    created = 0
+    for log in logs:
+        action    = log.get('actionType', '')
+        payload   = log.get('payload', {}) or {}
+        team_side = log.get('team')  # 'left', 'right', or None
+
+        # Map action to classification
+        if action == 'score_added':
+            points = payload.get('points', 0)
+            if points == 2:   classification = '2PT_MAKE'
+            elif points == 3: classification = '3PT_MAKE'
+            elif points == 1: classification = 'FT_MAKE'
+            else:             continue
+        elif action == 'foul_added':
+            classification = 'FOUL'
+        elif action == 'game_started':
+            classification = 'TIPOFF'
+        else:
+            continue
+
+        # Team side mapping
+        if team_side == 'left':
+            team      = 'team1'
+            team_name = left_name
+        elif team_side == 'right':
+            team      = 'team2'
+            team_name = right_name
+        else:
+            team      = None
+            team_name = 'Game'
+
+        # Timestamp calculation
+        log_time = datetime.fromisoformat(log['timestamp'].replace('Z', '+00:00'))
+        ts       = (log_time - game_start).total_seconds()
+        start_ts = max(0.0, ts - 5.0)
+        end_ts   = ts + 3.0
+
+        note = f"{team_name} — {SHOT_LABELS.get(classification, classification)}"
+
+        play_data = {
+            'game_id':           uball_game_id,
+            'classification':    classification,
+            'note':              note,
+            'timestamp_seconds': ts,
+            'start_timestamp':   start_ts,
+            'end_timestamp':     end_ts,
+        }
+        if team:
+            play_data['team'] = team
+
+        try:
+            client.create_play(play_data)
+            created += 1
+        except Exception as e:
+            logger.warning(f"[GameSync] Failed to create play ({classification} at {ts:.1f}s): {e}")
+
+    return created
+
+
 @app.route('/api/games/sync', methods=['POST'])
 def sync_game_to_uball():
     """
@@ -1752,6 +1833,11 @@ def sync_game_to_uball():
 
         uball_game_id = str(uball_game.get('id', ''))
 
+        # 5.5. Create plays from Firebase logs
+        logger.info(f"[GameSync] Step 5.5: Creating plays from Firebase logs...")
+        plays_created = _create_plays_from_firebase_logs(uball_client, uball_game_id, firebase_game)
+        logger.info(f"[GameSync] Created {plays_created} plays from {len(firebase_game.get('logs', []))} log events")
+
         # 6. Mark game as synced in Firebase
         logger.info(f"[GameSync] Step 6: Marking game as synced in Firebase...")
         firebase_service.mark_game_synced(firebase_game_id, uball_game_id)
@@ -1765,7 +1851,8 @@ def sync_game_to_uball():
             'uball_game_id': uball_game_id,
             'firebase_game_id': firebase_game_id,
             'video_name': video_name,
-            'game': uball_game
+            'game': uball_game,
+            'plays_created': plays_created,
         }
 
         # Include teams created info if any

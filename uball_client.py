@@ -293,6 +293,30 @@ class UballClient:
             logger.error(f"[UballClient] Create team error: {e}")
             return None
 
+    def create_play(self, play_data: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Create a play in the annotation tool.
+
+        Args:
+            play_data: Play data containing game_id, classification, note,
+                       timestamp_seconds, start_timestamp, end_timestamp, and optionally team.
+
+        Returns:
+            Created play data dict
+
+        Raises:
+            requests.HTTPError: If the request fails
+        """
+        self._ensure_authenticated()
+        response = requests.post(
+            f"{self.backend_url}/api/plays/",
+            json=play_data,
+            headers=self._get_headers(),
+            timeout=30
+        )
+        response.raise_for_status()
+        return response.json()
+
     def health_check(self) -> bool:
         """
         Check if Uball Backend is reachable and authentication works.
