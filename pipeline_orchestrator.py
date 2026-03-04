@@ -112,6 +112,7 @@ class PipelineStage(str, Enum):
     CLEANUP = 'cleanup'
     COMPLETED = 'completed'
     FAILED = 'failed'
+    CANCELLED = 'cancelled'
 
 
 class GameProcessingState:
@@ -263,7 +264,10 @@ class PipelineOrchestrator:
                 'completed_at': None,
 
                 # Errors
-                'errors': []
+                'errors': [],
+
+                # Cancellation
+                'cancel_requested': False
             }
 
         # Write initial pipeline-run doc to Firebase (source of truth)
@@ -338,6 +342,10 @@ class PipelineOrchestrator:
         upload_errors = []
 
         for i, session in enumerate(sessions):
+            if self._is_cancelled(pipeline_id):
+                self._mark_cancelled(pipeline_id)
+                return
+
             session_id = session['id']
             interface_id = session.get('interfaceId', '')
             existing_s3_prefix = session.get('s3Prefix')
@@ -455,6 +463,10 @@ class PipelineOrchestrator:
             with self._lock:
                 self._pipelines[pipeline_id]['errors'].extend(upload_errors)
 
+        if self._is_cancelled(pipeline_id):
+            self._mark_cancelled(pipeline_id)
+            return
+
         # ==================== PHASE 2: Detect Games ====================
         self._update_pipeline(pipeline_id, {
             'stage': PipelineStage.DETECTING_GAMES,
@@ -512,6 +524,10 @@ class PipelineOrchestrator:
             logger.info(f"[Pipeline {pipeline_id}] Completed - no games to process")
             return
 
+        if self._is_cancelled(pipeline_id):
+            self._mark_cancelled(pipeline_id)
+            return
+
         # Initialize game states
         with self._lock:
             self._pipelines[pipeline_id]['games_total'] = len(games)
@@ -553,6 +569,10 @@ class PipelineOrchestrator:
         processing_errors = []
 
         for i, game in enumerate(games):
+            if self._is_cancelled(pipeline_id):
+                self._mark_cancelled(pipeline_id)
+                return
+
             game_id = game['id']
             game_number = i + 1
 
@@ -785,6 +805,35 @@ class PipelineOrchestrator:
                 games = self._pipelines[pipeline_id].get('games', {})
                 if game_id in games:
                     games[game_id].update(updates)
+
+    def cancel_pipeline(self, pipeline_id: str) -> bool:
+        """Request cancellation of a running pipeline. Returns True if found and running."""
+        with self._lock:
+            if pipeline_id not in self._pipelines:
+                return False
+            if self._pipelines[pipeline_id].get('status') != 'running':
+                return False
+            self._pipelines[pipeline_id]['cancel_requested'] = True
+        return True
+
+    def _is_cancelled(self, pipeline_id: str) -> bool:
+        with self._lock:
+            return self._pipelines.get(pipeline_id, {}).get('cancel_requested', False)
+
+    def _mark_cancelled(self, pipeline_id: str):
+        cancelled_at = datetime.now().isoformat()
+        self._update_pipeline(pipeline_id, {
+            'status': 'cancelled',
+            'stage': PipelineStage.CANCELLED,
+            'stage_message': 'Pipeline cancelled by user.',
+            'completed_at': cancelled_at
+        })
+        self._firebase_update_pipeline(pipeline_id, {
+            'status': 'cancelled',
+            'stage': PipelineStage.CANCELLED.value,
+            'stage_message': 'Pipeline cancelled by user.',
+            'completed_at': cancelled_at
+        })
 
     def get_pipeline_status(self, pipeline_id: str) -> Optional[Dict[str, Any]]:
         """Get current status of a pipeline."""

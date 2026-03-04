@@ -5103,6 +5103,21 @@ def get_full_pipeline_status(pipeline_id):
     })
 
 
+@app.route('/api/pipeline/full/<pipeline_id>/cancel', methods=['POST'])
+def cancel_pipeline(pipeline_id):
+    """Cancel a running pipeline."""
+    from pipeline_orchestrator import get_orchestrator
+    orchestrator = get_orchestrator()
+    if not orchestrator:
+        return jsonify({'success': False, 'error': 'Pipeline orchestrator not initialized'}), 500
+
+    cancelled = orchestrator.cancel_pipeline(pipeline_id)
+    if not cancelled:
+        return jsonify({'success': False, 'error': 'Pipeline not found or not running'}), 404
+
+    return jsonify({'success': True, 'message': f'Cancel requested for pipeline {pipeline_id}'})
+
+
 @app.route('/api/pipeline/full/list', methods=['GET'])
 def list_full_pipelines():
     """
