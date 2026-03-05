@@ -5161,4 +5161,10 @@ if __name__ == '__main__':
 
     logger.info("=" * 60)
 
+    # Cleanup any pipelines that were left in 'running' state by a previous crash/restart
+    if firebase_service:
+        stale_count = firebase_service.cleanup_stale_running_pipelines()
+        if stale_count:
+            logger.warning(f"Startup cleanup: marked {stale_count} stale pipeline(s) as failed due to service restart")
+
     app.run(host='0.0.0.0', port=5000, debug=False, threaded=True)

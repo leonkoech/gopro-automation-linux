@@ -571,6 +571,47 @@ class FirebaseService:
             logging.getLogger('gopro.firebase').error(f"Failed to complete pipeline-run {pipeline_id}: {e}")
             return False
 
+    def cleanup_stale_running_pipelines(self) -> int:
+        """
+        On service startup, mark any pipelines still in 'running' status as failed.
+
+        This handles the case where the service was killed (restart, crash) while a
+        pipeline was in progress — the pipeline thread dies but Firebase never gets
+        updated from 'running' to 'failed'.
+
+        Returns:
+            Number of pipelines marked as failed.
+        """
+        import logging
+        log = logging.getLogger('gopro.firebase')
+        try:
+            q = (
+                self.db.collection(self.PIPELINE_RUNS_COLLECTION)
+                .where('jetson_id', '==', self.jetson_id)
+                .where('status', '==', 'running')
+            )
+            docs = q.get()
+            count = 0
+            failed_at = datetime.utcnow().isoformat() + 'Z'
+            for doc in docs:
+                try:
+                    doc.reference.update({
+                        'status': 'failed',
+                        'stage': 'failed',
+                        'stage_message': 'Pipeline interrupted: service restarted unexpectedly.',
+                        'completed_at': failed_at,
+                    })
+                    count += 1
+                    log.warning(f"Marked stale pipeline {doc.id} as failed (service restart cleanup)")
+                except Exception as e:
+                    log.error(f"Failed to clean up stale pipeline {doc.id}: {e}")
+            if count:
+                log.info(f"Startup cleanup: marked {count} stale running pipeline(s) as failed")
+            return count
+        except Exception as e:
+            log.error(f"Failed to query stale pipelines on startup: {e}")
+            return 0
+
     # ==================== Chapter Upload Pipeline Methods ====================
 
     def update_session_s3_prefix(self, session_id: str, s3_prefix: str) -> None:
