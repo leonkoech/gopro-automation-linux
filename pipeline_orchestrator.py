@@ -418,8 +418,13 @@ class PipelineOrchestrator:
                     session=session,
                     gopro_ip=gopro_ip,
                     chapters=chapters_to_upload,
-                    progress_callback=session_progress
+                    progress_callback=session_progress,
+                    cancel_fn=lambda: self._is_cancelled(pipeline_id)
                 )
+
+                if result.get('cancelled'):
+                    self._mark_cancelled(pipeline_id)
+                    return
 
                 if result['success']:
                     # Update Firebase with s3Prefix

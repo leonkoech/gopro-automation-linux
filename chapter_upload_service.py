@@ -616,7 +616,8 @@ class ChapterUploadService:
         session: Dict[str, Any],
         gopro_ip: str,
         chapters: List[Dict[str, Any]],
-        progress_callback: Optional[Callable[[str, int, int, int], None]] = None
+        progress_callback: Optional[Callable[[str, int, int, int], None]] = None,
+        cancel_fn: Optional[Callable[[], bool]] = None
     ) -> Dict[str, Any]:
         """
         Upload all chapters for a recording session to S3.
@@ -688,6 +689,12 @@ class ChapterUploadService:
 
         try:
             for i, chapter in enumerate(chapters):
+                # Check for cancellation before each chapter
+                if cancel_fn and cancel_fn():
+                    logger.info(f"Upload cancelled before chapter {i + 1}/{total_chapters} — stopping.")
+                    results['cancelled'] = True
+                    break
+
                 chapter_num = i + 1
                 filename = chapter['filename']
                 directory = chapter['directory']
