@@ -159,6 +159,12 @@ class FirebaseService:
             'totalSizeBytes': stop_data.get('total_size_bytes', 0)
         }
 
+        # Store exact chapter filenames so the pipeline uploads the correct files
+        # instead of blindly taking the last N files from the GoPro
+        chapter_files = stop_data.get('chapter_files')
+        if chapter_files:
+            update_data['chapterFiles'] = chapter_files
+
         doc_ref.update(update_data)
 
     def update_session_status(self, session_id: str, status: str) -> None:

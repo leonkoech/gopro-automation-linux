@@ -389,12 +389,28 @@ class PipelineOrchestrator:
             })
 
             try:
-                # Get chapters from GoPro
-                all_chapters = chapter_service.get_gopro_media_list(gopro_ip)
-                expected_count = session.get('totalChapters', 0)
-
-                # Take the chapters for this session (last N chapters)
-                chapters_to_upload = all_chapters[-expected_count:] if expected_count > 0 else all_chapters
+                # Get chapters for this session
+                stored_chapters = session.get('chapterFiles')
+                if stored_chapters:
+                    # Preferred: use exact filenames stored during recording stop
+                    chapters_to_upload = stored_chapters
+                    logger.info(f"[Pipeline {pipeline_id}] Session {session_id} using {len(chapters_to_upload)} stored chapter filenames")
+                else:
+                    # Legacy fallback: session was created before chapterFiles was stored.
+                    # Take last N chapters from GoPro, but ONLY if totalChapters > 0.
+                    expected_count = session.get('totalChapters', 0)
+                    if expected_count == 0:
+                        error = f"Session has no chapterFiles and totalChapters=0 — cannot determine which files to upload"
+                        logger.warning(f"[Pipeline {pipeline_id}] Session {session_id}: {error}")
+                        upload_errors.append(f"{_normalize_angle_code(session.get('angleCode'))}: {error}")
+                        self._update_session_state(pipeline_id, session_id, {
+                            'status': 'failed',
+                            'error': error
+                        })
+                        continue
+                    all_chapters = chapter_service.get_gopro_media_list(gopro_ip)
+                    chapters_to_upload = all_chapters[-expected_count:]
+                    logger.warning(f"[Pipeline {pipeline_id}] Session {session_id} using legacy last-{expected_count} fallback (no chapterFiles stored)")
 
                 self._update_session_state(pipeline_id, session_id, {
                     'chapters_total': len(chapters_to_upload)

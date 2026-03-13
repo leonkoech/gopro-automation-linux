@@ -840,7 +840,8 @@ def stop_recording(gopro_id):
                         if session_id_to_update:
                             stop_data = {
                                 'total_chapters': len(new_chapters),
-                                'total_size_bytes': total_size_bytes
+                                'total_size_bytes': total_size_bytes,
+                                'chapter_files': new_chapters  # Store exact filenames for correct pipeline upload
                             }
                             firebase_service.register_recording_stop(session_id_to_update, stop_data)
                             logger.info(f"[{gopro_id}] ✓ Firebase session updated: {session_id_to_update}")
