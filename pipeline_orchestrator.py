@@ -722,7 +722,42 @@ class PipelineOrchestrator:
                             poll_interval=30,
                             max_wait=3600  # 1 hour max wait
                         )
-                        logger.info(f"[Pipeline {pipeline_id}] Batch poller complete: {result.get('registered', 0)} registered, {result.get('failed', 0)} failed")
+                        completed_count = result.get('registered', 0)
+                        failed_count = result.get('failed', 0)
+                        logger.info(f"[Pipeline {pipeline_id}] Batch poller complete: {completed_count} registered, {failed_count} failed")
+
+                        # Build sets of completed/failed job IDs for game matching
+                        completed_job_ids = {j['job_id'] for j in result.get('completed_jobs', []) if j.get('job_id')}
+                        failed_job_ids = {j['job_id'] for j in result.get('failed_jobs', []) if j.get('job_id')}
+
+                        # Update in-memory pipeline state (if still exists)
+                        games_newly_completed = 0
+                        games_newly_failed = 0
+                        with self._lock:
+                            p = self._pipelines.get(pipeline_id)
+                            if p:
+                                p['batch_jobs_completed'] = completed_count + failed_count
+                                # Update each game's status based on its batch jobs
+                                for game_id, game_state in p.get('games', {}).items():
+                                    if game_state.get('status') == 'batch_submitted':
+                                        game_batch_ids = set(game_state.get('batch_jobs', []))
+                                        if game_batch_ids and game_batch_ids <= (completed_job_ids | failed_job_ids):
+                                            if game_batch_ids & failed_job_ids:
+                                                game_state['status'] = 'failed'
+                                                games_newly_failed += 1
+                                            else:
+                                                game_state['status'] = 'completed'
+                                                games_newly_completed += 1
+                                p['games_completed'] = p.get('games_completed', 0) + games_newly_completed
+                                p['games_failed'] = p.get('games_failed', 0) + games_newly_failed
+
+                        # Sync updated state to Firebase (works even after pipeline is "completed")
+                        self._firebase_sync_full_state(pipeline_id)
+                        self._firebase_update_pipeline(pipeline_id, {
+                            'batch_jobs_completed': completed_count + failed_count,
+                        })
+                        logger.info(f"[Pipeline {pipeline_id}] Firebase updated with batch results: {games_newly_completed} games completed, {games_newly_failed} failed")
+
                     except Exception as e:
                         logger.error(f"[Pipeline {pipeline_id}] Batch poller error: {e}")
 
