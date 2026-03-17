@@ -316,6 +316,66 @@ def get_gopro_files(gopro_ip):
         print(f"Error getting GoPro files: {e}")
     return files
 
+
+def _fetch_gopro_chapters(gopro_ip, pre_record_files=None, label=''):
+    """Fetch chapter files from GoPro SD card, waiting for file count to stabilize.
+
+    Args:
+        gopro_ip: GoPro HTTP API IP address
+        pre_record_files: Set of filenames on SD before recording (to exclude)
+        label: Label for log messages (e.g. gopro_id)
+
+    Returns:
+        List of {'directory': ..., 'filename': ..., 'size': ...} dicts
+    """
+    if pre_record_files is None:
+        pre_record_files = set()
+
+    new_chapters = []
+    last_chapter_count = 0
+    stable_count = 0
+    max_retries = 10
+
+    for attempt in range(max_retries):
+        logger.info(f"[{label}] Getting media list (attempt {attempt + 1}/{max_retries})...")
+        try:
+            media_response = requests.get(
+                f'http://{gopro_ip}:8080/gopro/media/list',
+                timeout=15
+            )
+            media_list = media_response.json()
+
+            new_chapters = []
+            for directory in media_list.get('media', []):
+                dir_name = directory['d']
+                for file_info in directory.get('fs', []):
+                    filename = file_info['n']
+                    if filename not in pre_record_files and filename.lower().endswith('.mp4'):
+                        new_chapters.append({
+                            'directory': dir_name,
+                            'filename': filename,
+                            'size': int(file_info.get('s', 0))
+                        })
+
+            logger.info(f"[{label}] Found {len(new_chapters)} new chapters")
+
+            if len(new_chapters) == last_chapter_count and len(new_chapters) > 0:
+                stable_count += 1
+                if stable_count >= 2:
+                    logger.info(f"[{label}] Chapter count stable at {len(new_chapters)}")
+                    break
+            else:
+                stable_count = 0
+                last_chapter_count = len(new_chapters)
+
+        except Exception as e:
+            logger.warning(f"[{label}] Error getting media list: {e}")
+
+        if attempt < max_retries - 1:
+            time.sleep(2)
+
+    return new_chapters
+
 def get_gopro_camera_name(gopro_ip):
     """Get the camera name from GoPro's API (ap_ssid field)"""
     try:
@@ -770,51 +830,8 @@ def stop_recording(gopro_id):
                 logger.info(f"[{gopro_id}] Waiting for GoPro to finalize files...")
                 time.sleep(5)
 
-                # Retry loop to ensure all chapters are available
-                new_chapters = []
-                last_chapter_count = 0
-                stable_count = 0
-                max_retries = 10
-
-                for attempt in range(max_retries):
-                    logger.info(f"[{gopro_id}] Getting media list (attempt {attempt + 1}/{max_retries})...")
-                    try:
-                        media_response = requests.get(
-                            f'http://{gopro_ip}:8080/gopro/media/list',
-                            timeout=15
-                        )
-                        media_list = media_response.json()
-
-                        # Find ALL new files (recorded during this session)
-                        new_chapters = []
-                        for directory in media_list.get('media', []):
-                            dir_name = directory['d']
-                            for file_info in directory.get('fs', []):
-                                filename = file_info['n']
-                                if filename not in pre_record_files and filename.lower().endswith('.mp4'):
-                                    new_chapters.append({
-                                        'directory': dir_name,
-                                        'filename': filename,
-                                        'size': int(file_info.get('s', 0))
-                                    })
-
-                        logger.info(f"[{gopro_id}] Found {len(new_chapters)} new chapters")
-
-                        # Check if chapter count has stabilized
-                        if len(new_chapters) == last_chapter_count and len(new_chapters) > 0:
-                            stable_count += 1
-                            if stable_count >= 2:
-                                logger.info(f"[{gopro_id}] Chapter count stable at {len(new_chapters)}")
-                                break
-                        else:
-                            stable_count = 0
-                            last_chapter_count = len(new_chapters)
-
-                    except Exception as e:
-                        logger.warning(f"[{gopro_id}] Error getting media list: {e}")
-
-                    if attempt < max_retries - 1:
-                        time.sleep(2)
+                # Fetch chapters from GoPro SD card
+                new_chapters = _fetch_gopro_chapters(gopro_ip, pre_record_files, gopro_id)
 
                 # Calculate totals
                 total_size_bytes = sum(ch['size'] for ch in new_chapters)
@@ -1053,6 +1070,16 @@ def stop_all_and_process():
             'errors': stop_errors
         }), 500
 
+    # Capture GoPro info before thread starts (recording_processes may be cleared)
+    gopro_info_snapshot = {}
+    with recording_lock:
+        for gopro_id in stopped_gopros:
+            if gopro_id in recording_processes:
+                gopro_info_snapshot[gopro_id] = {
+                    'gopro_ip': recording_processes[gopro_id].get('gopro_ip'),
+                    'pre_record_files': recording_processes[gopro_id].get('pre_record_files', set()),
+                }
+
     # Start background thread to monitor finalization and trigger pipeline
     def monitor_and_start_pipeline():
         try:
@@ -1085,19 +1112,36 @@ def stop_all_and_process():
             if elapsed >= max_wait:
                 logger.warning("[Stop All] Timeout waiting for finalization, starting pipeline anyway")
 
-            # IMPORTANT: Update Firebase sessions to "stopped" before starting pipeline
+            # IMPORTANT: Fetch real chapter data and update Firebase sessions to "stopped"
             # This is needed for externally discovered recordings that don't go through stop_recording
             if firebase_service:
-                logger.info("[Stop All] Updating Firebase sessions to stopped...")
+                logger.info("[Stop All] Fetching chapter data and updating Firebase sessions...")
                 for gopro_id in stopped_gopros:
                     try:
                         # Find the recording session by interface_id
                         session = firebase_service.find_recording_session_by_interface(gopro_id, 'recording')
                         if session:
-                            stop_data = {
-                                'total_chapters': 0,  # Will be updated by pipeline
-                                'total_size_bytes': 0
-                            }
+                            # Get GoPro IP from snapshot or discover it
+                            info = gopro_info_snapshot.get(gopro_id, {})
+                            gp_ip = info.get('gopro_ip') or get_gopro_wired_ip(gopro_id)
+                            pre_files = info.get('pre_record_files', set())
+
+                            if gp_ip:
+                                chapters = _fetch_gopro_chapters(gp_ip, pre_files, gopro_id)
+                                total_size = sum(ch['size'] for ch in chapters)
+                                stop_data = {
+                                    'total_chapters': len(chapters),
+                                    'total_size_bytes': total_size,
+                                    'chapter_files': chapters
+                                }
+                                logger.info(f"[Stop All] {gopro_id}: {len(chapters)} chapters, {total_size / (1024**3):.2f} GB")
+                            else:
+                                logger.warning(f"[Stop All] No GoPro IP for {gopro_id}, storing zeros")
+                                stop_data = {
+                                    'total_chapters': 0,
+                                    'total_size_bytes': 0
+                                }
+
                             firebase_service.register_recording_stop(session['id'], stop_data)
                             logger.info(f"[Stop All] Updated Firebase session {session['id']} to stopped")
                         else:
@@ -1151,42 +1195,41 @@ def _start_auto_pipeline_internal(auto_delete_sd: bool = True, from_background: 
         }), 503
 
     try:
-        # Get ALL stopped sessions for this Jetson (both pending and already uploaded)
+        # Get recent sessions for this Jetson
         all_sessions = firebase_service.get_recording_sessions(
             jetson_id=firebase_service.jetson_id,
             limit=50
         )
 
-        # Filter to stopped sessions only
-        sessions = [s for s in all_sessions if s.get('status') == 'stopped']
+        # Only process unprocessed sessions: stopped AND not yet uploaded to S3
+        # status=='stopped' handles the going-forward case (uploaded sessions get status='uploaded')
+        # not s3Prefix handles legacy sessions that were uploaded but still have status='stopped'
+        sessions = [
+            s for s in all_sessions
+            if s.get('status') == 'stopped' and not s.get('s3Prefix')
+        ]
 
-        # Separate into pending (no s3Prefix) and already uploaded (has s3Prefix)
-        pending_sessions = [s for s in sessions if not s.get('s3Prefix')]
-        uploaded_sessions = [s for s in sessions if s.get('s3Prefix')]
-
-        logger.info(f"[Pipeline] Found {len(pending_sessions)} pending, {len(uploaded_sessions)} already uploaded")
+        logger.info(f"[Pipeline] Found {len(sessions)} unprocessed sessions (out of {len(all_sessions)} total)")
 
         if not sessions:
             if from_background:
-                logger.warning("[Pipeline] No stopped sessions found")
+                logger.warning("[Pipeline] No unprocessed sessions found")
                 return None
             return jsonify({
                 'success': False,
-                'error': 'No stopped sessions found'
+                'error': 'No unprocessed sessions found'
             }), 404
 
-        # Discover GoPro connections ONLY for pending sessions (need to upload)
+        # Discover GoPro connections for pending sessions (need to upload chapters)
         gopro_connections = {}
-        for session in pending_sessions:
+        for session in sessions:
             interface_id = session.get('interfaceId')
             if interface_id and interface_id not in gopro_connections:
                 gopro_ip = get_gopro_wired_ip(interface_id)
                 if gopro_ip:
                     gopro_connections[interface_id] = gopro_ip
 
-        # If we have pending sessions but no GoPro connections, that's an error
-        # But if ALL sessions are already uploaded, we don't need GoPro connections
-        if pending_sessions and not gopro_connections:
+        if not gopro_connections:
             if from_background:
                 logger.error("[Pipeline] No GoPro cameras found for pending sessions")
                 return None
@@ -1194,10 +1237,6 @@ def _start_auto_pipeline_internal(auto_delete_sd: bool = True, from_background: 
                 'success': False,
                 'error': 'No GoPro cameras found for pending sessions. Chapters need to be uploaded first.'
             }), 400
-
-        # If no pending sessions but we have uploaded sessions, proceed without GoPro
-        if not pending_sessions and uploaded_sessions:
-            logger.info("[Pipeline] All sessions already uploaded, proceeding to game detection")
 
         # Start pipeline
         pipeline_id = orchestrator.start_pipeline(
@@ -5167,5 +5206,10 @@ if __name__ == '__main__':
         stale_count = firebase_service.cleanup_stale_running_pipelines()
         if stale_count:
             logger.warning(f"Startup cleanup: marked {stale_count} stale pipeline(s) as failed due to service restart")
+
+        # Migrate legacy sessions that have s3Prefix but still show status='stopped'
+        migrated_count = firebase_service.migrate_legacy_uploaded_sessions()
+        if migrated_count:
+            logger.info(f"Startup migration: updated {migrated_count} legacy session(s) to 'uploaded'")
 
     app.run(host='0.0.0.0', port=5000, debug=False, threaded=True)

@@ -618,6 +618,42 @@ class FirebaseService:
             log.error(f"Failed to query stale pipelines on startup: {e}")
             return 0
 
+    def migrate_legacy_uploaded_sessions(self) -> int:
+        """
+        On startup, fix legacy sessions that have s3Prefix but still show status='stopped'.
+
+        These sessions were uploaded before the bug fix that sets status='uploaded'
+        in update_session_s3_prefix(). This migration ensures they won't be re-picked
+        by the pipeline.
+
+        Returns:
+            Number of sessions migrated.
+        """
+        import logging
+        log = logging.getLogger('gopro.firebase')
+        try:
+            q = (
+                self.db.collection(self.RECORDING_SESSIONS_COLLECTION)
+                .where('status', '==', 'stopped')
+            )
+            docs = list(q.stream())
+            count = 0
+            for doc in docs:
+                data = doc.to_dict()
+                if data.get('s3Prefix'):
+                    try:
+                        doc.reference.update({'status': 'uploaded'})
+                        count += 1
+                        log.info(f"Migrated legacy session {doc.id} to status='uploaded'")
+                    except Exception as e:
+                        log.error(f"Failed to migrate session {doc.id}: {e}")
+            if count:
+                log.info(f"Startup migration: updated {count} legacy session(s) to 'uploaded'")
+            return count
+        except Exception as e:
+            log.error(f"Failed to query legacy sessions for migration: {e}")
+            return 0
+
     # ==================== Chapter Upload Pipeline Methods ====================
 
     def update_session_s3_prefix(self, session_id: str, s3_prefix: str) -> None:
@@ -631,7 +667,8 @@ class FirebaseService:
         doc_ref = self.db.collection(self.RECORDING_SESSIONS_COLLECTION).document(session_id)
         doc_ref.update({
             's3Prefix': s3_prefix,
-            's3UploadedAt': datetime.utcnow().isoformat() + 'Z'
+            's3UploadedAt': datetime.utcnow().isoformat() + 'Z',
+            'status': 'uploaded'
         })
 
     def get_sessions_pending_upload(self, jetson_id: Optional[str] = None) -> List[Dict[str, Any]]:
