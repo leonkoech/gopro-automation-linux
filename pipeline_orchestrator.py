@@ -228,6 +228,7 @@ class PipelineOrchestrator:
             self._pipelines[pipeline_id] = {
                 'pipeline_id': pipeline_id,
                 'jetson_id': self.jetson_id,
+                'jetson_name': os.getenv('JETSON_NAME', self.jetson_id),
                 'status': 'running',
                 'stage': PipelineStage.INITIALIZING,
                 'stage_message': 'Initializing pipeline...',
@@ -297,7 +298,8 @@ class PipelineOrchestrator:
                     'stage_message': f'Pipeline failed: {str(e)}',
                     'errors': [str(e)]
                 })
-                # Update Firebase on fatal failure
+                # Sync whatever state we have, then mark failed
+                self._firebase_sync_full_state(pipeline_id)
                 self._firebase_update_pipeline(pipeline_id, {
                     'status': 'failed',
                     'stage': PipelineStage.FAILED.value,
@@ -484,6 +486,9 @@ class PipelineOrchestrator:
             with self._lock:
                 self._pipelines[pipeline_id]['errors'].extend(upload_errors)
 
+        # Sync full session state to Firebase after all uploads
+        self._firebase_sync_full_state(pipeline_id)
+
         if self._is_cancelled(pipeline_id):
             self._mark_cancelled(pipeline_id)
             return
@@ -520,7 +525,10 @@ class PipelineOrchestrator:
             # No games found - pipeline complete (chapters uploaded successfully)
             completed_at = datetime.now().isoformat()
             with self._lock:
-                sessions_uploaded = self._pipelines[pipeline_id]['sessions_uploaded']
+                p = self._pipelines[pipeline_id]
+                sessions_uploaded = p['sessions_uploaded']
+                final_sessions = dict(p.get('sessions', {}))
+                bytes_uploaded = sum(s.get('bytes_uploaded', 0) for s in final_sessions.values())
             self._update_pipeline(pipeline_id, {
                 'status': 'completed',
                 'stage': PipelineStage.COMPLETED,
@@ -536,11 +544,16 @@ class PipelineOrchestrator:
                 'progress': 100,
                 'completed_at': completed_at,
                 'sessions_uploaded': sessions_uploaded,
+                'sessions_total': p.get('sessions_total', 0),
                 'games_total': 0,
                 'games_completed': 0,
                 'batch_jobs_submitted': 0,
                 'batch_jobs_completed': 0,
-                'errors': []
+                'errors': [],
+                'sessions': final_sessions,
+                'games': {},
+                'bytes_uploaded': bytes_uploaded,
+                'jetson_name': p.get('jetson_name', ''),
             })
             logger.info(f"[Pipeline {pipeline_id}] Completed - no games to process")
             return
@@ -649,6 +662,9 @@ class PipelineOrchestrator:
                         'stage_message': f'Processing game {game_number}/{len(games)}...'
                     })
 
+                    # Sync full game state to Firebase after each game
+                    self._firebase_sync_full_state(pipeline_id)
+
                     logger.info(f"[Pipeline {pipeline_id}] Game {game_number} processed ({len(batch_jobs)} batch jobs)")
                 else:
                     error = result.get('error', 'Unknown error')
@@ -754,6 +770,9 @@ class PipelineOrchestrator:
             games_completed = p.get('games_completed', 0)
             batch_submitted = p.get('batch_jobs_submitted', 0)
             batch_completed = p.get('batch_jobs_completed', 0)
+            final_sessions = dict(p.get('sessions', {}))
+            final_games = dict(p.get('games', {}))
+            bytes_uploaded = sum(s.get('bytes_uploaded', 0) for s in final_sessions.values())
 
         self.firebase_service.complete_pipeline_run(pipeline_id, {
             'status': final_status,
@@ -762,11 +781,16 @@ class PipelineOrchestrator:
             'progress': 100,
             'completed_at': completed_at,
             'sessions_uploaded': sessions_uploaded,
+            'sessions_total': len(sessions),
             'games_total': len(games),
             'games_completed': games_completed,
             'batch_jobs_submitted': batch_submitted,
             'batch_jobs_completed': batch_completed,
-            'errors': final_errors
+            'errors': final_errors,
+            'sessions': final_sessions,
+            'games': final_games,
+            'bytes_uploaded': bytes_uploaded,
+            'jetson_name': p.get('jetson_name', ''),
         })
 
         logger.info(f"[Pipeline {pipeline_id}] Completed successfully")
@@ -797,6 +821,21 @@ class PipelineOrchestrator:
         except Exception as e:
             logger.warning(f"Failed to delete files from GoPro at {gopro_ip}: {e}")
             raise
+
+    def _firebase_sync_full_state(self, pipeline_id: str):
+        """Sync complete sessions/games/bytes state to Firebase."""
+        with self._lock:
+            p = self._pipelines.get(pipeline_id)
+            if not p:
+                return
+            sessions = dict(p.get('sessions', {}))
+            games = dict(p.get('games', {}))
+            bytes_uploaded = sum(s.get('bytes_uploaded', 0) for s in sessions.values())
+        self._firebase_update_pipeline(pipeline_id, {
+            'sessions': sessions,
+            'games': games,
+            'bytes_uploaded': bytes_uploaded,
+        })
 
     def _firebase_update_pipeline(self, pipeline_id: str, updates: Dict[str, Any]):
         """Write pipeline updates to Firebase. Failures are logged but don't crash the pipeline."""
@@ -843,6 +882,8 @@ class PipelineOrchestrator:
 
     def _mark_cancelled(self, pipeline_id: str):
         cancelled_at = datetime.now().isoformat()
+        # Sync full state before writing cancelled status
+        self._firebase_sync_full_state(pipeline_id)
         self._update_pipeline(pipeline_id, {
             'status': 'cancelled',
             'stage': PipelineStage.CANCELLED,

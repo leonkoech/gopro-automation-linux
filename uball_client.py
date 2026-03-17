@@ -176,7 +176,17 @@ class UballClient:
                 logger.info(f"[UballClient] Game created: {result.get('id')}")
                 return result
             else:
-                logger.error(f"[UballClient] Create game failed: {response.status_code} - {response.text}")
+                error_text = response.text
+                logger.error(f"[UballClient] Create game failed: {response.status_code} - {error_text}")
+                # Handle duplicate firebase_game_id (race condition with other Jetson)
+                if '23505' in error_text or 'already exists' in error_text.lower():
+                    logger.warning(f"[UballClient] Duplicate detected, fetching existing game...")
+                    firebase_game_id = game_data.get('firebase_game_id', '')
+                    if firebase_game_id:
+                        existing = self.get_game_by_firebase_id(firebase_game_id)
+                        if existing:
+                            logger.info(f"[UballClient] Found existing game: {existing.get('id')}")
+                            return existing
                 return None
 
         except requests.exceptions.RequestException as e:

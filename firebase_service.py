@@ -492,6 +492,7 @@ class FirebaseService:
             doc_data = {
                 'pipeline_id': pipeline_data.get('pipeline_id'),
                 'jetson_id': pipeline_data.get('jetson_id'),
+                'jetson_name': pipeline_data.get('jetson_name', pipeline_data.get('jetson_id', '')),
                 'status': pipeline_data.get('status', 'running'),
                 'stage': pipeline_data.get('stage', 'initializing'),
                 'stage_message': pipeline_data.get('stage_message', 'Initializing pipeline...'),
@@ -507,6 +508,7 @@ class FirebaseService:
                 'recording_end': pipeline_data.get('recording_end'),
                 'started_at': pipeline_data.get('started_at', datetime.utcnow().isoformat() + 'Z'),
                 'completed_at': None,
+                'bytes_uploaded': 0,
                 'errors': [],
                 'sessions': pipeline_data.get('sessions', {}),
                 'games': pipeline_data.get('games', {}),
@@ -564,11 +566,16 @@ class FirebaseService:
                 'progress': final_data.get('progress', 100),
                 'completed_at': final_data.get('completed_at', datetime.utcnow().isoformat() + 'Z'),
                 'sessions_uploaded': final_data.get('sessions_uploaded', 0),
+                'sessions_total': final_data.get('sessions_total', 0),
                 'games_total': final_data.get('games_total', 0),
                 'games_completed': final_data.get('games_completed', 0),
                 'batch_jobs_submitted': final_data.get('batch_jobs_submitted', 0),
                 'batch_jobs_completed': final_data.get('batch_jobs_completed', 0),
                 'errors': final_data.get('errors', []),
+                'sessions': final_data.get('sessions', {}),
+                'games': final_data.get('games', {}),
+                'bytes_uploaded': final_data.get('bytes_uploaded', 0),
+                'jetson_name': final_data.get('jetson_name', ''),
             }
             doc_ref.update(update_data)
             return True
