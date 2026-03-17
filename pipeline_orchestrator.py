@@ -753,8 +753,17 @@ class PipelineOrchestrator:
 
                         # Sync updated state to Firebase (works even after pipeline is "completed")
                         self._firebase_sync_full_state(pipeline_id)
+
+                        # Read final counts under lock for Firebase update
+                        with self._lock:
+                            p2 = self._pipelines.get(pipeline_id)
+                            fb_games_completed = p2.get('games_completed', 0) if p2 else games_newly_completed
+                            fb_games_failed = p2.get('games_failed', 0) if p2 else games_newly_failed
+
                         self._firebase_update_pipeline(pipeline_id, {
                             'batch_jobs_completed': completed_count + failed_count,
+                            'games_completed': fb_games_completed,
+                            'games_failed': fb_games_failed,
                         })
                         logger.info(f"[Pipeline {pipeline_id}] Firebase updated with batch results: {games_newly_completed} games completed, {games_newly_failed} failed")
 
@@ -858,7 +867,7 @@ class PipelineOrchestrator:
             raise
 
     def _firebase_sync_full_state(self, pipeline_id: str):
-        """Sync complete sessions/games/bytes state to Firebase."""
+        """Sync complete sessions/games/bytes/game-counts state to Firebase."""
         with self._lock:
             p = self._pipelines.get(pipeline_id)
             if not p:
@@ -866,10 +875,14 @@ class PipelineOrchestrator:
             sessions = dict(p.get('sessions', {}))
             games = dict(p.get('games', {}))
             bytes_uploaded = sum(s.get('bytes_uploaded', 0) for s in sessions.values())
+            games_completed = p.get('games_completed', 0)
+            games_failed = p.get('games_failed', 0)
         self._firebase_update_pipeline(pipeline_id, {
             'sessions': sessions,
             'games': games,
             'bytes_uploaded': bytes_uploaded,
+            'games_completed': games_completed,
+            'games_failed': games_failed,
         })
 
     def _firebase_update_pipeline(self, pipeline_id: str, updates: Dict[str, Any]):
