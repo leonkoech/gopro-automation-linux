@@ -295,8 +295,16 @@ def get_gopro_wired_ip(gopro_id):
     return None
 
 def enable_usb_control(gopro_ip):
-    """Enable USB control mode on the GoPro - required before sending commands"""
+    """Enable USB control mode on the GoPro - required before sending commands.
+    Toggles USB control off then on to reset any stuck state."""
     try:
+        # Disable first to reset any stuck USB control state
+        requests.get(
+            f'http://{gopro_ip}:8080/gopro/camera/control/wired_usb?p=0',
+            timeout=5
+        )
+        time.sleep(2)
+        # Re-enable USB control
         response = requests.get(
             f'http://{gopro_ip}:8080/gopro/camera/control/wired_usb?p=1',
             timeout=5
@@ -660,6 +668,24 @@ def start_recording(gopro_id):
             pre_record_files = get_gopro_files(gopro_ip)
         print(f"Pre-recording files on {gopro_id} ({gopro_ip}): {len(pre_record_files)} files")
 
+        # Wait for camera to be ready (not busy) before starting shutter
+        print(f"Waiting for {gopro_id} ({gopro_ip}) to be ready...")
+        for wait_attempt in range(10):
+            try:
+                state_resp = requests.get(f'http://{gopro_ip}:8080/gopro/camera/state', timeout=5)
+                if state_resp.status_code == 200:
+                    cam_state = state_resp.json()
+                    system_busy = cam_state.get('status', {}).get('31', 0)
+                    encoding = cam_state.get('status', {}).get('8', 0)
+                    system_ready = cam_state.get('status', {}).get('82', 0)
+                    if not system_busy and not encoding:
+                        print(f"✓ Camera {gopro_id} ready (busy={system_busy}, encoding={encoding}, ready={system_ready})")
+                        break
+                    print(f"⏳ Camera {gopro_id} busy (busy={system_busy}, encoding={encoding}, ready={system_ready}), waiting...")
+            except Exception as e:
+                print(f"⚠ Could not check camera state: {e}")
+            time.sleep(1)
+
         # Start recording via HTTP API (retry up to 3 times with increasing delays)
         print(f"Starting recording on {gopro_id} ({gopro_ip})...")
         max_retries = 3
@@ -671,8 +697,17 @@ def start_recording(gopro_id):
             )
             if response.status_code == 200:
                 break
-            print(f"⚠ Shutter start attempt {attempt}/{max_retries} failed (HTTP {response.status_code}), retrying...")
-            time.sleep(1 * attempt)  # 1s, 2s, 3s backoff
+            # Log the response body for debugging
+            logger.warning(f"Shutter start attempt {attempt}/{max_retries} on {gopro_id} failed: HTTP {response.status_code}, body={response.text!r}")
+            # Check camera state for debugging
+            try:
+                dbg_state = requests.get(f'http://{gopro_ip}:8080/gopro/camera/state', timeout=5).json()
+                dbg_status = dbg_state.get('status', {})
+                logger.warning(f"Camera state after failed shutter: busy={dbg_status.get('31')}, encoding={dbg_status.get('8')}, "
+                             f"ready={dbg_status.get('82')}, mode={dbg_status.get('43')}, sd_status={dbg_status.get('33')}")
+            except Exception:
+                pass
+            time.sleep(2 * attempt)  # 2s, 4s, 6s backoff
 
         if response.status_code != 200:
             error_text = response.text if response.text else f"HTTP {response.status_code}"

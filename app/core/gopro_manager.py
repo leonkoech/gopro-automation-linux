@@ -111,8 +111,16 @@ def get_gopro_wired_ip(gopro_id):
 
 
 def enable_usb_control(gopro_ip):
-    """Enable USB control mode on the GoPro - required before sending commands"""
+    """Enable USB control mode on the GoPro - required before sending commands.
+    Toggles USB control off then on to reset any stuck state."""
     try:
+        # Disable first to reset any stuck USB control state
+        requests.get(
+            f'http://{gopro_ip}:8080/gopro/camera/control/wired_usb?p=0',
+            timeout=5
+        )
+        time.sleep(2)
+        # Re-enable USB control
         response = requests.get(
             f'http://{gopro_ip}:8080/gopro/camera/control/wired_usb?p=1',
             timeout=5
