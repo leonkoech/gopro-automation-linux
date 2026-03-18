@@ -37,6 +37,14 @@ logger = get_logger('gopro.main')
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*", "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"], "allow_headers": ["Content-Type", "Authorization"]}})
 
+# Register Z-CAM Blueprint (self-contained Z-CAM streaming pipeline)
+try:
+    from zcam import zcam_bp
+    app.register_blueprint(zcam_bp)
+    print("✓ Z-CAM streaming pipeline registered (/api/zcam/*)")
+except ImportError:
+    print("⚠ Z-CAM module not available (missing dependencies)")
+
 # Configuration
 VIDEO_STORAGE_DIR = os.path.expanduser('~/gopro_videos')
 SEGMENTS_DIR = os.path.join(VIDEO_STORAGE_DIR, 'segments')

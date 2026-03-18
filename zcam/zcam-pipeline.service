@@ -1,0 +1,22 @@
+[Unit]
+Description=GoPro Controller + Z-CAM Streaming Pipeline
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=jetson
+WorkingDirectory=/home/jetson/gorpro-automation
+EnvironmentFile=/home/jetson/gorpro-automation/.env
+ExecStart=/home/jetson/gorpro-automation/venv/bin/python main.py
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+# GStreamer plugin paths (adjust after building KVS + NDI plugins)
+Environment=GST_PLUGIN_PATH=/home/jetson/kvs-sdk/build:/home/jetson/ndi-sdk/lib
+Environment=LD_LIBRARY_PATH=/home/jetson/kvs-sdk/build:/home/jetson/ndi-sdk/lib
+
+[Install]
+WantedBy=multi-user.target
