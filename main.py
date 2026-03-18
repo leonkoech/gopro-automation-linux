@@ -37,6 +37,14 @@ logger = get_logger('gopro.main')
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*", "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"], "allow_headers": ["Content-Type", "Authorization"]}})
 
+# Register Z-CAM Blueprint (self-contained Z-CAM streaming pipeline)
+try:
+    from zcam import zcam_bp
+    app.register_blueprint(zcam_bp)
+    print("✓ Z-CAM streaming pipeline registered (/api/zcam/*)")
+except ImportError:
+    print("⚠ Z-CAM module not available (missing dependencies)")
+
 # Configuration
 VIDEO_STORAGE_DIR = os.path.expanduser('~/gopro_videos')
 SEGMENTS_DIR = os.path.join(VIDEO_STORAGE_DIR, 'segments')
@@ -638,7 +646,7 @@ def start_recording(gopro_id):
                 print(f"✓ Set {gopro_id} to Video preset")
             else:
                 print(f"⚠ Failed to set preset: {response.status_code}")
-            time.sleep(0.5)
+            time.sleep(1)
         except Exception as e:
             print(f"⚠ Warning: Could not set video mode for {gopro_id}: {e}")
 
@@ -652,12 +660,19 @@ def start_recording(gopro_id):
             pre_record_files = get_gopro_files(gopro_ip)
         print(f"Pre-recording files on {gopro_id} ({gopro_ip}): {len(pre_record_files)} files")
 
-        # Start recording via HTTP API
+        # Start recording via HTTP API (retry up to 3 times with increasing delays)
         print(f"Starting recording on {gopro_id} ({gopro_ip})...")
-        response = requests.get(
-            f'http://{gopro_ip}:8080/gopro/camera/shutter/start',
-            timeout=5
-        )
+        max_retries = 3
+        response = None
+        for attempt in range(1, max_retries + 1):
+            response = requests.get(
+                f'http://{gopro_ip}:8080/gopro/camera/shutter/start',
+                timeout=5
+            )
+            if response.status_code == 200:
+                break
+            print(f"⚠ Shutter start attempt {attempt}/{max_retries} failed (HTTP {response.status_code}), retrying...")
+            time.sleep(1 * attempt)  # 1s, 2s, 3s backoff
 
         if response.status_code != 200:
             error_text = response.text if response.text else f"HTTP {response.status_code}"

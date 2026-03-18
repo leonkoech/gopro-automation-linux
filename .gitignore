@@ -5,6 +5,7 @@ __pycache__/
 /gopro-automation-frontend
 tmpclaude*
 /frontend
+.hide
 
 
 uball-gopro-fleet-firebase-adminsdk.json

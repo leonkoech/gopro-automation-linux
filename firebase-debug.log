@@ -1,0 +1,192 @@
+[debug] [2026-02-02T02:11:06.859Z] ----------------------------------------------------------------------
+[debug] [2026-02-02T02:11:06.861Z] Command:       C:\Program Files\nodejs\node.exe C:\Program Files\nodejs\node_modules\firebase-tools\lib\bin\firebase.js init
+[debug] [2026-02-02T02:11:06.861Z] CLI Version:   14.26.0
+[debug] [2026-02-02T02:11:06.861Z] Platform:      win32
+[debug] [2026-02-02T02:11:06.861Z] Node Version:  v20.17.0
+[debug] [2026-02-02T02:11:06.861Z] Time:          Sun Feb 01 2026 21:11:06 GMT-0500 (Eastern Standard Time)
+[debug] [2026-02-02T02:11:06.861Z] ----------------------------------------------------------------------
+[debug] 
+[info] 
+     ######## #### ########  ######## ########     ###     ######  ########
+     ##        ##  ##     ## ##       ##     ##  ##   ##  ##       ##
+     ######    ##  ########  ######   ########  #########  ######  ######
+     ##        ##  ##    ##  ##       ##     ## ##     ##       ## ##
+     ##       #### ##     ## ######## ########  ##     ##  ######  ########
+
+You're about to initialize a Firebase project in this directory:
+
+  C:\Users\17866\Documents\Python Projects\gorpro-automation
+
+[info] 
+=== Account Setup
+[info] 
+[info] Which account do you want to use for this project? Choose an account or add a new one now
+[info] 
+[debug] [2026-02-02T02:11:14.438Z] setProjectAccount(C:\Users\17866\Documents\Python Projects\gorpro-automation, leonkipkoech00@gmail.com)
+[info] 
+[info] +  Using account: leonkipkoech00@gmail.com 
+[info] 
+=== Project Setup
+[info] 
+[info] First, let's associate this project directory with a Firebase project.
+[info] You can create multiple project aliases by running firebase use --add, 
+[info] 
+[debug] [2026-02-02T02:11:16.895Z] > command requires scopes: ["email","openid","https://www.googleapis.com/auth/cloudplatformprojects.readonly","https://www.googleapis.com/auth/firebase","https://www.googleapis.com/auth/cloud-platform"]
+[debug] [2026-02-02T02:11:16.895Z] > authorizing via signed-in user (leonkipkoech00@gmail.com)
+[debug] [2026-02-02T02:11:16.896Z] Checked if tokens are valid: false, expires at: 1769277840690
+[debug] [2026-02-02T02:11:16.896Z] Checked if tokens are valid: false, expires at: 1769277840690
+[debug] [2026-02-02T02:11:16.897Z] > refreshing access token with scopes: []
+[debug] [2026-02-02T02:11:16.898Z] >>> [apiv2][query] POST https://www.googleapis.com/oauth2/v3/token [none]
+[debug] [2026-02-02T02:11:16.899Z] >>> [apiv2][body] POST https://www.googleapis.com/oauth2/v3/token [omitted]
+[debug] [2026-02-02T02:11:17.019Z] <<< [apiv2][status] POST https://www.googleapis.com/oauth2/v3/token 200
+[debug] [2026-02-02T02:11:17.019Z] <<< [apiv2][body] POST https://www.googleapis.com/oauth2/v3/token [omitted]
+[debug] [2026-02-02T02:11:17.052Z] >>> [apiv2][query] GET https://firebase.googleapis.com/v1beta1/projects pageSize=100
+[debug] [2026-02-02T02:11:17.502Z] <<< [apiv2][status] GET https://firebase.googleapis.com/v1beta1/projects 200
+[debug] [2026-02-02T02:11:17.502Z] <<< [apiv2][body] GET https://firebase.googleapis.com/v1beta1/projects [omitted]
+[info] 
+=== App Hosting Setup
+[debug] [2026-02-02T02:11:28.611Z] Checked if tokens are valid: true, expires at: 1770001876020
+[debug] [2026-02-02T02:11:28.611Z] Checked if tokens are valid: true, expires at: 1770001876020
+[debug] [2026-02-02T02:11:28.611Z] >>> [apiv2][query] GET https://cloudbilling.googleapis.com/v1/projects/uball-gopro-fleet/billingInfo [none]
+[debug] [2026-02-02T02:11:28.904Z] <<< [apiv2][status] GET https://cloudbilling.googleapis.com/v1/projects/uball-gopro-fleet/billingInfo 200
+[debug] [2026-02-02T02:11:28.905Z] <<< [apiv2][body] GET https://cloudbilling.googleapis.com/v1/projects/uball-gopro-fleet/billingInfo {"name":"projects/uball-gopro-fleet/billingInfo","projectId":"uball-gopro-fleet","billingAccountName":"billingAccounts/01CEF9-32962B-51CCAB","billingEnabled":true}
+[debug] [2026-02-02T02:11:28.905Z] Checked if tokens are valid: true, expires at: 1770001876020
+[debug] [2026-02-02T02:11:28.906Z] Checked if tokens are valid: true, expires at: 1770001876020
+[debug] [2026-02-02T02:11:28.906Z] >>> [apiv2][query] GET https://serviceusage.googleapis.com/v1/projects/uball-gopro-fleet/services/firebaseapphosting.googleapis.com [none]
+[debug] [2026-02-02T02:11:28.906Z] >>> [apiv2][(partial)header] GET https://serviceusage.googleapis.com/v1/projects/uball-gopro-fleet/services/firebaseapphosting.googleapis.com x-goog-quota-user=projects/uball-gopro-fleet
+[debug] [2026-02-02T02:11:29.388Z] <<< [apiv2][status] GET https://serviceusage.googleapis.com/v1/projects/uball-gopro-fleet/services/firebaseapphosting.googleapis.com 200
+[debug] [2026-02-02T02:11:29.389Z] <<< [apiv2][body] GET https://serviceusage.googleapis.com/v1/projects/uball-gopro-fleet/services/firebaseapphosting.googleapis.com [omitted]
+[debug] [2026-02-02T02:11:29.389Z] Checked if tokens are valid: true, expires at: 1770001876020
+[debug] [2026-02-02T02:11:29.389Z] Checked if tokens are valid: true, expires at: 1770001876020
+[debug] [2026-02-02T02:11:29.389Z] >>> [apiv2][query] POST https://serviceusage.googleapis.com/v1/projects/uball-gopro-fleet/services/firebaseapphosting.googleapis.com:enable [none]
+[debug] [2026-02-02T02:11:29.389Z] >>> [apiv2][(partial)header] POST https://serviceusage.googleapis.com/v1/projects/uball-gopro-fleet/services/firebaseapphosting.googleapis.com:enable x-goog-quota-user=projects/uball-gopro-fleet
+[debug] [2026-02-02T02:11:30.032Z] <<< [apiv2][status] POST https://serviceusage.googleapis.com/v1/projects/uball-gopro-fleet/services/firebaseapphosting.googleapis.com:enable 200
+[debug] [2026-02-02T02:11:30.032Z] <<< [apiv2][body] POST https://serviceusage.googleapis.com/v1/projects/uball-gopro-fleet/services/firebaseapphosting.googleapis.com:enable [omitted]
+[debug] [2026-02-02T02:11:40.049Z] Checked if tokens are valid: true, expires at: 1770001876020
+[debug] [2026-02-02T02:11:40.050Z] Checked if tokens are valid: true, expires at: 1770001876020
+[debug] [2026-02-02T02:11:40.050Z] Checked if tokens are valid: true, expires at: 1770001876020
+[debug] [2026-02-02T02:11:40.050Z] Checked if tokens are valid: true, expires at: 1770001876020
+[debug] [2026-02-02T02:11:40.050Z] Checked if tokens are valid: true, expires at: 1770001876020
+[debug] [2026-02-02T02:11:40.051Z] Checked if tokens are valid: true, expires at: 1770001876020
+[debug] [2026-02-02T02:11:40.051Z] Checked if tokens are valid: true, expires at: 1770001876020
+[debug] [2026-02-02T02:11:40.051Z] Checked if tokens are valid: true, expires at: 1770001876020
+[debug] [2026-02-02T02:11:40.051Z] Checked if tokens are valid: true, expires at: 1770001876020
+[debug] [2026-02-02T02:11:40.051Z] Checked if tokens are valid: true, expires at: 1770001876020
+[debug] [2026-02-02T02:11:40.052Z] Checked if tokens are valid: true, expires at: 1770001876020
+[debug] [2026-02-02T02:11:40.052Z] Checked if tokens are valid: true, expires at: 1770001876020
+[debug] [2026-02-02T02:11:40.053Z] >>> [apiv2][query] GET https://serviceusage.googleapis.com/v1/projects/uball-gopro-fleet/services/developerconnect.googleapis.com [none]
+[debug] [2026-02-02T02:11:40.053Z] >>> [apiv2][(partial)header] GET https://serviceusage.googleapis.com/v1/projects/uball-gopro-fleet/services/developerconnect.googleapis.com x-goog-quota-user=projects/uball-gopro-fleet
+[debug] [2026-02-02T02:11:40.055Z] >>> [apiv2][query] GET https://serviceusage.googleapis.com/v1/projects/uball-gopro-fleet/services/cloudbuild.googleapis.com [none]
+[debug] [2026-02-02T02:11:40.055Z] >>> [apiv2][(partial)header] GET https://serviceusage.googleapis.com/v1/projects/uball-gopro-fleet/services/cloudbuild.googleapis.com x-goog-quota-user=projects/uball-gopro-fleet
+[debug] [2026-02-02T02:11:40.057Z] >>> [apiv2][query] GET https://serviceusage.googleapis.com/v1/projects/uball-gopro-fleet/services/secretmanager.googleapis.com [none]
+[debug] [2026-02-02T02:11:40.057Z] >>> [apiv2][(partial)header] GET https://serviceusage.googleapis.com/v1/projects/uball-gopro-fleet/services/secretmanager.googleapis.com x-goog-quota-user=projects/uball-gopro-fleet
+[debug] [2026-02-02T02:11:40.059Z] >>> [apiv2][query] GET https://serviceusage.googleapis.com/v1/projects/uball-gopro-fleet/services/run.googleapis.com [none]
+[debug] [2026-02-02T02:11:40.059Z] >>> [apiv2][(partial)header] GET https://serviceusage.googleapis.com/v1/projects/uball-gopro-fleet/services/run.googleapis.com x-goog-quota-user=projects/uball-gopro-fleet
+[debug] [2026-02-02T02:11:40.060Z] >>> [apiv2][query] GET https://serviceusage.googleapis.com/v1/projects/uball-gopro-fleet/services/artifactregistry.googleapis.com [none]
+[debug] [2026-02-02T02:11:40.060Z] >>> [apiv2][(partial)header] GET https://serviceusage.googleapis.com/v1/projects/uball-gopro-fleet/services/artifactregistry.googleapis.com x-goog-quota-user=projects/uball-gopro-fleet
+[debug] [2026-02-02T02:11:40.062Z] >>> [apiv2][query] GET https://serviceusage.googleapis.com/v1/projects/uball-gopro-fleet/services/iam.googleapis.com [none]
+[debug] [2026-02-02T02:11:40.062Z] >>> [apiv2][(partial)header] GET https://serviceusage.googleapis.com/v1/projects/uball-gopro-fleet/services/iam.googleapis.com x-goog-quota-user=projects/uball-gopro-fleet
+[debug] [2026-02-02T02:11:40.433Z] <<< [apiv2][status] GET https://serviceusage.googleapis.com/v1/projects/uball-gopro-fleet/services/developerconnect.googleapis.com 200
+[debug] [2026-02-02T02:11:40.434Z] <<< [apiv2][body] GET https://serviceusage.googleapis.com/v1/projects/uball-gopro-fleet/services/developerconnect.googleapis.com [omitted]
+[debug] [2026-02-02T02:11:40.434Z] Checked if tokens are valid: true, expires at: 1770001876020
+[debug] [2026-02-02T02:11:40.434Z] Checked if tokens are valid: true, expires at: 1770001876020
+[debug] [2026-02-02T02:11:40.434Z] >>> [apiv2][query] POST https://serviceusage.googleapis.com/v1/projects/uball-gopro-fleet/services/developerconnect.googleapis.com:enable [none]
+[debug] [2026-02-02T02:11:40.435Z] >>> [apiv2][(partial)header] POST https://serviceusage.googleapis.com/v1/projects/uball-gopro-fleet/services/developerconnect.googleapis.com:enable x-goog-quota-user=projects/uball-gopro-fleet
+[debug] [2026-02-02T02:11:40.435Z] <<< [apiv2][status] GET https://serviceusage.googleapis.com/v1/projects/uball-gopro-fleet/services/secretmanager.googleapis.com 200
+[debug] [2026-02-02T02:11:40.435Z] <<< [apiv2][body] GET https://serviceusage.googleapis.com/v1/projects/uball-gopro-fleet/services/secretmanager.googleapis.com [omitted]
+[debug] [2026-02-02T02:11:40.442Z] <<< [apiv2][status] GET https://serviceusage.googleapis.com/v1/projects/uball-gopro-fleet/services/cloudbuild.googleapis.com 200
+[debug] [2026-02-02T02:11:40.442Z] <<< [apiv2][body] GET https://serviceusage.googleapis.com/v1/projects/uball-gopro-fleet/services/cloudbuild.googleapis.com [omitted]
+[debug] [2026-02-02T02:11:40.457Z] <<< [apiv2][status] GET https://serviceusage.googleapis.com/v1/projects/uball-gopro-fleet/services/iam.googleapis.com 200
+[debug] [2026-02-02T02:11:40.457Z] <<< [apiv2][body] GET https://serviceusage.googleapis.com/v1/projects/uball-gopro-fleet/services/iam.googleapis.com [omitted]
+[debug] [2026-02-02T02:11:40.471Z] <<< [apiv2][status] GET https://serviceusage.googleapis.com/v1/projects/uball-gopro-fleet/services/run.googleapis.com 200
+[debug] [2026-02-02T02:11:40.472Z] <<< [apiv2][body] GET https://serviceusage.googleapis.com/v1/projects/uball-gopro-fleet/services/run.googleapis.com [omitted]
+[debug] [2026-02-02T02:11:40.486Z] <<< [apiv2][status] GET https://serviceusage.googleapis.com/v1/projects/uball-gopro-fleet/services/artifactregistry.googleapis.com 200
+[debug] [2026-02-02T02:11:40.487Z] <<< [apiv2][body] GET https://serviceusage.googleapis.com/v1/projects/uball-gopro-fleet/services/artifactregistry.googleapis.com [omitted]
+[debug] [2026-02-02T02:11:41.132Z] <<< [apiv2][status] POST https://serviceusage.googleapis.com/v1/projects/uball-gopro-fleet/services/developerconnect.googleapis.com:enable 200
+[debug] [2026-02-02T02:11:41.132Z] <<< [apiv2][body] POST https://serviceusage.googleapis.com/v1/projects/uball-gopro-fleet/services/developerconnect.googleapis.com:enable [omitted]
+[debug] [2026-02-02T02:11:51.148Z] Checked if tokens are valid: true, expires at: 1770001876020
+[debug] [2026-02-02T02:11:51.148Z] Checked if tokens are valid: true, expires at: 1770001876020
+[debug] [2026-02-02T02:11:51.148Z] >>> [apiv2][query] POST https://iam.googleapis.com/v1/projects/uball-gopro-fleet/serviceAccounts/firebase-app-hosting-compute@uball-gopro-fleet.iam.gserviceaccount.com:testIamPermissions [none]
+[debug] [2026-02-02T02:11:51.148Z] >>> [apiv2][(partial)header] POST https://iam.googleapis.com/v1/projects/uball-gopro-fleet/serviceAccounts/firebase-app-hosting-compute@uball-gopro-fleet.iam.gserviceaccount.com:testIamPermissions x-goog-quota-user=projects/uball-gopro-fleet
+[debug] [2026-02-02T02:11:51.148Z] >>> [apiv2][body] POST https://iam.googleapis.com/v1/projects/uball-gopro-fleet/serviceAccounts/firebase-app-hosting-compute@uball-gopro-fleet.iam.gserviceaccount.com:testIamPermissions {"permissions":["iam.serviceAccounts.actAs"]}
+[debug] [2026-02-02T02:11:51.417Z] <<< [apiv2][status] POST https://iam.googleapis.com/v1/projects/uball-gopro-fleet/serviceAccounts/firebase-app-hosting-compute@uball-gopro-fleet.iam.gserviceaccount.com:testIamPermissions 404
+[debug] [2026-02-02T02:11:51.417Z] <<< [apiv2][body] POST https://iam.googleapis.com/v1/projects/uball-gopro-fleet/serviceAccounts/firebase-app-hosting-compute@uball-gopro-fleet.iam.gserviceaccount.com:testIamPermissions {"error":{"code":404,"message":"Unknown service account","status":"NOT_FOUND"}}
+[debug] [2026-02-02T02:11:51.417Z] Checked if tokens are valid: true, expires at: 1770001876020
+[debug] [2026-02-02T02:11:51.418Z] Checked if tokens are valid: true, expires at: 1770001876020
+[debug] [2026-02-02T02:11:51.418Z] >>> [apiv2][query] POST https://iam.googleapis.com/v1/projects/uball-gopro-fleet/serviceAccounts [none]
+[debug] [2026-02-02T02:11:51.418Z] >>> [apiv2][body] POST https://iam.googleapis.com/v1/projects/uball-gopro-fleet/serviceAccounts {"accountId":"firebase-app-hosting-compute","serviceAccount":{"displayName":"Firebase App Hosting compute service account","description":"Default service account used to run builds and deploys for Firebase App Hosting"}}
+[debug] [2026-02-02T02:11:51.946Z] <<< [apiv2][status] POST https://iam.googleapis.com/v1/projects/uball-gopro-fleet/serviceAccounts 200
+[debug] [2026-02-02T02:11:51.946Z] <<< [apiv2][body] POST https://iam.googleapis.com/v1/projects/uball-gopro-fleet/serviceAccounts [omitted]
+[debug] [2026-02-02T02:11:51.946Z] Checked if tokens are valid: true, expires at: 1770001876020
+[debug] [2026-02-02T02:11:51.946Z] Checked if tokens are valid: true, expires at: 1770001876020
+[debug] [2026-02-02T02:11:51.946Z] >>> [apiv2][query] POST https://cloudresourcemanager.googleapis.com/v1/projects/uball-gopro-fleet:getIamPolicy [none]
+[debug] [2026-02-02T02:11:52.323Z] <<< [apiv2][status] POST https://cloudresourcemanager.googleapis.com/v1/projects/uball-gopro-fleet:getIamPolicy 200
+[debug] [2026-02-02T02:11:52.323Z] <<< [apiv2][body] POST https://cloudresourcemanager.googleapis.com/v1/projects/uball-gopro-fleet:getIamPolicy {"version":1,"etag":"BwZJzdfHmow=","bindings":[{"role":"roles/cloudbuild.builds.builder","members":["serviceAccount:693666737702@cloudbuild.gserviceaccount.com"]},{"role":"roles/cloudbuild.serviceAgent","members":["serviceAccount:service-693666737702@gcp-sa-cloudbuild.iam.gserviceaccount.com"]},{"role":"roles/containerregistry.ServiceAgent","members":["serviceAccount:service-693666737702@containerregistry.iam.gserviceaccount.com"]},{"role":"roles/editor","members":["serviceAccount:693666737702-compute@developer.gserviceaccount.com"]},{"role":"roles/firebase.managementServiceAgent","members":["serviceAccount:service-693666737702@gcp-sa-firebase.iam.gserviceaccount.com"]},{"role":"roles/firebase.sdkAdminServiceAgent","members":["serviceAccount:firebase-adminsdk-fbsvc@uball-gopro-fleet.iam.gserviceaccount.com"]},{"role":"roles/firebaseauth.admin","members":["serviceAccount:firebase-adminsdk-fbsvc@uball-gopro-fleet.iam.gserviceaccount.com"]},{"role":"roles/firebaserules.system","members":["serviceAccount:service-693666737702@firebase-rules.iam.gserviceaccount.com"]},{"role":"roles/firestore.serviceAgent","members":["serviceAccount:service-693666737702@gcp-sa-firestore.iam.gserviceaccount.com"]},{"role":"roles/iam.serviceAccountTokenCreator","members":["serviceAccount:firebase-adminsdk-fbsvc@uball-gopro-fleet.iam.gserviceaccount.com"]},{"role":"roles/owner","members":["user:leonkipkoech00@gmail.com","user:rohit@cellstrat.com","user:tim.shields@uballanywhere.com"]},{"role":"roles/run.serviceAgent","members":["serviceAccount:service-693666737702@serverless-robot-prod.iam.gserviceaccount.com"]}]}
+[debug] [2026-02-02T02:11:52.324Z] Checked if tokens are valid: true, expires at: 1770001876020
+[debug] [2026-02-02T02:11:52.324Z] Checked if tokens are valid: true, expires at: 1770001876020
+[debug] [2026-02-02T02:11:52.324Z] >>> [apiv2][query] POST https://cloudresourcemanager.googleapis.com/v1/projects/uball-gopro-fleet:setIamPolicy [none]
+[debug] [2026-02-02T02:11:52.324Z] >>> [apiv2][body] POST https://cloudresourcemanager.googleapis.com/v1/projects/uball-gopro-fleet:setIamPolicy {"policy":{"version":1,"etag":"BwZJzdfHmow=","bindings":[{"role":"roles/cloudbuild.builds.builder","members":["serviceAccount:693666737702@cloudbuild.gserviceaccount.com"]},{"role":"roles/cloudbuild.serviceAgent","members":["serviceAccount:service-693666737702@gcp-sa-cloudbuild.iam.gserviceaccount.com"]},{"role":"roles/containerregistry.ServiceAgent","members":["serviceAccount:service-693666737702@containerregistry.iam.gserviceaccount.com"]},{"role":"roles/editor","members":["serviceAccount:693666737702-compute@developer.gserviceaccount.com"]},{"role":"roles/firebase.managementServiceAgent","members":["serviceAccount:service-693666737702@gcp-sa-firebase.iam.gserviceaccount.com"]},{"role":"roles/firebase.sdkAdminServiceAgent","members":["serviceAccount:firebase-adminsdk-fbsvc@uball-gopro-fleet.iam.gserviceaccount.com","serviceAccount:firebase-app-hosting-compute@uball-gopro-fleet.iam.gserviceaccount.com"]},{"role":"roles/firebaseauth.admin","members":["serviceAccount:firebase-adminsdk-fbsvc@uball-gopro-fleet.iam.gserviceaccount.com"]},{"role":"roles/firebaserules.system","members":["serviceAccount:service-693666737702@firebase-rules.iam.gserviceaccount.com"]},{"role":"roles/firestore.serviceAgent","members":["serviceAccount:service-693666737702@gcp-sa-firestore.iam.gserviceaccount.com"]},{"role":"roles/iam.serviceAccountTokenCreator","members":["serviceAccount:firebase-adminsdk-fbsvc@uball-gopro-fleet.iam.gserviceaccount.com"]},{"role":"roles/owner","members":["user:leonkipkoech00@gmail.com","user:rohit@cellstrat.com","user:tim.shields@uballanywhere.com"]},{"role":"roles/run.serviceAgent","members":["serviceAccount:service-693666737702@serverless-robot-prod.iam.gserviceaccount.com"]},{"role":"roles/firebaseapphosting.computeRunner","members":["serviceAccount:firebase-app-hosting-compute@uball-gopro-fleet.iam.gserviceaccount.com"]},{"role":"roles/developerconnect.readTokenAccessor","members":["serviceAccount:firebase-app-hosting-compute@uball-gopro-fleet.iam.gserviceaccount.com"]},{"role":"roles/storage.objectViewer","members":["serviceAccount:firebase-app-hosting-compute@uball-gopro-fleet.iam.gserviceaccount.com"]}]},"updateMask":"bindings"}
+[debug] [2026-02-02T02:11:52.979Z] <<< [apiv2][status] POST https://cloudresourcemanager.googleapis.com/v1/projects/uball-gopro-fleet:setIamPolicy 200
+[debug] [2026-02-02T02:11:52.979Z] <<< [apiv2][body] POST https://cloudresourcemanager.googleapis.com/v1/projects/uball-gopro-fleet:setIamPolicy {"version":1,"etag":"BwZJzdit+9o=","bindings":[{"role":"roles/cloudbuild.builds.builder","members":["serviceAccount:693666737702@cloudbuild.gserviceaccount.com"]},{"role":"roles/cloudbuild.serviceAgent","members":["serviceAccount:service-693666737702@gcp-sa-cloudbuild.iam.gserviceaccount.com"]},{"role":"roles/containerregistry.ServiceAgent","members":["serviceAccount:service-693666737702@containerregistry.iam.gserviceaccount.com"]},{"role":"roles/developerconnect.readTokenAccessor","members":["serviceAccount:firebase-app-hosting-compute@uball-gopro-fleet.iam.gserviceaccount.com"]},{"role":"roles/editor","members":["serviceAccount:693666737702-compute@developer.gserviceaccount.com"]},{"role":"roles/firebase.managementServiceAgent","members":["serviceAccount:service-693666737702@gcp-sa-firebase.iam.gserviceaccount.com"]},{"role":"roles/firebase.sdkAdminServiceAgent","members":["serviceAccount:firebase-adminsdk-fbsvc@uball-gopro-fleet.iam.gserviceaccount.com","serviceAccount:firebase-app-hosting-compute@uball-gopro-fleet.iam.gserviceaccount.com"]},{"role":"roles/firebaseapphosting.computeRunner","members":["serviceAccount:firebase-app-hosting-compute@uball-gopro-fleet.iam.gserviceaccount.com"]},{"role":"roles/firebaseauth.admin","members":["serviceAccount:firebase-adminsdk-fbsvc@uball-gopro-fleet.iam.gserviceaccount.com"]},{"role":"roles/firebaserules.system","members":["serviceAccount:service-693666737702@firebase-rules.iam.gserviceaccount.com"]},{"role":"roles/firestore.serviceAgent","members":["serviceAccount:service-693666737702@gcp-sa-firestore.iam.gserviceaccount.com"]},{"role":"roles/iam.serviceAccountTokenCreator","members":["serviceAccount:firebase-adminsdk-fbsvc@uball-gopro-fleet.iam.gserviceaccount.com"]},{"role":"roles/owner","members":["user:leonkipkoech00@gmail.com","user:rohit@cellstrat.com","user:tim.shields@uballanywhere.com"]},{"role":"roles/run.serviceAgent","members":["serviceAccount:service-693666737702@serverless-robot-prod.iam.gserviceaccount.com"]},{"role":"roles/storage.objectViewer","members":["serviceAccount:firebase-app-hosting-compute@uball-gopro-fleet.iam.gserviceaccount.com"]}]}
+[info] i  This command links your local project to Firebase App Hosting. You will be able to deploy your web app with `firebase deploy` after setup. 
+[debug] [2026-02-02T02:12:21.194Z] ExitPromptError: User force closed the prompt with SIGINT
+    at Interface.sigint (C:\Users\17866\AppData\Roaming\nvm\v20.17.0\node_modules\firebase-tools\node_modules\@inquirer\core\dist\commonjs\lib\create-prompt.js:101:37)
+    at Interface.emit (node:events:519:28)
+    at Interface.emit (node:domain:488:12)
+    at [_ttyWrite] [as _ttyWrite] (node:internal/readline/interface:1126:18)
+    at ReadStream.onkeypress (node:internal/readline/interface:265:20)
+    at ReadStream.emit (node:events:531:35)
+    at ReadStream.emit (node:domain:488:12)
+    at emitKeys (node:internal/readline/utils:371:14)
+    at emitKeys.next (<anonymous>)
+    at ReadStream.onData (node:internal/readline/emitKeypressEvents:64:36)
+[error] 
+[error] Error: An unexpected error has occurred.
+[debug] [2026-02-02T02:12:28.340Z] ----------------------------------------------------------------------
+[debug] [2026-02-02T02:12:28.342Z] Command:       C:\Program Files\nodejs\node.exe C:\Program Files\nodejs\node_modules\firebase-tools\lib\bin\firebase.js init
+[debug] [2026-02-02T02:12:28.343Z] CLI Version:   14.26.0
+[debug] [2026-02-02T02:12:28.343Z] Platform:      win32
+[debug] [2026-02-02T02:12:28.343Z] Node Version:  v20.17.0
+[debug] [2026-02-02T02:12:28.343Z] Time:          Sun Feb 01 2026 21:12:28 GMT-0500 (Eastern Standard Time)
+[debug] [2026-02-02T02:12:28.343Z] ----------------------------------------------------------------------
+[debug] 
+[info] 
+     ######## #### ########  ######## ########     ###     ######  ########
+     ##        ##  ##     ## ##       ##     ##  ##   ##  ##       ##
+     ######    ##  ########  ######   ########  #########  ######  ######
+     ##        ##  ##    ##  ##       ##     ## ##     ##       ## ##
+     ##       #### ##     ## ######## ########  ##     ##  ######  ########
+
+You're about to initialize a Firebase project in this directory:
+
+  C:\Users\17866\Documents\Python Projects\gorpro-automation
+
+[info] 
+=== Account Setup
+[info] 
+[info] Which account do you want to use for this project? Choose an account or add a new one now
+[info] 
+[debug] [2026-02-02T02:12:34.165Z] setProjectAccount(C:\Users\17866\Documents\Python Projects\gorpro-automation, leonkipkoech00@gmail.com)
+[info] 
+[info] +  Using account: leonkipkoech00@gmail.com 
+[info] 
+=== Project Setup
+[info] 
+[info] First, let's associate this project directory with a Firebase project.
+[info] You can create multiple project aliases by running firebase use --add, 
+[info] 
+[debug] [2026-02-02T02:12:34.223Z] > command requires scopes: ["email","openid","https://www.googleapis.com/auth/cloudplatformprojects.readonly","https://www.googleapis.com/auth/firebase","https://www.googleapis.com/auth/cloud-platform"]
+[debug] [2026-02-02T02:12:34.223Z] > authorizing via signed-in user (leonkipkoech00@gmail.com)
+[debug] [2026-02-02T02:12:34.224Z] Checked if tokens are valid: true, expires at: 1770001876020
+[debug] [2026-02-02T02:12:34.225Z] Checked if tokens are valid: true, expires at: 1770001876020
+[debug] [2026-02-02T02:12:34.226Z] >>> [apiv2][query] GET https://firebase.googleapis.com/v1beta1/projects/uball-gopro-fleet [none]
+[debug] [2026-02-02T02:12:34.533Z] <<< [apiv2][status] GET https://firebase.googleapis.com/v1beta1/projects/uball-gopro-fleet 200
+[debug] [2026-02-02T02:12:34.533Z] <<< [apiv2][body] GET https://firebase.googleapis.com/v1beta1/projects/uball-gopro-fleet {"projectId":"uball-gopro-fleet","projectNumber":"693666737702","displayName":"UBALL-Gopro-Fleet","name":"projects/uball-gopro-fleet","resources":{"hostingSite":"uball-gopro-fleet"},"state":"ACTIVE","etag":"1_7a354f61-6e70-4054-94ff-3cdf8488e2d0"}
+[info] i  Using project uball-gopro-fleet (UBALL-Gopro-Fleet) . 
+[info] 
+=== Hosting Setup
+[debug] [2026-02-02T02:12:34.551Z] Checked if tokens are valid: true, expires at: 1770001876020
+[debug] [2026-02-02T02:12:34.551Z] Checked if tokens are valid: true, expires at: 1770001876020
+[debug] [2026-02-02T02:12:34.552Z] >>> [apiv2][query] GET https://firebase.googleapis.com/v1beta1/projects/uball-gopro-fleet [none]
+[debug] [2026-02-02T02:12:34.706Z] <<< [apiv2][status] GET https://firebase.googleapis.com/v1beta1/projects/uball-gopro-fleet 200
+[debug] [2026-02-02T02:12:34.706Z] <<< [apiv2][body] GET https://firebase.googleapis.com/v1beta1/projects/uball-gopro-fleet {"projectId":"uball-gopro-fleet","projectNumber":"693666737702","displayName":"UBALL-Gopro-Fleet","name":"projects/uball-gopro-fleet","resources":{"hostingSite":"uball-gopro-fleet"},"state":"ACTIVE","etag":"1_7a354f61-6e70-4054-94ff-3cdf8488e2d0"}
