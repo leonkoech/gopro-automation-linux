@@ -243,6 +243,20 @@ def get_connected_gopros():
                 if gopro_ip:
                     gopro_ip_cache[current_interface] = gopro_ip
 
+                # Check actual camera recording state (not just internal dict)
+                actual_recording = False
+                if gopro_ip:
+                    try:
+                        state_resp = requests.get(f'http://{gopro_ip}:8080/gopro/camera/state', timeout=2)
+                        if state_resp.status_code == 200:
+                            state = state_resp.json()
+                            actual_recording = state.get('status', {}).get('8', 0) == 1
+                    except:
+                        # Fall back to internal dict if camera query fails
+                        actual_recording = current_interface in recording_processes
+                else:
+                    actual_recording = current_interface in recording_processes
+
                 gopro_info = {
                     'id': current_interface,
                     'name': f'GoPro-{current_interface[-4:]}',
@@ -250,7 +264,7 @@ def get_connected_gopros():
                     'ip': current_ip,
                     'gopro_ip': gopro_ip,
                     'status': 'connected',
-                    'is_recording': current_interface in recording_processes
+                    'is_recording': actual_recording
                 }
                 gopros.append(gopro_info)
                 current_interface = None
@@ -310,6 +324,66 @@ def get_gopro_files(gopro_ip):
         print(f"Error getting GoPro files: {e}")
     return files
 
+
+def _fetch_gopro_chapters(gopro_ip, pre_record_files=None, label=''):
+    """Fetch chapter files from GoPro SD card, waiting for file count to stabilize.
+
+    Args:
+        gopro_ip: GoPro HTTP API IP address
+        pre_record_files: Set of filenames on SD before recording (to exclude)
+        label: Label for log messages (e.g. gopro_id)
+
+    Returns:
+        List of {'directory': ..., 'filename': ..., 'size': ...} dicts
+    """
+    if pre_record_files is None:
+        pre_record_files = set()
+
+    new_chapters = []
+    last_chapter_count = 0
+    stable_count = 0
+    max_retries = 10
+
+    for attempt in range(max_retries):
+        logger.info(f"[{label}] Getting media list (attempt {attempt + 1}/{max_retries})...")
+        try:
+            media_response = requests.get(
+                f'http://{gopro_ip}:8080/gopro/media/list',
+                timeout=15
+            )
+            media_list = media_response.json()
+
+            new_chapters = []
+            for directory in media_list.get('media', []):
+                dir_name = directory['d']
+                for file_info in directory.get('fs', []):
+                    filename = file_info['n']
+                    if filename not in pre_record_files and filename.lower().endswith('.mp4'):
+                        new_chapters.append({
+                            'directory': dir_name,
+                            'filename': filename,
+                            'size': int(file_info.get('s', 0))
+                        })
+
+            logger.info(f"[{label}] Found {len(new_chapters)} new chapters")
+
+            if len(new_chapters) == last_chapter_count and len(new_chapters) > 0:
+                stable_count += 1
+                if stable_count >= 2:
+                    logger.info(f"[{label}] Chapter count stable at {len(new_chapters)}")
+                    break
+            else:
+                stable_count = 0
+                last_chapter_count = len(new_chapters)
+
+        except Exception as e:
+            logger.warning(f"[{label}] Error getting media list: {e}")
+
+        if attempt < max_retries - 1:
+            time.sleep(2)
+
+    return new_chapters
+
 def get_gopro_camera_name(gopro_ip):
     """Get the camera name from GoPro's API (ap_ssid field)"""
     try:
@@ -335,39 +409,38 @@ def sanitize_filename(name):
     return name.strip()
 
 
+# Only these four session/angle types (no UNKNOWN in UI).
+VALID_ANGLE_CODES = ('FL', 'FR', 'NL', 'NR')
+
+
 def _get_angle_code_from_camera_name(camera_name: str) -> str:
     """
     Extract angle code from camera name or CAMERA_ANGLE_MAP env var.
+    Returns only FL, FR, NL, or NR so sessions are always one of 4 types.
 
     Args:
         camera_name: GoPro camera name (e.g., "GoPro FL")
 
     Returns:
-        Angle code (FL, FR, NL, NR) or 'UNK' if unknown
+        Angle code: one of FL, FR, NL, NR
     """
     # Try CAMERA_ANGLE_MAP env var first
     angle_map_str = os.getenv('CAMERA_ANGLE_MAP', '{}')
-    print(f"[DEBUG] CAMERA_ANGLE_MAP env: {angle_map_str}")
-    print(f"[DEBUG] Looking up camera_name: '{camera_name}'")
     try:
         angle_map = json.loads(angle_map_str)
-        print(f"[DEBUG] Parsed angle_map: {angle_map}")
         if camera_name in angle_map:
             result = angle_map[camera_name]
-            print(f"[DEBUG] Found mapping: {camera_name} -> {result}")
-            return result
-        else:
-            print(f"[DEBUG] Camera '{camera_name}' not in angle_map keys: {list(angle_map.keys())}")
-    except json.JSONDecodeError as e:
-        print(f"[DEBUG] JSON decode error: {e}")
+            return result if result in VALID_ANGLE_CODES else 'NL'
+    except json.JSONDecodeError:
+        pass
 
     # Fallback: extract from camera name like "GoPro FL"
     if camera_name:
-        for code in ['FL', 'FR', 'NL', 'NR']:
+        for code in VALID_ANGLE_CODES:
             if code in camera_name.upper():
                 return code
 
-    return 'UNK'  # Unknown angle
+    return 'NL'  # Default so we never return UNK/UNKNOWN
 
 def get_video_list():
     """Get list of all recorded videos"""
@@ -516,14 +589,46 @@ def start_recording(gopro_id):
     if not gopro:
         return jsonify({'success': False, 'error': 'GoPro not found'}), 404
 
-    with recording_lock:
-        if gopro_id in recording_processes:
-            return jsonify({'success': False, 'error': 'Already recording'}), 400
-
     gopro_ip = gopro.get('gopro_ip') or get_gopro_wired_ip(gopro_id)
     if not gopro_ip:
         return jsonify({'success': False, 'error': f'Could not find GoPro IP for {gopro_id}'}), 500
 
+    # Check ACTUAL camera state before rejecting
+    actual_recording = False
+    try:
+        state_resp = requests.get(f'http://{gopro_ip}:8080/gopro/camera/state', timeout=3)
+        if state_resp.status_code == 200:
+            state = state_resp.json()
+            actual_recording = state.get('status', {}).get('8', 0) == 1
+    except Exception as e:
+        logger.warning(f"Could not check camera state for {gopro_id}: {e}")
+
+    stale_pre_record_files = None
+    with recording_lock:
+        if gopro_id in recording_processes:
+            if actual_recording:
+                # Camera is actually recording - reject
+                return jsonify({'success': False, 'error': 'Already recording'}), 400
+            else:
+                # Stale entry - camera stopped but dict wasn't cleaned up
+                logger.info(f"[Start Recording] Cleaning stale entry for {gopro_id}")
+                stale_pre_record_files = recording_processes[gopro_id].get('pre_record_files', None)
+                del recording_processes[gopro_id]
+        elif actual_recording:
+            # Camera is recording but not tracked - add to dict for tracking
+            logger.info(f"[Start Recording] Camera {gopro_id} already recording but not tracked, adding to dict")
+            recording_processes[gopro_id] = {
+                'gopro_ip': gopro_ip,
+                'is_recording': True,
+                'started_externally': True
+            }
+            return jsonify({
+                'success': True,
+                'message': 'Camera was already recording, now tracked',
+                'gopro_id': gopro_id
+            })
+
+    # Continue with starting recording (gopro_ip already validated above)
     try:
         # Enable USB control first - required for wired control
         print(f"Enabling USB control on {gopro_id} ({gopro_ip})...")
@@ -546,7 +651,13 @@ def start_recording(gopro_id):
             print(f"⚠ Warning: Could not set video mode for {gopro_id}: {e}")
 
         # Get list of existing files BEFORE recording
-        pre_record_files = get_gopro_files(gopro_ip)
+        # If we cleaned a stale entry, reuse its pre_record_files to avoid
+        # treating the full recording as "pre-existing" files
+        if stale_pre_record_files is not None:
+            pre_record_files = stale_pre_record_files
+            logger.info(f"Reusing pre_record_files from stale entry ({len(pre_record_files)} files)")
+        else:
+            pre_record_files = get_gopro_files(gopro_ip)
         print(f"Pre-recording files on {gopro_id} ({gopro_ip}): {len(pre_record_files)} files")
 
         # Start recording via HTTP API
@@ -678,7 +789,17 @@ def start_recording(gopro_id):
 
 @app.route('/api/gopros/<gopro_id>/record/stop', methods=['POST'])
 def stop_recording(gopro_id):
-    """Stop recording and download all new video chapters using HTTP API"""
+    """
+    Stop recording on a GoPro camera.
+
+    This ONLY stops the camera and registers the session in Firebase.
+    NO local download - chapters will be streamed directly to S3 by the pipeline.
+
+    The pipeline (triggered by stop-all-and-process or process-only) will:
+    1. Stream chapters from GoPro HTTP directly to S3
+    2. Detect and process games
+    3. Delete GoPro files after success
+    """
     global recording_processes
 
     with recording_lock:
@@ -689,27 +810,9 @@ def stop_recording(gopro_id):
         recording_info = recording_processes[gopro_id].copy()
 
     try:
-        session_dir = recording_info.get('session_dir')
         gopro_ip = recording_info.get('gopro_ip')
         pre_record_files = recording_info.get('pre_record_files', set())
-        camera_name = recording_info.get('camera_name', f'GoPro-{gopro_id[-4:]}')
-        start_datetime = recording_info.get('start_datetime', datetime.now())
         firebase_session_id = recording_info.get('firebase_session_id')
-
-        # Generate filename with format: YYYYMMDD HHMMSS - HHMMSS camera_name.mp4
-        stop_datetime = datetime.now()
-        date_str = start_datetime.strftime('%Y%m%d')
-        start_time_str = start_datetime.strftime('%H%M%S')
-        stop_time_str = stop_datetime.strftime('%H%M%S')
-        safe_camera_name = sanitize_filename(camera_name)
-        video_filename = f'{date_str} {start_time_str} - {stop_time_str} {safe_camera_name}.mp4'
-        video_path = os.path.join(VIDEO_STORAGE_DIR, video_filename)
-
-        # Update recording info with the generated filename
-        with recording_lock:
-            if gopro_id in recording_processes:
-                recording_processes[gopro_id]['video_path'] = video_path
-                recording_processes[gopro_id]['video_filename'] = video_filename
 
         if not gopro_ip:
             gopro_ip = get_gopro_wired_ip(gopro_id)
@@ -721,308 +824,99 @@ def stop_recording(gopro_id):
             return jsonify({'success': False, 'error': 'Could not detect GoPro IP'}), 500
 
         # Send stop command to camera via HTTP API
-        print(f"Stopping recording on {gopro_id} ({gopro_ip})...")
+        logger.info(f"[{gopro_id}] Stopping recording on {gopro_ip}...")
         try:
             response = requests.get(f'http://{gopro_ip}:8080/gopro/camera/shutter/stop', timeout=5)
             if response.status_code == 200:
-                print(f"✓ Recording stopped on {gopro_id}")
+                logger.info(f"[{gopro_id}] ✓ Recording stopped")
             else:
-                print(f"⚠ Stop command returned: {response.status_code}")
+                logger.warning(f"[{gopro_id}] Stop command returned: {response.status_code}")
         except Exception as e:
-            print(f"Warning: Could not send stop command: {e}")
+            logger.warning(f"[{gopro_id}] Could not send stop command: {e}")
 
         with recording_lock:
             if gopro_id in recording_processes:
-                recording_processes[gopro_id]['downloading'] = True
-                recording_processes[gopro_id]['download_progress'] = 0
-                recording_processes[gopro_id]['stage'] = 'stopping'
-                recording_processes[gopro_id]['stage_message'] = 'Stopping GoPro...'
+                recording_processes[gopro_id]['stage'] = 'finalizing'
+                recording_processes[gopro_id]['stage_message'] = 'Waiting for GoPro to finalize files...'
 
-        def download_all_chapters():
-            """Download ALL new video chapters created during recording with integrity checks"""
+        def finalize_and_register():
+            """Wait for GoPro to finalize files and register session in Firebase."""
             try:
-                # Update stage: downloading
-                with recording_lock:
-                    if gopro_id in recording_processes:
-                        recording_processes[gopro_id]['stage'] = 'downloading'
-                        recording_processes[gopro_id]['stage_message'] = 'Waiting for GoPro to finalize files...'
-
                 # Wait for camera to finalize all chapter files
                 logger.info(f"[{gopro_id}] Waiting for GoPro to finalize files...")
                 time.sleep(5)
 
-                # Retry loop to ensure all chapters are available
-                new_chapters = []
-                last_chapter_count = 0
-                stable_count = 0
-                max_retries = 10
+                # Fetch chapters from GoPro SD card
+                new_chapters = _fetch_gopro_chapters(gopro_ip, pre_record_files, gopro_id)
 
-                for attempt in range(max_retries):
-                    logger.info(f"[{gopro_id}] Getting media list from {gopro_ip} (attempt {attempt + 1}/{max_retries})...")
-                    media_response = requests.get(
-                        f'http://{gopro_ip}:8080/gopro/media/list',
-                        timeout=15
-                    )
-                    media_list = media_response.json()
-
-                    # Find ALL new files
-                    new_chapters = []
-                    for directory in media_list.get('media', []):
-                        dir_name = directory['d']
-                        for file_info in directory.get('fs', []):
-                            filename = file_info['n']
-                            if filename not in pre_record_files and filename.lower().endswith('.mp4'):
-                                new_chapters.append({
-                                    'directory': dir_name,
-                                    'filename': filename,
-                                    'size': int(file_info.get('s', 0))
-                                })
-
-                    logger.info(f"[{gopro_id}] Found {len(new_chapters)} new chapters")
-
-                    # Check if chapter count has stabilized
-                    if len(new_chapters) == last_chapter_count and len(new_chapters) > 0:
-                        stable_count += 1
-                        if stable_count >= 2:
-                            logger.info(f"[{gopro_id}] Chapter count stable at {len(new_chapters)}")
-                            break
-                    else:
-                        stable_count = 0
-                        last_chapter_count = len(new_chapters)
-
-                    if attempt < max_retries - 1:
-                        time.sleep(2)
-
-                # Sort chapters by GoPro naming convention
-                def gopro_sort_key(chapter):
-                    filename = chapter['filename'].upper()
-                    if len(filename) >= 8 and filename.startswith('G'):
-                        chapter_num = filename[2:4]
-                        video_num = filename[4:8]
-                        return (video_num, chapter_num)
-                    return (filename, "00")
-
-                new_chapters.sort(key=gopro_sort_key)
-
-                # Safety check for too many files
-                MAX_CHAPTERS = 20
+                # Calculate totals
                 total_size_bytes = sum(ch['size'] for ch in new_chapters)
                 total_size_gb = total_size_bytes / (1024**3)
 
-                if len(new_chapters) > MAX_CHAPTERS:
-                    logger.warning(f"[{gopro_id}] Found {len(new_chapters)} new chapters ({total_size_gb:.1f} GB) - limiting to last {MAX_CHAPTERS}")
-                    new_chapters = new_chapters[-MAX_CHAPTERS:]
-                    total_size_bytes = sum(ch['size'] for ch in new_chapters)
-                    total_size_gb = total_size_bytes / (1024**3)
-
-                logger.info(f"[{gopro_id}] Total download size: {total_size_gb:.2f} GB")
+                logger.info(f"[{gopro_id}] Session has {len(new_chapters)} chapters ({total_size_gb:.2f} GB)")
 
                 # Update Firebase with recording stop info
-                if firebase_service and firebase_session_id:
+                if firebase_service:
                     try:
-                        stop_data = {
-                            'total_chapters': len(new_chapters),
-                            'total_size_bytes': total_size_bytes
-                        }
-                        firebase_service.register_recording_stop(firebase_session_id, stop_data)
-                        logger.info(f"[{gopro_id}] Updated Firebase session: {firebase_session_id}")
+                        # If we don't have firebase_session_id (e.g., discovered externally),
+                        # look it up by interface_id and status='recording'
+                        session_id_to_update = firebase_session_id
+                        if not session_id_to_update:
+                            logger.info(f"[{gopro_id}] Looking up Firebase session by interface_id...")
+                            session = firebase_service.find_recording_session_by_interface(gopro_id, 'recording')
+                            if session:
+                                session_id_to_update = session['id']
+                                logger.info(f"[{gopro_id}] Found Firebase session: {session_id_to_update}")
+                            else:
+                                logger.warning(f"[{gopro_id}] No recording session found in Firebase for interface {gopro_id}")
+
+                        if session_id_to_update:
+                            stop_data = {
+                                'total_chapters': len(new_chapters),
+                                'total_size_bytes': total_size_bytes,
+                                'chapter_files': new_chapters  # Store exact filenames for correct pipeline upload
+                            }
+                            firebase_service.register_recording_stop(session_id_to_update, stop_data)
+                            logger.info(f"[{gopro_id}] ✓ Firebase session updated: {session_id_to_update}")
                     except Exception as e:
                         logger.warning(f"[{gopro_id}] Failed to update Firebase: {e}")
 
-                logger.info(f"[{gopro_id}] Found {len(new_chapters)} new chapters to download")
-                for ch in new_chapters:
-                    logger.info(f"[{gopro_id}]   - {ch['filename']} ({ch['size']} bytes)")
+                # Mark as done (ready for pipeline)
+                with recording_lock:
+                    if gopro_id in recording_processes:
+                        recording_processes[gopro_id]['stage'] = 'ready'
+                        recording_processes[gopro_id]['stage_message'] = f'Ready! {len(new_chapters)} chapters to upload'
+                        recording_processes[gopro_id]['total_chapters'] = len(new_chapters)
+                        recording_processes[gopro_id]['total_size_bytes'] = total_size_bytes
 
-                if not new_chapters:
-                    logger.warning(f"[{gopro_id}] No new chapters found")
-                    if firebase_service and firebase_session_id:
-                        try:
-                            firebase_service.register_recording_stop(firebase_session_id, {
-                                'total_chapters': 0,
-                                'total_size_bytes': 0
-                            })
-                        except Exception as e:
-                            logger.warning(f"[{gopro_id}] Failed to update Firebase: {e}")
-                    with recording_lock:
-                        if gopro_id in recording_processes:
-                            del recording_processes[gopro_id]
-                    return
-
-                # Download all chapters with integrity verification
-                # Start background keep-alive thread to prevent GoPro from sleeping
-                keep_alive_thread = DownloadKeepAliveThread(gopro_ip)
-                keep_alive_thread.start()
-                logger.info(f"[{gopro_id}] Started keep-alive thread for download")
-
-                downloaded_files = []
-                failed_chapters = []
-                total_chapters = len(new_chapters)
-
-                try:
-                    for i, chapter in enumerate(new_chapters):
-                        chapter_path = os.path.join(session_dir, f'chapter_{i+1:03d}_{chapter["filename"]}')
-                        download_url = f'http://{gopro_ip}:8080/videos/DCIM/{chapter["directory"]}/{chapter["filename"]}'
-                        expected_size = int(chapter.get('size', 0))
-
-                        logger.info(f"[{gopro_id}] Downloading chapter {i+1}/{total_chapters}: {chapter['filename']} ({expected_size / (1024**3):.2f} GB)")
-
-                        # Update stage message
-                        with recording_lock:
-                            if gopro_id in recording_processes:
-                                recording_processes[gopro_id]['stage_message'] = f'Downloading chapter {i+1}/{total_chapters}...'
-
-                        download_success = False
-
-                        for attempt in range(DOWNLOAD_MAX_RETRIES):
-                            try:
-                                # Check current file size for resume
-                                current_size = os.path.getsize(chapter_path) if os.path.exists(chapter_path) else 0
-
-                                # Skip if already complete
-                                if expected_size > 0 and current_size >= expected_size:
-                                    logger.info(f"[{gopro_id}] Chapter {i+1} already complete ({current_size:,} bytes)")
-                                    download_success = True
-                                    break
-
-                                # Prepare headers for resume
-                                headers = {}
-                                if current_size > 0:
-                                    headers['Range'] = f'bytes={current_size}-'
-                                    logger.info(f"[{gopro_id}] Resuming from byte {current_size:,} ({current_size/1024/1024/1024:.2f} GB)")
-
-                                # Start download with BOTH connect and read timeout
-                                response = requests.get(
-                                    download_url,
-                                    headers=headers,
-                                    stream=True,
-                                    timeout=(DOWNLOAD_CONNECT_TIMEOUT, DOWNLOAD_READ_TIMEOUT)
-                                )
-
-                                # Handle response codes
-                                if current_size > 0 and response.status_code == 416:
-                                    # Range not satisfiable - file is likely complete
-                                    logger.info(f"[{gopro_id}] Server returned 416 - file may be complete")
-                                    download_success = True
-                                    break
-
-                                if current_size > 0 and response.status_code != 206:
-                                    logger.warning(f"[{gopro_id}] Server returned {response.status_code} instead of 206, will append anyway")
-
-                                # Determine write mode
-                                if current_size > 0 and response.status_code == 206:
-                                    mode = 'ab'  # Append
-                                elif current_size > 0:
-                                    mode = 'ab'  # Still try to append
-                                else:
-                                    mode = 'wb'  # Fresh start
-
-                                # Write to file with smaller chunks for faster stall detection
-                                bytes_written = 0
-                                with open(chapter_path, mode) as f:
-                                    for chunk in response.iter_content(chunk_size=DOWNLOAD_CHUNK_SIZE):
-                                        if chunk:
-                                            f.write(chunk)
-                                            bytes_written += len(chunk)
-
-                                # Verify final size
-                                final_size = os.path.getsize(chapter_path)
-
-                                if expected_size > 0 and final_size >= expected_size:
-                                    logger.info(f"[{gopro_id}] Chapter {i+1} download complete ({final_size:,} bytes)")
-                                    download_success = True
-                                    break
-                                elif expected_size > 0:
-                                    logger.warning(f"[{gopro_id}] Chapter {i+1} incomplete: {final_size:,}/{expected_size:,} bytes - will retry")
-                                else:
-                                    logger.info(f"[{gopro_id}] Chapter {i+1} downloaded: {final_size:,} bytes (expected size unknown)")
-                                    download_success = True
-                                    break
-
-                            except requests.exceptions.Timeout as e:
-                                logger.warning(f"[{gopro_id}] Timeout on attempt {attempt+1}/{DOWNLOAD_MAX_RETRIES}: {e}")
-                            except requests.exceptions.ConnectionError as e:
-                                logger.warning(f"[{gopro_id}] Connection error on attempt {attempt+1}/{DOWNLOAD_MAX_RETRIES}: {e}")
-                            except Exception as e:
-                                logger.warning(f"[{gopro_id}] Error on attempt {attempt+1}/{DOWNLOAD_MAX_RETRIES}: {e}")
-
-                            # Exponential backoff (max 30 seconds) - NEVER delete partial files
-                            wait_time = min(2 ** attempt, 30)
-                            logger.info(f"[{gopro_id}] Waiting {wait_time}s before retry...")
-                            time.sleep(wait_time)
-
-                        # After retry loop - verify integrity
-                        if download_success and os.path.exists(chapter_path):
-                            # Quick integrity check with ffprobe
-                            if not verify_video_integrity(chapter_path):
-                                logger.warning(f"[{gopro_id}] Chapter {i+1} failed integrity check, marking as failed")
-                                download_success = False
-                                failed_chapters.append(chapter['filename'])
-                            else:
-                                downloaded_files.append(chapter_path)
-                                logger.info(f"[{gopro_id}] Chapter {i+1} verified OK")
-                        elif not download_success:
-                            logger.error(f"[{gopro_id}] Failed to download chapter {i+1} after {DOWNLOAD_MAX_RETRIES} attempts")
-                            failed_chapters.append(chapter['filename'])
-
-                        # Update progress
-                        with recording_lock:
-                            if gopro_id in recording_processes:
-                                progress = int(((i + 1) / total_chapters) * 100)
-                                recording_processes[gopro_id]['download_progress'] = progress
-
-                finally:
-                    # Always stop keep-alive thread
-                    keep_alive_thread.stop()
-                    logger.info(f"[{gopro_id}] Stopped keep-alive thread")
-
-                # Summary
-                if downloaded_files:
-                    total_size_mb = sum(os.path.getsize(f) for f in downloaded_files) / (1024 * 1024)
-                    logger.info(f"[{gopro_id}] Downloaded {len(downloaded_files)} chapters ({total_size_mb:.1f} MB) to {session_dir}")
-
-                    if failed_chapters:
-                        logger.warning(f"[{gopro_id}] Failed chapters: {failed_chapters}")
-
-                    with recording_lock:
-                        if gopro_id in recording_processes:
-                            if failed_chapters:
-                                recording_processes[gopro_id]['stage'] = 'done_with_errors'
-                                recording_processes[gopro_id]['stage_message'] = f'Done with {len(failed_chapters)} failed chapters'
-                                recording_processes[gopro_id]['failed_chapters'] = failed_chapters
-                            else:
-                                recording_processes[gopro_id]['stage'] = 'done'
-                                recording_processes[gopro_id]['stage_message'] = f'Done! {len(downloaded_files)} chapters saved'
-                else:
-                    logger.error(f"[{gopro_id}] No chapters downloaded successfully")
-                    with recording_lock:
-                        if gopro_id in recording_processes:
-                            recording_processes[gopro_id]['stage'] = 'failed'
-                            recording_processes[gopro_id]['stage_message'] = 'All downloads failed'
+                # Keep in recording_processes briefly so UI can see the status
+                time.sleep(3)
 
                 with recording_lock:
                     if gopro_id in recording_processes:
                         del recording_processes[gopro_id]
-                        logger.info(f"[{gopro_id}] Recording cleanup complete")
+                        logger.info(f"[{gopro_id}] Recording finalized, ready for pipeline")
 
             except Exception as e:
-                logger.error(f"[{gopro_id}] Error in download_all_chapters: {e}")
+                logger.error(f"[{gopro_id}] Error in finalize_and_register: {e}")
                 import traceback
                 traceback.print_exc()
                 with recording_lock:
                     if gopro_id in recording_processes:
-                        recording_processes[gopro_id]['download_error'] = str(e)
+                        recording_processes[gopro_id]['stage'] = 'error'
+                        recording_processes[gopro_id]['stage_message'] = f'Error: {str(e)}'
                         del recording_processes[gopro_id]
-        threading.Thread(target=download_all_chapters, daemon=True).start()
+
+        threading.Thread(target=finalize_and_register, daemon=True).start()
 
         return jsonify({
             'success': True,
-            'message': f'Recording stopped, downloading chapters...',
-            'video_filename': video_filename,
-            'pre_record_files_count': len(pre_record_files)
+            'message': 'Recording stopped. Chapters will be uploaded to S3 by the pipeline.',
+            'gopro_id': gopro_id
         })
 
     except Exception as e:
-        print(f"Error in stop_recording: {str(e)}")
+        logger.error(f"[{gopro_id}] Error in stop_recording: {e}")
         import traceback
         traceback.print_exc()
         with recording_lock:
@@ -1039,7 +933,7 @@ def recording_status(gopro_id):
                 'success': True,
                 'is_recording': False
             })
-        
+
         info = recording_processes[gopro_id]
         return jsonify({
             'success': True,
@@ -1054,6 +948,447 @@ def recording_status(gopro_id):
             'stage_message': info.get('stage_message', 'Recording...'),
             'error': info.get('error')
         })
+
+
+@app.route('/api/recording/stop-all-and-process', methods=['POST'])
+def stop_all_and_process():
+    """
+    Stop all recordings and automatically start the full processing pipeline.
+
+    This is the main automation endpoint that:
+    1. Stops all recording GoPros on this Jetson
+    2. Waits for GoPros to finalize files (~10 seconds)
+    3. Streams chapters directly from GoPro HTTP to S3 (no local download!)
+    4. Detects games from Firebase based on recording timerange
+    5. Processes each game (extract, upload 4K)
+    6. Submits AWS Batch jobs for encoding (4K -> 1080p)
+    7. Deletes GoPro SD card files after success
+
+    Request Body (optional):
+    {
+        "auto_delete_sd": true  // Delete GoPro files after success (default: true)
+    }
+
+    Returns:
+        {
+            success: true,
+            message: "Stopping N GoPros, pipeline will start automatically",
+            gopros_stopped: N
+        }
+
+    After stopping, poll /api/recording/pipeline-status for progress.
+    """
+    global recording_processes
+
+    data = request.get_json() or {}
+    auto_delete_sd = data.get('auto_delete_sd', True)
+
+    # Find all recording GoPros from internal state
+    with recording_lock:
+        recording_gopros = list(recording_processes.keys())
+
+    # If no recordings in internal state, check actual GoPro state
+    # This handles cases where recordings were started externally or after server restart
+    if not recording_gopros:
+        logger.info("[Stop All] No recordings in internal state, checking actual GoPro state...")
+
+        # Discover all connected GoPros
+        discovered_gopros = get_connected_gopros()
+
+        for gopro in discovered_gopros:
+            gopro_id = gopro.get('interface')
+            gopro_ip = gopro.get('gopro_ip')
+
+            if gopro_ip:
+                try:
+                    # Check actual recording state from GoPro
+                    state_response = requests.get(
+                        f'http://{gopro_ip}:8080/gopro/camera/state',
+                        timeout=3
+                    )
+                    if state_response.status_code == 200:
+                        state = state_response.json()
+                        # Status 8 = is_recording (1 = true, 0 = false)
+                        is_recording = state.get('status', {}).get('8', 0) == 1
+
+                        if is_recording:
+                            logger.info(f"[Stop All] Found recording GoPro: {gopro_id} (from camera state)")
+                            recording_gopros.append(gopro_id)
+                            # Add to internal state for tracking
+                            with recording_lock:
+                                recording_processes[gopro_id] = {
+                                    'gopro_ip': gopro_ip,
+                                    'is_recording': True,
+                                    'discovered_externally': True
+                                }
+                except Exception as e:
+                    logger.warning(f"[Stop All] Could not check state for {gopro_id}: {e}")
+
+    if not recording_gopros:
+        # Still no recordings - check for pending sessions and start pipeline
+        logger.info("[Stop All] No active recordings, checking for pending sessions...")
+
+        if firebase_service:
+            pending_sessions = firebase_service.get_sessions_pending_upload(
+                jetson_id=firebase_service.jetson_id
+            )
+            if pending_sessions:
+                # Start pipeline with pending sessions
+                return _start_auto_pipeline_internal(auto_delete_sd)
+
+        return jsonify({
+            'success': False,
+            'error': 'No recordings in progress and no pending sessions'
+        }), 400
+
+    # Stop each recording
+    stopped_gopros = []
+    stop_errors = []
+
+    for gopro_id in recording_gopros:
+        try:
+            # Get GoPro IP
+            with recording_lock:
+                if gopro_id in recording_processes:
+                    gopro_ip = recording_processes[gopro_id].get('gopro_ip')
+                    if not gopro_ip:
+                        gopro_ip = get_gopro_wired_ip(gopro_id)
+
+            if gopro_ip:
+                # Send stop command
+                try:
+                    response = requests.get(
+                        f'http://{gopro_ip}:8080/gopro/camera/shutter/stop',
+                        timeout=5
+                    )
+                    if response.status_code == 200:
+                        stopped_gopros.append(gopro_id)
+                        logger.info(f"[Stop All] Stopped recording on {gopro_id}")
+                except Exception as e:
+                    stop_errors.append(f"{gopro_id}: {e}")
+                    logger.warning(f"[Stop All] Failed to stop {gopro_id}: {e}")
+
+                # Mark as stopping
+                with recording_lock:
+                    if gopro_id in recording_processes:
+                        recording_processes[gopro_id]['is_stopping'] = True
+                        recording_processes[gopro_id]['stage'] = 'stopping'
+                        recording_processes[gopro_id]['stage_message'] = 'Stopping GoPro...'
+
+        except Exception as e:
+            stop_errors.append(f"{gopro_id}: {e}")
+            logger.error(f"[Stop All] Error stopping {gopro_id}: {e}")
+
+    if not stopped_gopros:
+        return jsonify({
+            'success': False,
+            'error': 'Failed to stop any recordings',
+            'errors': stop_errors
+        }), 500
+
+    # Capture GoPro info before thread starts (recording_processes may be cleared)
+    gopro_info_snapshot = {}
+    with recording_lock:
+        for gopro_id in stopped_gopros:
+            if gopro_id in recording_processes:
+                gopro_info_snapshot[gopro_id] = {
+                    'gopro_ip': recording_processes[gopro_id].get('gopro_ip'),
+                    'pre_record_files': recording_processes[gopro_id].get('pre_record_files', set()),
+                }
+
+    # Start background thread to monitor finalization and trigger pipeline
+    def monitor_and_start_pipeline():
+        try:
+            # Wait for all GoPros to finalize their files (no downloads - just finalization)
+            logger.info(f"[Stop All] Waiting for {len(stopped_gopros)} GoPros to finalize files...")
+
+            max_wait = 120  # 2 minutes max (finalization is fast, ~10-15 seconds per GoPro)
+            check_interval = 2  # Check every 2 seconds
+            elapsed = 0
+
+            while elapsed < max_wait:
+                # Check if all stopped GoPros have finalized
+                with recording_lock:
+                    still_finalizing = [
+                        gid for gid in stopped_gopros
+                        if gid in recording_processes
+                    ]
+
+                if not still_finalizing:
+                    logger.info("[Stop All] All GoPros finalized, starting pipeline...")
+                    break
+
+                time.sleep(check_interval)
+                elapsed += check_interval
+
+                # Log progress every 10 seconds
+                if elapsed % 10 == 0:
+                    logger.info(f"[Stop All] Still waiting for {len(still_finalizing)} GoPros to finalize: {still_finalizing}")
+
+            if elapsed >= max_wait:
+                logger.warning("[Stop All] Timeout waiting for finalization, starting pipeline anyway")
+
+            # IMPORTANT: Fetch real chapter data and update Firebase sessions to "stopped"
+            # This is needed for externally discovered recordings that don't go through stop_recording
+            if firebase_service:
+                logger.info("[Stop All] Fetching chapter data and updating Firebase sessions...")
+                for gopro_id in stopped_gopros:
+                    try:
+                        # Find the recording session by interface_id
+                        session = firebase_service.find_recording_session_by_interface(gopro_id, 'recording')
+                        if session:
+                            # Get GoPro IP from snapshot or discover it
+                            info = gopro_info_snapshot.get(gopro_id, {})
+                            gp_ip = info.get('gopro_ip') or get_gopro_wired_ip(gopro_id)
+                            pre_files = info.get('pre_record_files', set())
+
+                            if gp_ip:
+                                chapters = _fetch_gopro_chapters(gp_ip, pre_files, gopro_id)
+                                total_size = sum(ch['size'] for ch in chapters)
+                                stop_data = {
+                                    'total_chapters': len(chapters),
+                                    'total_size_bytes': total_size,
+                                    'chapter_files': chapters
+                                }
+                                logger.info(f"[Stop All] {gopro_id}: {len(chapters)} chapters, {total_size / (1024**3):.2f} GB")
+                            else:
+                                logger.warning(f"[Stop All] No GoPro IP for {gopro_id}, storing zeros")
+                                stop_data = {
+                                    'total_chapters': 0,
+                                    'total_size_bytes': 0
+                                }
+
+                            firebase_service.register_recording_stop(session['id'], stop_data)
+                            logger.info(f"[Stop All] Updated Firebase session {session['id']} to stopped")
+                        else:
+                            logger.warning(f"[Stop All] No recording session found for {gopro_id}")
+                    except Exception as e:
+                        logger.warning(f"[Stop All] Failed to update session for {gopro_id}: {e}")
+
+            # Give a small delay for Firebase to sync
+            time.sleep(2)
+
+            # Start the pipeline (streams chapters directly from GoPro HTTP to S3)
+            _start_auto_pipeline_internal(auto_delete_sd, from_background=True)
+
+        except Exception as e:
+            logger.error(f"[Stop All] Error in monitor_and_start_pipeline: {e}")
+            import traceback
+            traceback.print_exc()
+
+    threading.Thread(target=monitor_and_start_pipeline, daemon=True).start()
+
+    return jsonify({
+        'success': True,
+        'message': f'Stopping {len(stopped_gopros)} GoPros. Pipeline will start after finalization (~15 seconds).',
+        'gopros_stopped': len(stopped_gopros),
+        'stopped_gopros': stopped_gopros,
+        'errors': stop_errors if stop_errors else None
+    })
+
+
+def _start_auto_pipeline_internal(auto_delete_sd: bool = True, from_background: bool = False):
+    """Internal helper to start the automated pipeline."""
+    from pipeline_orchestrator import get_orchestrator
+
+    orchestrator = get_orchestrator()
+    if not orchestrator:
+        if from_background:
+            logger.error("[Pipeline] Orchestrator not available")
+            return None
+        return jsonify({
+            'success': False,
+            'error': 'Pipeline orchestrator not initialized'
+        }), 503
+
+    if not firebase_service:
+        if from_background:
+            logger.error("[Pipeline] Firebase not available")
+            return None
+        return jsonify({
+            'success': False,
+            'error': 'Firebase service not configured'
+        }), 503
+
+    try:
+        # Get recent sessions for this Jetson
+        all_sessions = firebase_service.get_recording_sessions(
+            jetson_id=firebase_service.jetson_id,
+            limit=50
+        )
+
+        # Include sessions that are stopped — either needing upload or already uploaded
+        # Sessions with s3Prefix already set will skip upload in the pipeline
+        sessions = [
+            s for s in all_sessions
+            if s.get('status') == 'stopped'
+        ]
+
+        logger.info(f"[Pipeline] Found {len(sessions)} unprocessed sessions (out of {len(all_sessions)} total)")
+
+        if not sessions:
+            if from_background:
+                logger.warning("[Pipeline] No unprocessed sessions found")
+                return None
+            return jsonify({
+                'success': False,
+                'error': 'No unprocessed sessions found'
+            }), 404
+
+        # Discover GoPro connections for sessions that need upload (no s3Prefix)
+        gopro_connections = {}
+        sessions_needing_upload = [s for s in sessions if not s.get('s3Prefix')]
+        sessions_already_uploaded = [s for s in sessions if s.get('s3Prefix')]
+
+        for session in sessions_needing_upload:
+            interface_id = session.get('interfaceId')
+            if interface_id and interface_id not in gopro_connections:
+                gopro_ip = get_gopro_wired_ip(interface_id)
+                if gopro_ip:
+                    gopro_connections[interface_id] = gopro_ip
+
+        if sessions_needing_upload and not gopro_connections:
+            if from_background:
+                logger.error("[Pipeline] No GoPro cameras found for pending sessions")
+                return None
+            return jsonify({
+                'success': False,
+                'error': 'No GoPro cameras found for pending sessions. Chapters need to be uploaded first.'
+            }), 400
+
+        if sessions_already_uploaded:
+            logger.info(f"[Pipeline] {len(sessions_already_uploaded)} sessions already have chapters in S3 (will skip upload)")
+
+        # Start pipeline
+        pipeline_id = orchestrator.start_pipeline(
+            sessions=sessions,
+            gopro_connections=gopro_connections,
+            auto_delete_sd=auto_delete_sd
+        )
+
+        logger.info(f"[Pipeline] Started pipeline {pipeline_id} with {len(sessions)} sessions")
+
+        if from_background:
+            return pipeline_id
+
+        return jsonify({
+            'success': True,
+            'pipeline_id': pipeline_id,
+            'sessions_count': len(sessions),
+            'message': f'Pipeline started with {len(sessions)} sessions'
+        })
+
+    except Exception as e:
+        logger.error(f"[Pipeline] Error starting pipeline: {e}")
+        import traceback
+        traceback.print_exc()
+        if from_background:
+            return None
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+
+@app.route('/api/recording/process-only', methods=['POST'])
+def process_only():
+    """
+    Start the processing pipeline without stopping recordings.
+
+    Use this when:
+    - Recordings have already stopped
+    - You want to manually trigger processing
+    - You want to re-process after fixing an issue
+
+    This does everything stop-all-and-process does EXCEPT stopping recordings:
+    1. Stream chapters directly from GoPro HTTP to S3 (no local download!)
+    2. Detect games from Firebase based on recording timerange
+    3. Process each game (extract, upload 4K)
+    4. Submit AWS Batch jobs for encoding (4K -> 1080p)
+    5. Delete GoPro SD card files after success
+
+    Request Body (optional):
+    {
+        "auto_delete_sd": true  // Delete GoPro files after success (default: true)
+    }
+
+    Returns:
+        { success: true, pipeline_id: "...", sessions_count: N, message: "..." }
+
+    Poll /api/recording/pipeline-status for progress.
+    """
+    data = request.get_json() or {}
+    auto_delete_sd = data.get('auto_delete_sd', True)
+
+    # Check if any GoPros are currently recording
+    with recording_lock:
+        recording_gopros = [gid for gid, info in recording_processes.items()
+                          if not info.get('is_stopping', False)]
+
+    if recording_gopros:
+        return jsonify({
+            'success': False,
+            'error': f'{len(recording_gopros)} GoPro(s) still recording. Stop them first or use stop-all-and-process.',
+            'recording_gopros': recording_gopros
+        }), 400
+
+    # Start the pipeline
+    result = _start_auto_pipeline_internal(auto_delete_sd)
+
+    # Handle the response properly
+    if isinstance(result, tuple):
+        return result  # Error response with status code
+    return result
+
+
+@app.route('/api/recording/pipeline-status', methods=['GET'])
+def get_recording_pipeline_status():
+    """
+    Get combined status of recording downloads and pipeline for THIS Jetson.
+
+    Returns current state for UI display:
+    - Recording/download progress for each GoPro
+    - Pipeline status if running (only this Jetson's pipeline)
+
+    When multiple Jetsons are selected (e.g. Jetson 1 = NR, Jetson 2 = NL):
+    the frontend must poll this endpoint on EACH Jetson's base URL and merge
+    the results so both Jetsons' progress are visible. Each Jetson only returns
+    its own pipeline; there is no server-side aggregation.
+
+    Pipeline sessions include: display_label (e.g. "02/02/2026 NR"), session_date
+    (MM/DD/YYYY), angle_code (FL|FR|NL|NR) for the Sessions list.
+    """
+    from pipeline_orchestrator import get_orchestrator
+
+    result = {
+        'success': True,
+        'recording': {},
+        'pipeline': None
+    }
+
+    # Get recording status for all GoPros
+    with recording_lock:
+        for gopro_id, info in recording_processes.items():
+            result['recording'][gopro_id] = {
+                'is_recording': True,
+                'is_stopping': info.get('is_stopping', False),
+                'downloading': info.get('downloading', False),
+                'download_progress': info.get('download_progress', 0),
+                'stage': info.get('stage', 'recording'),
+                'stage_message': info.get('stage_message', 'Recording...')
+            }
+
+    # Get pipeline status if orchestrator exists
+    orchestrator = get_orchestrator()
+    if orchestrator:
+        pipelines = orchestrator.list_pipelines(limit=1)
+        if pipelines:
+            latest_pipeline = pipelines[0]
+            # Include pipeline in ANY status while it's in memory
+            # The 5-minute retention in pipeline_orchestrator handles cleanup
+            result['pipeline'] = latest_pipeline
+
+    return jsonify(result)
 
 
 # ==================== Recording Session Registration ====================
@@ -1303,6 +1638,87 @@ def get_game(game_id):
         }), 500
 
 
+SHOT_LABELS = {
+    '2PT_MAKE': '2-Pointer Made',  '2PT_MISS': '2-Pointer Missed',
+    '3PT_MAKE': '3-Pointer Made',  '3PT_MISS': '3-Pointer Missed',
+    'FT_MAKE':  'Free Throw Made', 'FT_MISS':  'Free Throw Missed',
+    'FOUL':     'Foul',            'TIPOFF':   'Tipoff',
+}
+
+
+def _create_plays_from_firebase_logs(client, uball_game_id, firebase_game):
+    """Create plays in annotation tool from Firebase game logs.
+
+    Returns:
+        int: Number of plays successfully created
+    """
+    logs = firebase_game.get('logs', [])
+    if not logs:
+        return 0
+
+    left_name  = firebase_game.get('leftTeam', {}).get('name', 'Team 1')
+    right_name = firebase_game.get('rightTeam', {}).get('name', 'Team 2')
+    game_start = datetime.fromisoformat(firebase_game['createdAt'].replace('Z', '+00:00'))
+
+    created = 0
+    for log in logs:
+        action    = log.get('actionType', '')
+        payload   = log.get('payload', {}) or {}
+        team_side = log.get('team')  # 'left', 'right', or None
+
+        # Map action to classification
+        if action == 'score_added':
+            points = payload.get('points', 0)
+            if points == 2:   classification = '2PT_MAKE'
+            elif points == 3: classification = '3PT_MAKE'
+            elif points == 1: classification = 'FT_MAKE'
+            else:             continue
+        elif action == 'foul_added':
+            classification = 'FOUL'
+        elif action == 'game_started':
+            classification = 'TIPOFF'
+        else:
+            continue
+
+        # Team side mapping
+        if team_side == 'left':
+            team      = 'team1'
+            team_name = left_name
+        elif team_side == 'right':
+            team      = 'team2'
+            team_name = right_name
+        else:
+            team      = None
+            team_name = 'Game'
+
+        # Timestamp calculation
+        log_time = datetime.fromisoformat(log['timestamp'].replace('Z', '+00:00'))
+        ts       = (log_time - game_start).total_seconds()
+        start_ts = max(0.0, ts - 5.0)
+        end_ts   = ts + 3.0
+
+        note = f"{team_name} — {SHOT_LABELS.get(classification, classification)}"
+
+        play_data = {
+            'game_id':           uball_game_id,
+            'classification':    classification,
+            'note':              note,
+            'timestamp_seconds': ts,
+            'start_timestamp':   start_ts,
+            'end_timestamp':     end_ts,
+        }
+        if team:
+            play_data['team'] = team
+
+        try:
+            client.create_play(play_data)
+            created += 1
+        except Exception as e:
+            logger.warning(f"[GameSync] Failed to create play ({classification} at {ts:.1f}s): {e}")
+
+    return created
+
+
 @app.route('/api/games/sync', methods=['POST'])
 def sync_game_to_uball():
     """
@@ -1478,6 +1894,11 @@ def sync_game_to_uball():
 
         uball_game_id = str(uball_game.get('id', ''))
 
+        # 5.5. Create plays from Firebase logs
+        logger.info(f"[GameSync] Step 5.5: Creating plays from Firebase logs...")
+        plays_created = _create_plays_from_firebase_logs(uball_client, uball_game_id, firebase_game)
+        logger.info(f"[GameSync] Created {plays_created} plays from {len(firebase_game.get('logs', []))} log events")
+
         # 6. Mark game as synced in Firebase
         logger.info(f"[GameSync] Step 6: Marking game as synced in Firebase...")
         firebase_service.mark_game_synced(firebase_game_id, uball_game_id)
@@ -1491,7 +1912,8 @@ def sync_game_to_uball():
             'uball_game_id': uball_game_id,
             'firebase_game_id': firebase_game_id,
             'video_name': video_name,
-            'game': uball_game
+            'game': uball_game,
+            'plays_created': plays_created,
         }
 
         # Include teams created info if any
@@ -1722,7 +2144,7 @@ def process_game_videos_endpoint():
         }), 500
 
 
-def _run_video_processing_job(job_id: str, firebase_game_id: str, game_number: int, location: str, force_local_transcode: bool = False):
+def _run_video_processing_job(job_id: str, firebase_game_id: str, game_number: int, location: str):
     """Background worker for async video processing."""
     def update_progress(stage: str, detail: str = '', progress: float = 0, current_angle: str = ''):
         with video_processing_lock:
@@ -1746,8 +2168,7 @@ def _run_video_processing_job(job_id: str, firebase_game_id: str, game_number: i
             location=location,
             uball_client=uball_client,
             s3_bucket=UPLOAD_BUCKET,
-            progress_callback=update_progress,
-            force_local_transcode=force_local_transcode
+            progress_callback=update_progress
         )
 
         with video_processing_lock:
@@ -1788,8 +2209,7 @@ def process_game_videos_async():
     {
         "firebase_game_id": "abc123",
         "game_number": 1,
-        "location": "court-a",
-        "force_local_transcode": false  // Optional: force local CPU encoding instead of AWS GPU
+        "location": "court-a"
     }
 
     Returns immediately:
@@ -1815,7 +2235,6 @@ def process_game_videos_async():
         firebase_game_id = data.get('firebase_game_id')
         game_number = data.get('game_number', 1)
         location = data.get('location', UPLOAD_LOCATION)
-        force_local_transcode = data.get('force_local_transcode', False)
 
         if not firebase_game_id:
             return jsonify({'success': False, 'error': 'firebase_game_id required'}), 400
@@ -1825,7 +2244,6 @@ def process_game_videos_async():
 
         # Create job
         job_id = str(uuid.uuid4())
-        transcode_mode = 'local' if force_local_transcode else 'aws_gpu'
 
         with video_processing_lock:
             video_processing_jobs[job_id] = {
@@ -1833,7 +2251,7 @@ def process_game_videos_async():
                 'firebase_game_id': firebase_game_id,
                 'game_number': game_number,
                 'location': location,
-                'transcode_mode': transcode_mode,
+                'transcode_mode': 'aws_batch',
                 'status': 'running',
                 'stage': 'queued',
                 'detail': 'Job queued',
@@ -1848,12 +2266,12 @@ def process_game_videos_async():
         # Start background thread
         thread = threading.Thread(
             target=_run_video_processing_job,
-            args=(job_id, firebase_game_id, game_number, location, force_local_transcode),
+            args=(job_id, firebase_game_id, game_number, location),
             daemon=True
         )
         thread.start()
 
-        logger.info(f"[VideoProcessing] Started async job {job_id} for game {firebase_game_id} (mode: {transcode_mode})")
+        logger.info(f"[VideoProcessing] Started async job {job_id} for game {firebase_game_id} (mode: aws_batch)")
 
         return jsonify({
             'success': True,
@@ -2120,6 +2538,134 @@ def preview_game_extraction(game_id):
 
     except Exception as e:
         logger.error(f"[VideoProcessing] Preview error: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+
+@app.route('/api/batch/register-completed', methods=['POST'])
+def register_completed_batch_jobs():
+    """
+    Scan recent AWS Batch jobs and register completed FL/FR videos in Uball.
+
+    This endpoint:
+    1. Lists recent SUCCEEDED Batch jobs from the transcode queue
+    2. For each FL/FR video, registers it in Uball if not already registered
+    3. Returns counts of registered videos
+
+    Call this periodically (e.g., every 5 minutes) to ensure videos are registered.
+
+    Returns:
+        { success: true, registered: 5, already_registered: 10, errors: [] }
+    """
+    if not uball_client:
+        return jsonify({
+            'success': False,
+            'error': 'Uball Backend client not configured'
+        }), 503
+
+    try:
+        import boto3
+        from botocore.config import Config as BotoConfig
+
+        # Initialize AWS clients
+        boto_config = BotoConfig(retries={'max_attempts': 3})
+        batch_client = boto3.client('batch', region_name='us-east-1', config=boto_config)
+        s3_client = boto3.client('s3', region_name='us-east-1', config=boto_config)
+
+        bucket = os.getenv('UPLOAD_BUCKET', 'uball-videos-production')
+        job_queue = os.getenv('AWS_BATCH_JOB_QUEUE', 'gpu-transcode-queue')
+
+        # Get recent succeeded jobs
+        response = batch_client.list_jobs(
+            jobQueue=job_queue,
+            jobStatus='SUCCEEDED',
+            maxResults=100
+        )
+
+        jobs = response.get('jobSummaryList', [])
+        logger.info(f"[BatchRegister] Found {len(jobs)} succeeded Batch jobs")
+
+        registered = 0
+        already_registered = 0
+        errors = []
+
+        for job_summary in jobs:
+            job_id = job_summary['jobId']
+
+            # Get job details to find output S3 key
+            job_detail = batch_client.describe_jobs(jobs=[job_id])
+            if not job_detail.get('jobs'):
+                continue
+
+            job = job_detail['jobs'][0]
+            env_vars = {e['name']: e['value'] for e in job.get('container', {}).get('environment', [])}
+
+            output_key = env_vars.get('OUTPUT_S3_KEY', '')
+            angle = env_vars.get('ANGLE', '')
+
+            # Only register FL and FR
+            if angle not in ['FL', 'FR']:
+                continue
+
+            if not output_key:
+                continue
+
+            # Check if file exists in S3
+            try:
+                s3_client.head_object(Bucket=bucket, Key=output_key)
+            except:
+                continue  # File doesn't exist
+
+            # Get game_id from Batch job environment (full UUID)
+            game_id = env_vars.get('GAME_ID', '')
+            if not game_id:
+                # Fallback: parse from S3 path (less reliable)
+                parts = output_key.split('/')
+                if len(parts) >= 4:
+                    game_id = parts[2]  # Partial UUID from path
+                else:
+                    continue
+
+            # Get filename from S3 path
+            filename = output_key.split('/')[-1]
+            uball_angle = 'LEFT' if angle == 'FL' else 'RIGHT'
+
+            # Try to register (will fail gracefully if already registered)
+            try:
+                result = uball_client.register_video(
+                    game_id=game_id,
+                    s3_key=output_key,
+                    angle=uball_angle,
+                    filename=filename,
+                    duration=0.0
+                )
+
+                if result:
+                    registered += 1
+                    logger.info(f"[BatchRegister] Registered {angle} for game {game_id}: {output_key}")
+                else:
+                    already_registered += 1
+            except Exception as e:
+                error_msg = str(e)
+                if 'duplicate' in error_msg.lower() or 'already exists' in error_msg.lower():
+                    already_registered += 1
+                else:
+                    errors.append({'key': output_key, 'error': error_msg})
+
+        return jsonify({
+            'success': True,
+            'registered': registered,
+            'already_registered': already_registered,
+            'total_jobs_checked': len(jobs),
+            'errors': errors
+        })
+
+    except Exception as e:
+        logger.error(f"[BatchRegister] Error: {e}")
         import traceback
         traceback.print_exc()
         return jsonify({
@@ -3588,13 +4134,7 @@ def get_batch_transcode_status(job_id):
         }
     """
     try:
-        from aws_batch_transcode import AWSBatchTranscoder, is_aws_gpu_transcode_enabled
-
-        if not is_aws_gpu_transcode_enabled():
-            return jsonify({
-                'success': False,
-                'error': 'AWS GPU transcoding is not enabled. Set USE_AWS_GPU_TRANSCODE=true'
-            }), 503
+        from aws_batch_transcode import AWSBatchTranscoder
 
         transcoder = AWSBatchTranscoder()
         status = transcoder.get_job_status(job_id)
@@ -3642,13 +4182,7 @@ def complete_batch_transcode(job_id):
         }
     """
     try:
-        from aws_batch_transcode import AWSBatchTranscoder, is_aws_gpu_transcode_enabled
-
-        if not is_aws_gpu_transcode_enabled():
-            return jsonify({
-                'success': False,
-                'error': 'AWS GPU transcoding is not enabled. Set USE_AWS_GPU_TRANSCODE=true'
-            }), 503
+        from aws_batch_transcode import AWSBatchTranscoder
 
         data = request.get_json()
         if not data:
@@ -3754,13 +4288,7 @@ def wait_for_batch_transcode(job_id):
         Final job status (same as GET /api/batch/transcode/{job_id}/status)
     """
     try:
-        from aws_batch_transcode import AWSBatchTranscoder, is_aws_gpu_transcode_enabled
-
-        if not is_aws_gpu_transcode_enabled():
-            return jsonify({
-                'success': False,
-                'error': 'AWS GPU transcoding is not enabled. Set USE_AWS_GPU_TRANSCODE=true'
-            }), 503
+        from aws_batch_transcode import AWSBatchTranscoder
 
         data = request.get_json() or {}
         timeout = data.get('timeout', 1800)  # 30 min default
@@ -3807,10 +4335,6 @@ def get_batch_transcode_config():
         }
     """
     try:
-        from aws_batch_transcode import is_aws_gpu_transcode_enabled
-
-        enabled = is_aws_gpu_transcode_enabled()
-
         config = {
             'job_queue': os.getenv('AWS_BATCH_JOB_QUEUE', 'gpu-transcode-queue'),
             'job_definition': os.getenv('AWS_BATCH_JOB_DEFINITION', 'ffmpeg-nvenc-transcode'),
@@ -3820,7 +4344,7 @@ def get_batch_transcode_config():
 
         return jsonify({
             'success': True,
-            'enabled': enabled,
+            'enabled': True,
             'config': config
         })
 
@@ -4124,6 +4648,564 @@ def cancel_admin_job(job_id):
     return jsonify({'success': True, 'message': 'Job cancellation requested'})
 
 
+# ==================== Chapter Upload Pipeline Endpoints ====================
+
+# Pipeline job tracking
+pipeline_jobs = {}  # job_id -> job state dict
+pipeline_jobs_lock = threading.Lock()
+
+
+@app.route('/api/pipeline/sessions/pending', methods=['GET'])
+def list_pending_sessions():
+    """
+    List recording sessions that need chapter upload to S3.
+
+    These are sessions where:
+    - status is 'stopped' (recording finished)
+    - s3Prefix is not set (chapters not yet uploaded)
+    - totalChapters > 0 (has files to upload)
+
+    Query params:
+        jetson_id: Optional filter by Jetson ID (defaults to current Jetson)
+
+    Returns:
+        { success: true, sessions: [...], count: N }
+    """
+    if not firebase_service:
+        return jsonify({
+            'success': False,
+            'error': 'Firebase service not configured'
+        }), 503
+
+    try:
+        jetson_id = request.args.get('jetson_id', firebase_service.jetson_id)
+
+        sessions = firebase_service.get_sessions_pending_upload(jetson_id=jetson_id)
+
+        return jsonify({
+            'success': True,
+            'jetson_id': jetson_id,
+            'count': len(sessions),
+            'sessions': sessions
+        })
+
+    except Exception as e:
+        logger.error(f"[Pipeline] Error listing pending sessions: {e}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+
+@app.route('/api/sessions/<session_id>/upload-chapters', methods=['POST'])
+def upload_session_chapters(session_id):
+    """
+    Start async chapter upload job for a recording session.
+
+    Streams chapters directly from GoPro HTTP to S3 (no temp files).
+
+    Request Body (optional):
+    {
+        "gopro_ip": "172.x.x.x"  // Optional, will auto-discover if not provided
+    }
+
+    Returns:
+        { success: true, job_id: "...", message: "Upload started" }
+
+    Poll /api/pipeline/<job_id>/status for progress.
+    """
+    if not firebase_service:
+        return jsonify({
+            'success': False,
+            'error': 'Firebase service not configured'
+        }), 503
+
+    if not upload_service:
+        return jsonify({
+            'success': False,
+            'error': 'Upload service not configured'
+        }), 503
+
+    try:
+        # Get session from Firebase
+        session = firebase_service.get_recording_session(session_id)
+        if not session:
+            return jsonify({
+                'success': False,
+                'error': f'Session not found: {session_id}'
+            }), 404
+
+        # Check if already uploaded
+        if session.get('s3Prefix'):
+            return jsonify({
+                'success': False,
+                'error': 'Session chapters already uploaded',
+                's3Prefix': session['s3Prefix']
+            }), 400
+
+        # Get GoPro IP
+        data = request.get_json() or {}
+        gopro_ip = data.get('gopro_ip')
+
+        if not gopro_ip:
+            # Try to discover GoPro IP from interface
+            interface_id = session.get('interfaceId')
+            if interface_id:
+                gopro_ip = get_gopro_wired_ip(interface_id)
+
+        if not gopro_ip:
+            return jsonify({
+                'success': False,
+                'error': 'Could not find GoPro IP. Provide gopro_ip or ensure GoPro is connected.'
+            }), 400
+
+        # Create job ID
+        job_id = str(uuid.uuid4())[:8]
+
+        # Initialize job state
+        with pipeline_jobs_lock:
+            pipeline_jobs[job_id] = {
+                'job_id': job_id,
+                'session_id': session_id,
+                'segment_session': session.get('segmentSession', ''),
+                'angle_code': session.get('angleCode', 'UNKNOWN'),
+                'gopro_ip': gopro_ip,
+                'status': 'starting',
+                'substage': 'starting',  # NEW: Track download vs upload stage
+                'progress': 0,
+                'total_chapters': session.get('totalChapters', 0),
+                'chapters_uploaded': 0,
+                'chapters_downloaded': 0,  # NEW: Track download progress
+                'bytes_uploaded': 0,
+                'bytes_downloaded': 0,  # NEW: Track download bytes
+                's3_prefix': None,
+                'error': None,
+                'current_chapter': None,  # NEW: Current chapter info
+                'started_at': datetime.now().isoformat(),
+                'completed_at': None
+            }
+
+        # Start upload in background thread
+        def run_upload():
+            try:
+                from chapter_upload_service import ChapterUploadService
+
+                # Update status
+                with pipeline_jobs_lock:
+                    pipeline_jobs[job_id]['status'] = 'discovering'
+
+                # Get chapters from GoPro
+                chapter_service = ChapterUploadService(
+                    s3_client=upload_service.s3_client,
+                    bucket_name=upload_service.bucket_name
+                )
+
+                # Find chapters for this session on GoPro
+                # Note: We need pre_record_files from when recording started
+                # For now, get all files and match by count
+                all_chapters = chapter_service.get_gopro_media_list(gopro_ip)
+
+                expected_count = session.get('totalChapters', 0)
+                if len(all_chapters) < expected_count:
+                    with pipeline_jobs_lock:
+                        pipeline_jobs[job_id]['status'] = 'failed'
+                        pipeline_jobs[job_id]['substage'] = 'failed'
+                        pipeline_jobs[job_id]['error'] = f'Expected {expected_count} chapters but found {len(all_chapters)} on GoPro'
+                        pipeline_jobs[job_id]['current_chapter'] = None
+                    return
+
+                # Take the last N chapters (most recent recording)
+                chapters_to_upload = all_chapters[-expected_count:] if expected_count > 0 else all_chapters
+
+                with pipeline_jobs_lock:
+                    pipeline_jobs[job_id]['status'] = 'downloading'  # Start with downloading
+                    pipeline_jobs[job_id]['substage'] = 'downloading'
+                    pipeline_jobs[job_id]['total_chapters'] = len(chapters_to_upload)
+
+                # Progress callback - now tracks download vs upload stages
+                def progress_callback(stage, chapter_num, total, bytes_current):
+                    """
+                    Progress callback for chapter upload service.
+                    
+                    Args:
+                        stage: 'downloading' or 'uploading'
+                        chapter_num: Current chapter number (1-based)
+                        total: Total number of chapters
+                        bytes_current: Current bytes for this stage
+                    """
+                    with pipeline_jobs_lock:
+                        if job_id in pipeline_jobs:
+                            job = pipeline_jobs[job_id]
+                            
+                            # Update substage
+                            job['substage'] = stage
+                            
+                            # Update status based on stage
+                            if stage == 'downloading':
+                                job['status'] = 'downloading'
+                                job['chapters_downloaded'] = chapter_num
+                                job['bytes_downloaded'] = bytes_current
+                            elif stage == 'uploading':
+                                job['status'] = 'uploading'
+                                job['chapters_uploaded'] = chapter_num
+                                job['bytes_uploaded'] = bytes_current
+                            
+                            # Update overall progress (based on total chapters)
+                            # Progress = (completed chapters / total) * 100
+                            # For downloading: chapter_num - 1 complete
+                            # For uploading: chapter_num - 1 complete + current upload progress
+                            if stage == 'downloading':
+                                completed = chapter_num - 1
+                            else:  # uploading
+                                completed = chapter_num - 1
+                            
+                            job['progress'] = int((completed / total) * 100) if total > 0 else 0
+                            
+                            # Update current chapter info (optional, for better UX)
+                            # Note: We don't have filename here, would need to pass it through
+                            job['current_chapter'] = {
+                                'number': chapter_num,
+                                'stage': stage
+                            }
+
+                # Upload chapters
+                result = chapter_service.upload_session_chapters(
+                    session=session,
+                    gopro_ip=gopro_ip,
+                    chapters=chapters_to_upload,
+                    progress_callback=progress_callback
+                )
+
+                if result['success']:
+                    # Update Firebase with s3Prefix
+                    firebase_service.update_session_s3_prefix(session_id, result['s3_prefix'])
+
+                    with pipeline_jobs_lock:
+                        pipeline_jobs[job_id]['status'] = 'completed'
+                        pipeline_jobs[job_id]['substage'] = 'completed'
+                        pipeline_jobs[job_id]['s3_prefix'] = result['s3_prefix']
+                        pipeline_jobs[job_id]['chapters_uploaded'] = result['chapters_uploaded']
+                        pipeline_jobs[job_id]['chapters_downloaded'] = result['chapters_uploaded']  # Same as uploaded
+                        pipeline_jobs[job_id]['bytes_uploaded'] = result['total_bytes']
+                        pipeline_jobs[job_id]['bytes_downloaded'] = result['total_bytes']  # Same as uploaded
+                        pipeline_jobs[job_id]['progress'] = 100
+                        pipeline_jobs[job_id]['current_chapter'] = None
+                        pipeline_jobs[job_id]['completed_at'] = datetime.now().isoformat()
+                else:
+                    with pipeline_jobs_lock:
+                        pipeline_jobs[job_id]['status'] = 'failed'
+                        pipeline_jobs[job_id]['substage'] = 'failed'
+                        pipeline_jobs[job_id]['error'] = '; '.join(result.get('errors', ['Unknown error']))
+                        pipeline_jobs[job_id]['current_chapter'] = None
+                        pipeline_jobs[job_id]['completed_at'] = datetime.now().isoformat()
+
+            except Exception as e:
+                logger.error(f"[Pipeline] Upload job {job_id} failed: {e}")
+                import traceback
+                traceback.print_exc()
+                with pipeline_jobs_lock:
+                    pipeline_jobs[job_id]['status'] = 'failed'
+                    pipeline_jobs[job_id]['substage'] = 'failed'
+                    pipeline_jobs[job_id]['error'] = str(e)
+                    pipeline_jobs[job_id]['current_chapter'] = None
+                    pipeline_jobs[job_id]['completed_at'] = datetime.now().isoformat()
+
+        threading.Thread(target=run_upload, daemon=True).start()
+
+        return jsonify({
+            'success': True,
+            'job_id': job_id,
+            'message': 'Chapter upload started',
+            'session_id': session_id,
+            'gopro_ip': gopro_ip
+        })
+
+    except Exception as e:
+        logger.error(f"[Pipeline] Error starting chapter upload: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+
+@app.route('/api/pipeline/<job_id>/status', methods=['GET'])
+def get_pipeline_job_status(job_id):
+    """
+    Get status of a pipeline job (chapter upload or game processing).
+
+    Poll this endpoint every 2 seconds for progress updates.
+
+    Returns:
+        {
+            success: true,
+            job: {
+                job_id: "...",
+                status: "uploading" | "completed" | "failed",
+                progress: 0-100,
+                chapters_uploaded: N,
+                total_chapters: N,
+                bytes_uploaded: N,
+                s3_prefix: "..." (when completed),
+                error: "..." (when failed)
+            }
+        }
+    """
+    with pipeline_jobs_lock:
+        job = pipeline_jobs.get(job_id)
+
+    if not job:
+        return jsonify({
+            'success': False,
+            'error': 'Job not found'
+        }), 404
+
+    return jsonify({
+        'success': True,
+        'job': job
+    })
+
+
+@app.route('/api/pipeline/jobs', methods=['GET'])
+def list_pipeline_jobs():
+    """
+    List all pipeline jobs (for debugging/monitoring).
+
+    Query params:
+        status: Optional filter by status (starting, uploading, completed, failed)
+        limit: Maximum jobs to return (default 20)
+
+    Returns:
+        { success: true, jobs: [...], count: N }
+    """
+    status_filter = request.args.get('status')
+    limit = request.args.get('limit', 20, type=int)
+
+    with pipeline_jobs_lock:
+        jobs = list(pipeline_jobs.values())
+
+    # Filter by status if requested
+    if status_filter:
+        jobs = [j for j in jobs if j.get('status') == status_filter]
+
+    # Sort by started_at descending (most recent first)
+    jobs.sort(key=lambda j: j.get('started_at', ''), reverse=True)
+
+    # Apply limit
+    jobs = jobs[:limit]
+
+    return jsonify({
+        'success': True,
+        'count': len(jobs),
+        'jobs': jobs
+    })
+
+
+# ==================== Full Pipeline Automation ====================
+
+# Initialize pipeline orchestrator
+from pipeline_orchestrator import init_orchestrator, get_orchestrator
+
+pipeline_orchestrator = None
+if firebase_service and upload_service:
+    try:
+        pipeline_orchestrator = init_orchestrator(
+            jetson_id=firebase_service.jetson_id,
+            firebase_service=firebase_service,
+            upload_service=upload_service,
+            video_processor=video_processor,
+            uball_client=uball_client
+        )
+        print(f"✓ Pipeline orchestrator initialized (uball_client: {'yes' if uball_client else 'no'})")
+    except Exception as e:
+        print(f"⚠ Failed to initialize pipeline orchestrator: {e}")
+
+
+@app.route('/api/pipeline/auto-start', methods=['POST'])
+def start_auto_pipeline():
+    """
+    Start the fully automated pipeline for all pending sessions on this Jetson.
+
+    This endpoint:
+    1. Gets all pending sessions (status='stopped', no s3Prefix)
+    2. Discovers connected GoPros for each session
+    3. Starts the full pipeline: upload → detect games → process → encode → cleanup
+
+    Request Body (optional):
+    {
+        "auto_delete_sd": true,  // Delete GoPro files after success (default: true)
+        "session_ids": ["id1", "id2"]  // Optional: specific sessions to process
+    }
+
+    Returns:
+        { success: true, pipeline_id: "...", sessions_count: N, message: "..." }
+
+    Poll /api/pipeline/full/{pipeline_id}/status for progress.
+    """
+    if not pipeline_orchestrator:
+        return jsonify({
+            'success': False,
+            'error': 'Pipeline orchestrator not initialized'
+        }), 503
+
+    if not firebase_service:
+        return jsonify({
+            'success': False,
+            'error': 'Firebase service not configured'
+        }), 503
+
+    try:
+        data = request.get_json() or {}
+        auto_delete_sd = data.get('auto_delete_sd', True)
+        specific_session_ids = data.get('session_ids')
+
+        # Get pending sessions
+        if specific_session_ids:
+            # Get specific sessions
+            sessions = []
+            for sid in specific_session_ids:
+                session = firebase_service.get_recording_session(sid)
+                if session:
+                    session['id'] = sid
+                    sessions.append(session)
+        else:
+            # Get all pending sessions for this Jetson
+            sessions = firebase_service.get_sessions_pending_upload(jetson_id=firebase_service.jetson_id)
+
+        if not sessions:
+            return jsonify({
+                'success': False,
+                'error': 'No pending sessions found'
+            }), 404
+
+        # Discover GoPro connections for each session's interface
+        gopro_connections = {}
+        for session in sessions:
+            interface_id = session.get('interfaceId')
+            if interface_id and interface_id not in gopro_connections:
+                gopro_ip = get_gopro_wired_ip(interface_id)
+                if gopro_ip:
+                    gopro_connections[interface_id] = gopro_ip
+
+        if not gopro_connections:
+            return jsonify({
+                'success': False,
+                'error': 'No GoPro cameras found. Ensure cameras are connected.'
+            }), 400
+
+        # Start the pipeline
+        pipeline_id = pipeline_orchestrator.start_pipeline(
+            sessions=sessions,
+            gopro_connections=gopro_connections,
+            auto_delete_sd=auto_delete_sd
+        )
+
+        return jsonify({
+            'success': True,
+            'pipeline_id': pipeline_id,
+            'sessions_count': len(sessions),
+            'gopro_connections': len(gopro_connections),
+            'message': f'Pipeline started with {len(sessions)} sessions'
+        })
+
+    except Exception as e:
+        logger.error(f"[Pipeline] Error starting auto pipeline: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+
+@app.route('/api/pipeline/full/<pipeline_id>/status', methods=['GET'])
+def get_full_pipeline_status(pipeline_id):
+    """
+    Get status of the full automated pipeline.
+
+    Poll this endpoint every 2 seconds for progress updates.
+
+    Returns:
+        {
+            success: true,
+            pipeline: {
+                pipeline_id: "...",
+                status: "running" | "completed" | "failed",
+                stage: "uploading_chapters" | "detecting_games" | "processing_games" | ...,
+                stage_message: "Processing game 2/4...",
+                progress: 0-100,
+                sessions: { ... },
+                games: { ... },
+                games_total: N,
+                games_completed: N,
+                batch_jobs_submitted: N,
+                errors: [...]
+            }
+        }
+    """
+    if not pipeline_orchestrator:
+        return jsonify({
+            'success': False,
+            'error': 'Pipeline orchestrator not initialized'
+        }), 503
+
+    pipeline = pipeline_orchestrator.get_pipeline_status(pipeline_id)
+
+    if not pipeline:
+        return jsonify({
+            'success': False,
+            'error': 'Pipeline not found'
+        }), 404
+
+    return jsonify({
+        'success': True,
+        'pipeline': pipeline
+    })
+
+
+@app.route('/api/pipeline/full/<pipeline_id>/cancel', methods=['POST'])
+def cancel_pipeline(pipeline_id):
+    """Cancel a running pipeline."""
+    from pipeline_orchestrator import get_orchestrator
+    orchestrator = get_orchestrator()
+    if not orchestrator:
+        return jsonify({'success': False, 'error': 'Pipeline orchestrator not initialized'}), 500
+
+    cancelled = orchestrator.cancel_pipeline(pipeline_id)
+    if not cancelled:
+        return jsonify({'success': False, 'error': 'Pipeline not found or not running'}), 404
+
+    return jsonify({'success': True, 'message': f'Cancel requested for pipeline {pipeline_id}'})
+
+
+@app.route('/api/pipeline/full/list', methods=['GET'])
+def list_full_pipelines():
+    """
+    List all full pipelines.
+
+    Query params:
+        status: Optional filter (running, completed, failed)
+        limit: Maximum pipelines to return (default 20)
+    """
+    if not pipeline_orchestrator:
+        return jsonify({
+            'success': False,
+            'error': 'Pipeline orchestrator not initialized'
+        }), 503
+
+    status_filter = request.args.get('status')
+    limit = request.args.get('limit', 20, type=int)
+
+    pipelines = pipeline_orchestrator.list_pipelines(status=status_filter, limit=limit)
+
+    return jsonify({
+        'success': True,
+        'count': len(pipelines),
+        'pipelines': pipelines
+    })
+
+
 if __name__ == '__main__':
     logger.info("=" * 60)
     logger.info("GoPro Controller API Service Starting...")
@@ -4134,15 +5216,21 @@ if __name__ == '__main__':
     logger.info(f"API endpoint: http://0.0.0.0:5000")
     logger.info("Make sure GoPros are connected via USB")
 
-    # Check AWS GPU transcoding status
-    use_aws_gpu = os.getenv('USE_AWS_GPU_TRANSCODE', 'false').lower() == 'true'
-    if use_aws_gpu:
-        logger.info("AWS GPU Transcoding: ENABLED")
-        logger.info(f"  Job Queue: {os.getenv('AWS_BATCH_JOB_QUEUE', 'gpu-transcode-queue')}")
-        logger.info(f"  Job Definition: {os.getenv('AWS_BATCH_JOB_DEFINITION', 'ffmpeg-nvenc-transcode')}")
-    else:
-        logger.info("AWS GPU Transcoding: DISABLED (using local CPU encoding)")
+    logger.info("AWS Batch Transcoding: ENABLED")
+    logger.info(f"  Job Queue: {os.getenv('AWS_BATCH_JOB_QUEUE', 'gpu-transcode-queue')}")
+    logger.info(f"  Job Definition: {os.getenv('AWS_BATCH_JOB_DEFINITION', 'ffmpeg-nvenc-transcode')}")
 
     logger.info("=" * 60)
+
+    # Cleanup any pipelines that were left in 'running' state by a previous crash/restart
+    if firebase_service:
+        stale_count = firebase_service.cleanup_stale_running_pipelines()
+        if stale_count:
+            logger.warning(f"Startup cleanup: marked {stale_count} stale pipeline(s) as failed due to service restart")
+
+        # Migrate legacy sessions that have s3Prefix but still show status='stopped'
+        migrated_count = firebase_service.migrate_legacy_uploaded_sessions()
+        if migrated_count:
+            logger.info(f"Startup migration: updated {migrated_count} legacy session(s) to 'uploaded'")
 
     app.run(host='0.0.0.0', port=5000, debug=False, threaded=True)

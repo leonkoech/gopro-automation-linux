@@ -176,7 +176,17 @@ class UballClient:
                 logger.info(f"[UballClient] Game created: {result.get('id')}")
                 return result
             else:
-                logger.error(f"[UballClient] Create game failed: {response.status_code} - {response.text}")
+                error_text = response.text
+                logger.error(f"[UballClient] Create game failed: {response.status_code} - {error_text}")
+                # Handle duplicate firebase_game_id (race condition with other Jetson)
+                if '23505' in error_text or 'already exists' in error_text.lower():
+                    logger.warning(f"[UballClient] Duplicate detected, fetching existing game...")
+                    firebase_game_id = game_data.get('firebase_game_id', '')
+                    if firebase_game_id:
+                        existing = self.get_game_by_firebase_id(firebase_game_id)
+                        if existing:
+                            logger.info(f"[UballClient] Found existing game: {existing.get('id')}")
+                            return existing
                 return None
 
         except requests.exceptions.RequestException as e:
@@ -293,6 +303,30 @@ class UballClient:
             logger.error(f"[UballClient] Create team error: {e}")
             return None
 
+    def create_play(self, play_data: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Create a play in the annotation tool.
+
+        Args:
+            play_data: Play data containing game_id, classification, note,
+                       timestamp_seconds, start_timestamp, end_timestamp, and optionally team.
+
+        Returns:
+            Created play data dict
+
+        Raises:
+            requests.HTTPError: If the request fails
+        """
+        self._ensure_authenticated()
+        response = requests.post(
+            f"{self.backend_url}/api/plays/",
+            json=play_data,
+            headers=self._get_headers(),
+            timeout=30
+        )
+        response.raise_for_status()
+        return response.json()
+
     def health_check(self) -> bool:
         """
         Check if Uball Backend is reachable and authentication works.
@@ -387,8 +421,8 @@ class UballClient:
                 "last_modified": int(time.time() * 1000)  # Current time in milliseconds
             }
 
-            if duration is not None:
-                payload["duration"] = duration
+            # Duration is required by video_metadata table - default to 0.0 if not provided
+            payload["duration"] = duration if duration is not None else 0.0
 
             logger.info(f"[UballClient] Registering video with payload: {payload}")
 

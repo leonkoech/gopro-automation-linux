@@ -1,6 +1,12 @@
+__pycache__/
+*.pyc
 /venv/
 .env
 /gopro-automation-frontend
 tmpclaude*
 /frontend
 .hide
+
+
+uball-gopro-fleet-firebase-adminsdk.json
+id_rsa

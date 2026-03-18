@@ -31,7 +31,7 @@ Document Structure:
 
 import os
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional, List, Dict, Any
 
 import firebase_admin
@@ -78,27 +78,32 @@ class FirebaseService:
 
         self.db = firestore.client()
 
+    # Only these four session/angle types are supported; no UNKNOWN in UI.
+    VALID_ANGLE_CODES = ('FL', 'FR', 'NL', 'NR')
+
     def _get_angle_code(self, camera_name: str) -> str:
         """
-        Extract angle code from camera name.
+        Extract angle code from camera name. Returns only FL, FR, NL, or NR.
 
         Args:
             camera_name: GoPro camera name (e.g., "GoPro FL")
 
         Returns:
-            Angle code (FL, FR, NL, NR) or camera name suffix
+            Angle code: one of FL, FR, NL, NR (never UNKNOWN)
         """
         # Check explicit mapping first
         if camera_name in self.camera_angle_map:
-            return self.camera_angle_map[camera_name]
+            code = self.camera_angle_map[camera_name]
+            return code if code in self.VALID_ANGLE_CODES else 'NL'
 
         # Try to extract from camera name (e.g., "GoPro FL" -> "FL")
         if camera_name and ' ' in camera_name:
             suffix = camera_name.split(' ')[-1].upper()
-            if suffix in ['FL', 'FR', 'NL', 'NR']:
+            if suffix in self.VALID_ANGLE_CODES:
                 return suffix
 
-        return 'UNKNOWN'
+        # Fallback so we never persist UNKNOWN; sessions stay one of 4 types.
+        return 'NL'
 
     def register_recording_start(self, session_data: dict) -> str:
         """
@@ -154,6 +159,12 @@ class FirebaseService:
             'totalSizeBytes': stop_data.get('total_size_bytes', 0)
         }
 
+        # Store exact chapter filenames so the pipeline uploads the correct files
+        # instead of blindly taking the last N files from the GoPro
+        chapter_files = stop_data.get('chapter_files')
+        if chapter_files:
+            update_data['chapterFiles'] = chapter_files
+
         doc_ref.update(update_data)
 
     def update_session_status(self, session_id: str, status: str) -> None:
@@ -193,6 +204,14 @@ class FirebaseService:
             'processedGames': firestore.ArrayUnion([processed_game])
         })
 
+    def _to_utc_iso(self, dt: datetime) -> str:
+        """Return datetime as ISO 8601 UTC string (e.g. 2026-02-02T14:09:46.000Z) for Firestore."""
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        utc = dt.astimezone(timezone.utc)
+        s = utc.isoformat().replace('+00:00', '')
+        return s + 'Z' if not s.endswith('Z') else s
+
     def get_games_in_timerange(self, start: datetime, end: datetime) -> List[Dict[str, Any]]:
         """
         Fetch games from basketball-games that overlap with the given time range.
@@ -201,18 +220,19 @@ class FirebaseService:
         - Game started before recording ended AND
         - Game ended after recording started (or game hasn't ended yet)
 
+        All timestamps must be stored in Firebase as UTC (ISO 8601 with Z) for correct matching.
+
         Args:
-            start: Start of time range (recording start time)
-            end: End of time range (recording end time)
+            start: Start of time range (recording start time, UTC)
+            end: End of time range (recording end time, UTC)
 
         Returns:
             List of game documents that overlap with the time range
         """
         games_ref = self.db.collection(self.BASKETBALL_GAMES_COLLECTION)
 
-        # Convert to ISO format strings for Firestore comparison
-        start_iso = start.isoformat() + 'Z' if not start.isoformat().endswith('Z') else start.isoformat()
-        end_iso = end.isoformat() + 'Z' if not end.isoformat().endswith('Z') else end.isoformat()
+        start_iso = self._to_utc_iso(start)
+        end_iso = self._to_utc_iso(end)
 
         # Query games that started before our recording ended
         # We'll filter further in Python for games that ended after our recording started
@@ -295,6 +315,34 @@ class FirebaseService:
         """
         sessions_ref = self.db.collection(self.RECORDING_SESSIONS_COLLECTION)
         query = sessions_ref.where('segmentSession', '==', segment_session).limit(1)
+
+        for doc in query.stream():
+            data = doc.to_dict()
+            data['id'] = doc.id
+            return data
+
+        return None
+
+    def find_recording_session_by_interface(self, interface_id: str, status: str = 'recording') -> Optional[Dict[str, Any]]:
+        """
+        Find a recording session by interface ID and status.
+
+        Used to look up the Firebase session when we don't have the session ID
+        (e.g., when recording was discovered externally).
+
+        Args:
+            interface_id: USB interface ID (e.g., 'enxd43260ddac87')
+            status: Session status to filter by (default: 'recording')
+
+        Returns:
+            Most recent matching session or None if not found
+        """
+        sessions_ref = self.db.collection(self.RECORDING_SESSIONS_COLLECTION)
+        # Simple query without order_by to avoid requiring composite index
+        query = (sessions_ref
+                 .where('interfaceId', '==', interface_id)
+                 .where('status', '==', status)
+                 .limit(1))
 
         for doc in query.stream():
             data = doc.to_dict()
@@ -421,6 +469,257 @@ class FirebaseService:
             'uballGameId': uball_game_id,
             'syncedAt': datetime.utcnow().isoformat() + 'Z'
         })
+
+    # ==================== Pipeline Run Tracking Methods ====================
+
+    PIPELINE_RUNS_COLLECTION = 'pipeline-runs'
+
+    def create_pipeline_run(self, pipeline_data: Dict[str, Any]) -> Optional[str]:
+        """
+        Create a pipeline-run document in Firebase when a pipeline starts.
+
+        This makes the Jetson backend the source of truth for pipeline state,
+        so the dashboard shows correct status even if the browser is closed.
+
+        Args:
+            pipeline_data: Dictionary containing pipeline state (pipeline_id, jetson_id,
+                          sessions info, stage, status, timestamps, etc.)
+
+        Returns:
+            Firebase document ID, or None if write failed
+        """
+        try:
+            doc_data = {
+                'pipeline_id': pipeline_data.get('pipeline_id'),
+                'jetson_id': pipeline_data.get('jetson_id'),
+                'jetson_name': pipeline_data.get('jetson_name', pipeline_data.get('jetson_id', '')),
+                'status': pipeline_data.get('status', 'running'),
+                'stage': pipeline_data.get('stage', 'initializing'),
+                'stage_message': pipeline_data.get('stage_message', 'Initializing pipeline...'),
+                'progress': pipeline_data.get('progress', 0),
+                'sessions_total': pipeline_data.get('sessions_total', 0),
+                'sessions_uploaded': pipeline_data.get('sessions_uploaded', 0),
+                'sessions_skipped_unk': pipeline_data.get('sessions_skipped_unk', 0),
+                'games_total': pipeline_data.get('games_total', 0),
+                'games_completed': pipeline_data.get('games_completed', 0),
+                'batch_jobs_submitted': pipeline_data.get('batch_jobs_submitted', 0),
+                'batch_jobs_completed': pipeline_data.get('batch_jobs_completed', 0),
+                'recording_start': pipeline_data.get('recording_start'),
+                'recording_end': pipeline_data.get('recording_end'),
+                'started_at': pipeline_data.get('started_at', datetime.utcnow().isoformat() + 'Z'),
+                'completed_at': None,
+                'bytes_uploaded': 0,
+                'errors': [],
+                'sessions': pipeline_data.get('sessions', {}),
+                'games': pipeline_data.get('games', {}),
+            }
+
+            doc_ref = self.db.collection(self.PIPELINE_RUNS_COLLECTION).document(pipeline_data['pipeline_id'])
+            doc_ref.set(doc_data)
+            return doc_ref.id
+        except Exception as e:
+            import logging
+            logging.getLogger('gopro.firebase').error(f"Failed to create pipeline-run doc: {e}")
+            return None
+
+    def update_pipeline_run(self, pipeline_id: str, updates: Dict[str, Any]) -> bool:
+        """
+        Update specific fields on an existing pipeline-run document.
+
+        Called at stage transitions, session completions, and game completions.
+        Failures are logged but do not crash the pipeline.
+
+        Args:
+            pipeline_id: The pipeline ID (used as document ID)
+            updates: Dictionary of fields to update
+
+        Returns:
+            True if update succeeded, False otherwise
+        """
+        try:
+            doc_ref = self.db.collection(self.PIPELINE_RUNS_COLLECTION).document(pipeline_id)
+            doc_ref.update(updates)
+            return True
+        except Exception as e:
+            import logging
+            logging.getLogger('gopro.firebase').error(f"Failed to update pipeline-run {pipeline_id}: {e}")
+            return False
+
+    def complete_pipeline_run(self, pipeline_id: str, final_data: Dict[str, Any]) -> bool:
+        """
+        Mark a pipeline-run as completed or failed with final stats.
+
+        Args:
+            pipeline_id: The pipeline ID (used as document ID)
+            final_data: Dictionary containing final status, stage, message,
+                       completed_at, and any final counts
+
+        Returns:
+            True if update succeeded, False otherwise
+        """
+        try:
+            doc_ref = self.db.collection(self.PIPELINE_RUNS_COLLECTION).document(pipeline_id)
+            update_data = {
+                'status': final_data.get('status', 'completed'),
+                'stage': final_data.get('stage', 'completed'),
+                'stage_message': final_data.get('stage_message', 'Pipeline complete.'),
+                'progress': final_data.get('progress', 100),
+                'completed_at': final_data.get('completed_at', datetime.utcnow().isoformat() + 'Z'),
+                'sessions_uploaded': final_data.get('sessions_uploaded', 0),
+                'sessions_total': final_data.get('sessions_total', 0),
+                'games_total': final_data.get('games_total', 0),
+                'games_completed': final_data.get('games_completed', 0),
+                'batch_jobs_submitted': final_data.get('batch_jobs_submitted', 0),
+                'batch_jobs_completed': final_data.get('batch_jobs_completed', 0),
+                'errors': final_data.get('errors', []),
+                'sessions': final_data.get('sessions', {}),
+                'games': final_data.get('games', {}),
+                'bytes_uploaded': final_data.get('bytes_uploaded', 0),
+                'jetson_name': final_data.get('jetson_name', ''),
+            }
+            doc_ref.update(update_data)
+            return True
+        except Exception as e:
+            import logging
+            logging.getLogger('gopro.firebase').error(f"Failed to complete pipeline-run {pipeline_id}: {e}")
+            return False
+
+    def cleanup_stale_running_pipelines(self) -> int:
+        """
+        On service startup, mark any pipelines still in 'running' status as failed.
+
+        This handles the case where the service was killed (restart, crash) while a
+        pipeline was in progress — the pipeline thread dies but Firebase never gets
+        updated from 'running' to 'failed'.
+
+        Returns:
+            Number of pipelines marked as failed.
+        """
+        import logging
+        log = logging.getLogger('gopro.firebase')
+        try:
+            q = (
+                self.db.collection(self.PIPELINE_RUNS_COLLECTION)
+                .where('jetson_id', '==', self.jetson_id)
+                .where('status', '==', 'running')
+            )
+            docs = q.get()
+            count = 0
+            failed_at = datetime.utcnow().isoformat() + 'Z'
+            for doc in docs:
+                try:
+                    doc.reference.update({
+                        'status': 'failed',
+                        'stage': 'failed',
+                        'stage_message': 'Pipeline interrupted: service restarted unexpectedly.',
+                        'completed_at': failed_at,
+                    })
+                    count += 1
+                    log.warning(f"Marked stale pipeline {doc.id} as failed (service restart cleanup)")
+                except Exception as e:
+                    log.error(f"Failed to clean up stale pipeline {doc.id}: {e}")
+            if count:
+                log.info(f"Startup cleanup: marked {count} stale running pipeline(s) as failed")
+            return count
+        except Exception as e:
+            log.error(f"Failed to query stale pipelines on startup: {e}")
+            return 0
+
+    def migrate_legacy_uploaded_sessions(self) -> int:
+        """
+        On startup, fix legacy sessions that have s3Prefix but still show status='stopped'.
+
+        These sessions were uploaded before the bug fix that sets status='uploaded'
+        in update_session_s3_prefix(). This migration ensures they won't be re-picked
+        by the pipeline.
+
+        Returns:
+            Number of sessions migrated.
+        """
+        import logging
+        log = logging.getLogger('gopro.firebase')
+        try:
+            q = (
+                self.db.collection(self.RECORDING_SESSIONS_COLLECTION)
+                .where('status', '==', 'stopped')
+            )
+            docs = list(q.stream())
+            count = 0
+            for doc in docs:
+                data = doc.to_dict()
+                if data.get('s3Prefix') and not data.get('_recovery'):
+                    try:
+                        doc.reference.update({'status': 'uploaded'})
+                        count += 1
+                        log.info(f"Migrated legacy session {doc.id} to status='uploaded'")
+                    except Exception as e:
+                        log.error(f"Failed to migrate session {doc.id}: {e}")
+            if count:
+                log.info(f"Startup migration: updated {count} legacy session(s) to 'uploaded'")
+            return count
+        except Exception as e:
+            log.error(f"Failed to query legacy sessions for migration: {e}")
+            return 0
+
+    # ==================== Chapter Upload Pipeline Methods ====================
+
+    def update_session_s3_prefix(self, session_id: str, s3_prefix: str) -> None:
+        """
+        Set the s3Prefix field on a recording session after chapters are uploaded to S3.
+
+        Args:
+            session_id: Document ID of the recording session
+            s3_prefix: S3 prefix where chapters are stored (e.g., "raw-chapters/enxd43260ef4d38_20250120_140530/")
+        """
+        doc_ref = self.db.collection(self.RECORDING_SESSIONS_COLLECTION).document(session_id)
+        doc_ref.update({
+            's3Prefix': s3_prefix,
+            's3UploadedAt': datetime.utcnow().isoformat() + 'Z',
+            'status': 'uploaded'
+        })
+
+    def get_sessions_pending_upload(self, jetson_id: Optional[str] = None) -> List[Dict[str, Any]]:
+        """
+        Get recording sessions that need chapter upload to S3.
+
+        Sessions are pending upload if:
+        - status is 'stopped' (recording finished, chapters available)
+        - s3Prefix is not set (chapters not yet uploaded to S3)
+
+        Args:
+            jetson_id: Optional filter by Jetson ID (defaults to current Jetson)
+
+        Returns:
+            List of session documents pending upload
+        """
+        sessions_ref = self.db.collection(self.RECORDING_SESSIONS_COLLECTION)
+
+        # Query for stopped sessions
+        query = sessions_ref.where('status', '==', 'stopped')
+
+        if jetson_id:
+            query = query.where('jetsonId', '==', jetson_id)
+
+        # Filter in Python for missing s3Prefix (Firestore doesn't support "field not exists" well)
+        pending_sessions = []
+        for doc in query.stream():
+            session_data = doc.to_dict()
+            session_data['id'] = doc.id
+
+            # Skip if already has s3Prefix (already uploaded)
+            if session_data.get('s3Prefix'):
+                continue
+
+            # Skip if no chapters (nothing to upload)
+            if session_data.get('totalChapters', 0) == 0:
+                continue
+
+            pending_sessions.append(session_data)
+
+        # Sort by startedAt descending (most recent first)
+        pending_sessions.sort(key=lambda s: s.get('startedAt', ''), reverse=True)
+
+        return pending_sessions
 
 
 # Singleton instance

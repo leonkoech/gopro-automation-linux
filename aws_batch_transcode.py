@@ -2,18 +2,28 @@
 AWS Batch GPU Transcoding Module
 
 Offloads 4K→1080p video transcoding to AWS Batch GPU instances (g4dn.xlarge)
-with NVIDIA NVENC hardware encoding for ~10x faster processing.
+with NVIDIA NVENC hardware encoding for fast processing.
 
 Flow:
 1. Jetson extracts 4K clip with stream copy (fast, no encoding)
 2. Uploads 4K to S3 raw/ prefix
-3. Submits AWS Batch job for GPU transcoding
-4. Batch job downloads 4K, encodes to 1080p with NVENC, uploads result
+3. Submits AWS Batch job for GPU transcoding (queue selected by file size)
+4. Batch job downloads 4K, encodes to 1080p with h264_nvenc, uploads result
 5. Raw 4K file is deleted after successful transcode
 
+Queue Selection (based on 4K file size):
+    - gpu-transcode-queue: Files < 14GB (30GB EBS)
+    - gpu-transcode-queue-large: Files >= 14GB (100GB EBS)
+
+Encoding Specs (h264_nvenc GPU):
+    - Video: h264_nvenc, preset p4, cq 23
+    - Scale: scale_cuda=-2:1080 (GPU-accelerated)
+    - Audio: AAC 128k
+    - movflags: +faststart
+
 Environment Variables:
-    USE_AWS_GPU_TRANSCODE: Enable GPU transcoding (true/false)
-    AWS_BATCH_JOB_QUEUE: Batch job queue name
+    AWS_BATCH_JOB_QUEUE: Batch job queue name (default for small files)
+    AWS_BATCH_JOB_QUEUE_LARGE: Batch job queue for large files (>=14GB)
     AWS_BATCH_JOB_DEFINITION: Batch job definition name
     AWS_BATCH_REGION: AWS region for Batch (default: us-east-1)
 """
@@ -38,9 +48,13 @@ logger = get_logger('gopro.aws_batch_transcode')
 class AWSBatchTranscoder:
     """Manages AWS Batch GPU transcoding jobs for video processing."""
 
+    # File size threshold for queue selection (14GB in bytes)
+    LARGE_FILE_THRESHOLD = 14 * 1024 * 1024 * 1024  # 14GB
+
     def __init__(
         self,
         job_queue: str = None,
+        job_queue_large: str = None,
         job_definition: str = None,
         region: str = None,
         bucket: str = None
@@ -49,13 +63,15 @@ class AWSBatchTranscoder:
         Initialize AWS Batch Transcoder.
 
         Args:
-            job_queue: Batch job queue name (default from env: AWS_BATCH_JOB_QUEUE)
-            job_definition: Batch job definition name (default from env: AWS_BATCH_JOB_DEFINITION)
+            job_queue: Batch job queue for small files <14GB (default: gpu-transcode-queue)
+            job_queue_large: Batch job queue for large files >=14GB (default: gpu-transcode-queue-large)
+            job_definition: Batch job definition name (default: ffmpeg-nvenc-transcode:16)
             region: AWS region (default from env: AWS_BATCH_REGION or us-east-1)
             bucket: S3 bucket name (default from env: UPLOAD_BUCKET)
         """
         self.job_queue = job_queue or os.getenv('AWS_BATCH_JOB_QUEUE', 'gpu-transcode-queue')
-        self.job_definition = job_definition or os.getenv('AWS_BATCH_JOB_DEFINITION', 'ffmpeg-nvenc-transcode')
+        self.job_queue_large = job_queue_large or os.getenv('AWS_BATCH_JOB_QUEUE_LARGE', 'gpu-transcode-queue-large')
+        self.job_definition = job_definition or os.getenv('AWS_BATCH_JOB_DEFINITION', 'ffmpeg-nvenc-transcode:17')
         self.region = region or os.getenv('AWS_BATCH_REGION', os.getenv('AWS_REGION', 'us-east-1'))
         self.bucket = bucket or os.getenv('UPLOAD_BUCKET', 'uball-videos-production')
 
@@ -68,7 +84,25 @@ class AWSBatchTranscoder:
         self.s3_client = boto3.client('s3', region_name=self.region, config=boto_config, verify=False)
 
         logger.info(f"AWSBatchTranscoder initialized: queue={self.job_queue}, "
-                    f"definition={self.job_definition}, region={self.region}, bucket={self.bucket}")
+                    f"queue_large={self.job_queue_large}, definition={self.job_definition}, "
+                    f"region={self.region}, bucket={self.bucket}")
+
+    def select_job_queue(self, file_size_bytes: int) -> str:
+        """
+        Select the appropriate job queue based on file size.
+
+        Args:
+            file_size_bytes: Size of the input file in bytes
+
+        Returns:
+            Job queue name (standard for <14GB, large for >=14GB)
+        """
+        if file_size_bytes >= self.LARGE_FILE_THRESHOLD:
+            logger.info(f"File size {file_size_bytes / (1024**3):.2f}GB >= 14GB, using large queue: {self.job_queue_large}")
+            return self.job_queue_large
+        else:
+            logger.info(f"File size {file_size_bytes / (1024**3):.2f}GB < 14GB, using standard queue: {self.job_queue}")
+            return self.job_queue
 
     def submit_transcode_job(
         self,
@@ -76,7 +110,8 @@ class AWSBatchTranscoder:
         output_s3_key: str,
         game_id: str,
         angle: str,
-        job_name_prefix: str = 'transcode'
+        job_name_prefix: str = 'transcode',
+        file_size_bytes: int = 0
     ) -> Dict[str, Any]:
         """
         Submit a transcode job to AWS Batch.
@@ -87,6 +122,7 @@ class AWSBatchTranscoder:
             game_id: Game identifier for tracking
             angle: Camera angle code (FL, FR, NL, NR)
             job_name_prefix: Prefix for job name
+            file_size_bytes: Size of 4K input file in bytes (for queue selection)
 
         Returns:
             Dict with jobId, jobName, and submission details
@@ -95,18 +131,22 @@ class AWSBatchTranscoder:
         timestamp = int(time.time())
         job_name = f"{job_name_prefix}-{angle}-{timestamp}"
 
+        # Select queue based on file size
+        selected_queue = self.select_job_queue(file_size_bytes)
+
         # Build S3 URIs
         input_uri = f"s3://{self.bucket}/{input_s3_key}"
         output_uri = f"s3://{self.bucket}/{output_s3_key}"
 
         logger.info(f"Submitting Batch transcode job: {job_name}")
+        logger.info(f"  Queue: {selected_queue}")
         logger.info(f"  Input: {input_uri}")
         logger.info(f"  Output: {output_uri}")
 
         try:
             response = self.batch_client.submit_job(
                 jobName=job_name,
-                jobQueue=self.job_queue,
+                jobQueue=selected_queue,
                 jobDefinition=self.job_definition,
                 parameters={
                     'input_uri': input_uri,
@@ -139,16 +179,132 @@ class AWSBatchTranscoder:
             return {
                 'jobId': job_id,
                 'jobName': job_name,
+                'jobQueue': selected_queue,
                 'input_s3_key': input_s3_key,
                 'output_s3_key': output_s3_key,
                 'game_id': game_id,
                 'angle': angle,
+                'file_size_bytes': file_size_bytes,
                 'status': 'SUBMITTED',
                 'submitted_at': time.time()
             }
 
         except ClientError as e:
             logger.error(f"Failed to submit Batch job: {e}")
+            raise
+
+    def submit_extract_transcode_job(
+        self,
+        chapters: List[Dict],
+        bucket: str,
+        offset_seconds: float,
+        duration_seconds: float,
+        output_s3_key: str,
+        game_id: str,
+        angle: str,
+        add_buffer_seconds: float = 30.0
+    ) -> Dict[str, Any]:
+        """
+        Submit single Batch job that extracts from chapters AND transcodes to 1080p.
+        No Lambda, no intermediate 4K file.
+
+        Args:
+            chapters: List of chapter dicts with 's3_key' field
+            bucket: S3 bucket name
+            offset_seconds: Seek position in concatenated chapters
+            duration_seconds: Duration to extract
+            output_s3_key: Final 1080p output path (e.g., "court-a/2026-01-20/uuid/video.mp4")
+            game_id: Game identifier for tracking
+            angle: Camera angle code (FL, FR, NL, NR)
+            add_buffer_seconds: Buffer to add to duration (default: 30)
+
+        Returns:
+            Dict with jobId, jobName, and submission details
+        """
+        import json
+
+        # Extract S3 keys from chapters
+        chapter_keys = []
+        for ch in chapters:
+            if isinstance(ch, dict) and 's3_key' in ch:
+                chapter_keys.append(ch['s3_key'])
+            elif isinstance(ch, str):
+                chapter_keys.append(ch)
+            else:
+                logger.warning(f"Unexpected chapter format: {ch}")
+
+        if not chapter_keys:
+            raise ValueError("No valid chapter S3 keys found")
+
+        chapters_json = json.dumps(chapter_keys)
+
+        # Generate unique job name
+        timestamp = int(time.time())
+        job_name = f"extract-transcode-{angle}-{timestamp}"
+
+        # Get job definition for extract+transcode
+        extract_job_definition = os.getenv(
+            'AWS_BATCH_JOB_DEFINITION_EXTRACT',
+            'ffmpeg-extract-transcode:1'
+        )
+
+        # Use large queue for extraction jobs (they process multiple chapters)
+        selected_queue = self.job_queue_large
+
+        logger.info(f"[BATCH-ONLY] Submitting extract+transcode job: {job_name}")
+        logger.info(f"  Queue: {selected_queue}")
+        logger.info(f"  Definition: {extract_job_definition}")
+        logger.info(f"  Chapters: {len(chapter_keys)}")
+        logger.info(f"  Offset: {offset_seconds}s, Duration: {duration_seconds}s (+{add_buffer_seconds}s buffer)")
+        logger.info(f"  Output: s3://{bucket}/{output_s3_key}")
+
+        try:
+            response = self.batch_client.submit_job(
+                jobName=job_name,
+                jobQueue=selected_queue,
+                jobDefinition=extract_job_definition,
+                containerOverrides={
+                    'environment': [
+                        {'name': 'CHAPTERS_JSON', 'value': chapters_json},
+                        {'name': 'BUCKET', 'value': bucket},
+                        {'name': 'OFFSET_SECONDS', 'value': str(offset_seconds)},
+                        {'name': 'DURATION_SECONDS', 'value': str(duration_seconds)},
+                        {'name': 'ADD_BUFFER_SECONDS', 'value': str(add_buffer_seconds)},
+                        {'name': 'OUTPUT_S3_KEY', 'value': output_s3_key},
+                        {'name': 'GAME_ID', 'value': game_id},
+                        {'name': 'ANGLE', 'value': angle}
+                    ]
+                },
+                tags={
+                    'game_id': game_id,
+                    'angle': angle,
+                    'service': 'gopro-automation',
+                    'pipeline': 'batch-only'
+                }
+            )
+
+            job_id = response['jobId']
+            logger.info(f"[BATCH-ONLY] Job submitted: {job_id}")
+
+            return {
+                'job_id': job_id,
+                'jobId': job_id,  # Alias for compatibility
+                'jobName': job_name,
+                'jobQueue': selected_queue,
+                'jobDefinition': extract_job_definition,
+                'chapters_count': len(chapter_keys),
+                'offset_seconds': offset_seconds,
+                'duration_seconds': duration_seconds,
+                'output_s3_key': output_s3_key,
+                'game_id': game_id,
+                'angle': angle,
+                'status': 'SUBMITTED',
+                'submitted_at': time.time(),
+                'pipeline': 'batch-only'
+            }
+
+        except ClientError as e:
+            logger.error(f"[BATCH-ONLY] Failed to submit extract+transcode job: {e}")
             raise
 
     def get_job_status(self, job_id: str) -> Dict[str, Any]:
@@ -372,12 +528,13 @@ class AWSBatchTranscoder:
         """
         Generate S3 key for raw 4K file in raw/ prefix.
 
-        Format: raw/{location}/{date}/{game_uuid}/{angle}_4k.mp4
+        Format: raw/{location}/{date}/{game_folder}/{date}_{game_folder}_{angle}.mp4
+        Example: raw/court-a/2026-01-20/3cdc8667-bc9c-4bf6-9050/2026-01-20_3cdc8667-bc9c-4bf6-9050_NL.mp4
 
         Args:
-            location: Court/location identifier
+            location: Court/location identifier (e.g., "court-a")
             game_date: Game date (YYYY-MM-DD)
-            uball_game_id: Uball game UUID
+            uball_game_id: Uball game UUID (game must be synced to Uball first)
             angle_code: Camera angle (FL, FR, NL, NR)
 
         Returns:
@@ -388,26 +545,21 @@ class AWSBatchTranscoder:
             uuid_parts = uball_game_id.split('-')[:4]
             folder = '-'.join(uuid_parts)
         else:
+            # This shouldn't happen - games should be synced before processing
             folder = f"unknown-{game_date}"
 
-        return f"raw/{location}/{game_date}/{folder}/{angle_code}_4k.mp4"
-
-
-def is_aws_gpu_transcode_enabled() -> bool:
-    """Check if AWS GPU transcoding is enabled via environment variable."""
-    return os.getenv('USE_AWS_GPU_TRANSCODE', 'false').lower() == 'true'
+        # Format: {date}_{game_folder}_{angle}.mp4
+        filename = f"{game_date}_{folder}_{angle_code}.mp4"
+        return f"raw/{location}/{game_date}/{folder}/{filename}"
 
 
 def get_batch_transcoder() -> Optional[AWSBatchTranscoder]:
     """
-    Get AWSBatchTranscoder instance if GPU transcoding is enabled.
+    Get AWSBatchTranscoder instance.
 
     Returns:
-        AWSBatchTranscoder instance or None if not enabled
+        AWSBatchTranscoder instance or None on error
     """
-    if not is_aws_gpu_transcode_enabled():
-        return None
-
     try:
         return AWSBatchTranscoder()
     except Exception as e:

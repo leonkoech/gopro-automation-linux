@@ -1,7 +1,11 @@
 {
   "permissions": {
     "allow": [
-      "Bash(npm run build:*)"
+      "Bash(npm run build:*)",
+      "Bash(ssh:*)",
+      "Bash(python3:*)",
+      "Bash(SSH_KEY=\"/Users/rohitkale/Cellstrat/GitHub_Repositories/gopro-automation-linux/id_rsa\")",
+      "Bash(__NEW_LINE_801c3476a9dd493c__ echo \"=== JETSON 1 - Recent activity ===\")"
     ],
     "deny": [],
     "ask": []
