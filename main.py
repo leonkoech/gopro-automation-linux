@@ -595,6 +595,7 @@ def start_recording(gopro_id):
     except Exception as e:
         logger.warning(f"Could not check camera state for {gopro_id}: {e}")
 
+    stale_pre_record_files = None
     with recording_lock:
         if gopro_id in recording_processes:
             if actual_recording:
@@ -603,6 +604,7 @@ def start_recording(gopro_id):
             else:
                 # Stale entry - camera stopped but dict wasn't cleaned up
                 logger.info(f"[Start Recording] Cleaning stale entry for {gopro_id}")
+                stale_pre_record_files = recording_processes[gopro_id].get('pre_record_files', None)
                 del recording_processes[gopro_id]
         elif actual_recording:
             # Camera is recording but not tracked - add to dict for tracking
@@ -641,7 +643,13 @@ def start_recording(gopro_id):
             print(f"⚠ Warning: Could not set video mode for {gopro_id}: {e}")
 
         # Get list of existing files BEFORE recording
-        pre_record_files = get_gopro_files(gopro_ip)
+        # If we cleaned a stale entry, reuse its pre_record_files to avoid
+        # treating the full recording as "pre-existing" files
+        if stale_pre_record_files is not None:
+            pre_record_files = stale_pre_record_files
+            logger.info(f"Reusing pre_record_files from stale entry ({len(pre_record_files)} files)")
+        else:
+            pre_record_files = get_gopro_files(gopro_ip)
         print(f"Pre-recording files on {gopro_id} ({gopro_ip}): {len(pre_record_files)} files")
 
         # Start recording via HTTP API

@@ -667,7 +667,7 @@ class PipelineOrchestrator:
 
                     logger.info(f"[Pipeline {pipeline_id}] Game {game_number} processed ({len(batch_jobs)} batch jobs)")
                 else:
-                    error = result.get('error', 'Unknown error')
+                    error = result.get('error') or result.get('status_message') or 'Unknown error'
                     processing_errors.append(f"Game {game_number}: {error}")
                     self._update_game_state(pipeline_id, game_id, {
                         'status': 'failed',

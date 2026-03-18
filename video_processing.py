@@ -1678,6 +1678,7 @@ def process_game_videos(
             else:
                 status_msg = 'No videos were processed'
                 results['status'] = 'failed'
+                results['error'] = status_msg
             report_progress('failed', status_msg, 0)
 
         results['status_message'] = status_msg
