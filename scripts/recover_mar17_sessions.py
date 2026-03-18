@@ -231,12 +231,23 @@ def main():
             for ch in chapters:
                 print(f"    {ch['filename']} ({format_size(ch['size'])})")
 
-            # Find matching existing session
+            # Find the 20:33 recording session for this camera.
+            # Multiple sessions exist per camera from earlier test recordings.
+            # The target session has "2033" in segment timestamp (started ~20:33).
             matching = None
             for s in existing_sessions:
-                if s.get('interfaceId') == interface_id or s.get('angleCode') == angle:
-                    matching = s
-                    break
+                seg = s.get('segmentSession', '')
+                if (s.get('interfaceId') == interface_id or s.get('angleCode') == angle):
+                    if '2033' in seg:
+                        matching = s
+                        break
+            # Fallback: if no 2033 session found, check for recording/failed sessions
+            if not matching:
+                for s in existing_sessions:
+                    if (s.get('interfaceId') == interface_id or s.get('angleCode') == angle):
+                        if s.get('status') in ('recording', 'failed'):
+                            matching = s
+                            break
 
             if matching:
                 # ── Update existing session ───────────────────────────────────
