@@ -1209,12 +1209,11 @@ def _start_auto_pipeline_internal(auto_delete_sd: bool = True, from_background: 
             limit=50
         )
 
-        # Only process unprocessed sessions: stopped AND not yet uploaded to S3
-        # status=='stopped' handles the going-forward case (uploaded sessions get status='uploaded')
-        # not s3Prefix handles legacy sessions that were uploaded but still have status='stopped'
+        # Include sessions that are stopped — either needing upload or already uploaded
+        # Sessions with s3Prefix already set will skip upload in the pipeline
         sessions = [
             s for s in all_sessions
-            if s.get('status') == 'stopped' and not s.get('s3Prefix')
+            if s.get('status') == 'stopped'
         ]
 
         logger.info(f"[Pipeline] Found {len(sessions)} unprocessed sessions (out of {len(all_sessions)} total)")
@@ -1228,16 +1227,19 @@ def _start_auto_pipeline_internal(auto_delete_sd: bool = True, from_background: 
                 'error': 'No unprocessed sessions found'
             }), 404
 
-        # Discover GoPro connections for pending sessions (need to upload chapters)
+        # Discover GoPro connections for sessions that need upload (no s3Prefix)
         gopro_connections = {}
-        for session in sessions:
+        sessions_needing_upload = [s for s in sessions if not s.get('s3Prefix')]
+        sessions_already_uploaded = [s for s in sessions if s.get('s3Prefix')]
+
+        for session in sessions_needing_upload:
             interface_id = session.get('interfaceId')
             if interface_id and interface_id not in gopro_connections:
                 gopro_ip = get_gopro_wired_ip(interface_id)
                 if gopro_ip:
                     gopro_connections[interface_id] = gopro_ip
 
-        if not gopro_connections:
+        if sessions_needing_upload and not gopro_connections:
             if from_background:
                 logger.error("[Pipeline] No GoPro cameras found for pending sessions")
                 return None
@@ -1245,6 +1247,9 @@ def _start_auto_pipeline_internal(auto_delete_sd: bool = True, from_background: 
                 'success': False,
                 'error': 'No GoPro cameras found for pending sessions. Chapters need to be uploaded first.'
             }), 400
+
+        if sessions_already_uploaded:
+            logger.info(f"[Pipeline] {len(sessions_already_uploaded)} sessions already have chapters in S3 (will skip upload)")
 
         # Start pipeline
         pipeline_id = orchestrator.start_pipeline(
