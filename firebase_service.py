@@ -647,7 +647,7 @@ class FirebaseService:
             count = 0
             for doc in docs:
                 data = doc.to_dict()
-                if data.get('s3Prefix'):
+                if data.get('s3Prefix') and not data.get('_recovery'):
                     try:
                         doc.reference.update({'status': 'uploaded'})
                         count += 1
