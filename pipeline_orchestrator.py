@@ -371,6 +371,10 @@ class PipelineOrchestrator:
             # Skip upload if session already has chapters in S3
             if existing_s3_prefix:
                 logger.info(f"[Pipeline {pipeline_id}] Session {session_id} already uploaded to {existing_s3_prefix}, skipping upload")
+                # Fix session status in Firebase so it won't be re-picked up next pipeline run
+                if session.get('status') == 'stopped':
+                    self.firebase_service.update_session_s3_prefix(session_id, existing_s3_prefix)
+                    logger.info(f"[Pipeline {pipeline_id}] Fixed session {session_id} status: stopped -> uploaded")
                 self._update_session_state(pipeline_id, session_id, {
                     'status': 'completed',
                     's3_prefix': existing_s3_prefix,
