@@ -279,7 +279,7 @@ class UballClient:
             return None
 
         try:
-            payload = {"name": name}
+            payload = {"name": name, "division": ""}
 
             response = requests.post(
                 f"{self.backend_url}/api/teams/",
