@@ -51,6 +51,15 @@ class Config:
     UBALL_AUTH_EMAIL = os.getenv('UBALL_AUTH_EMAIL')
     UBALL_AUTH_PASSWORD = os.getenv('UBALL_AUTH_PASSWORD')
 
+    # Angle filtering - comma-separated list of angles to process (e.g. "FL,FR")
+    # When set, only these angles are uploaded and processed; others are skipped.
+    # Default: None (all valid angles: FL, FR, NL, NR)
+    _angles_raw = os.getenv('ANGLES_TO_PROCESS', '').strip()
+    ANGLES_TO_PROCESS = (
+        frozenset(a.strip().upper() for a in _angles_raw.split(',') if a.strip())
+        if _angles_raw else None
+    )
+
     # Download configuration - optimized for GoPro USB connections
     DOWNLOAD_CHUNK_SIZE = 262144  # 256KB
     DOWNLOAD_CONNECT_TIMEOUT = 10  # seconds

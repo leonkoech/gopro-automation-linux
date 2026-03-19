@@ -220,6 +220,21 @@ class PipelineOrchestrator:
             skipped_angles = [s.get('angleCode', 'NONE') for s in skipped_unk_sessions]
             logger.info(f"[Pipeline {pipeline_id}] Skipping {len(skipped_unk_sessions)} sessions with unknown angles: {skipped_angles}")
 
+        # Filter by ANGLES_TO_PROCESS if configured
+        angles_to_process = os.getenv('ANGLES_TO_PROCESS', '').strip()
+        skipped_angle_filter = []
+        if angles_to_process:
+            allowed = frozenset(a.strip().upper() for a in angles_to_process.split(',') if a.strip())
+            logger.info(f"[Pipeline {pipeline_id}] ANGLES_TO_PROCESS={allowed}")
+            filtered = []
+            for s in valid_sessions:
+                if s.get('angleCode', '').upper() in allowed:
+                    filtered.append(s)
+                else:
+                    skipped_angle_filter.append(s)
+                    logger.info(f"[Pipeline {pipeline_id}] Skipping {s.get('angleCode')} session {s.get('id')} - not in ANGLES_TO_PROCESS")
+            valid_sessions = filtered
+
         # Use valid_sessions for the rest of the pipeline
         sessions = valid_sessions
 
@@ -241,6 +256,7 @@ class PipelineOrchestrator:
                 },
                 'sessions_total': len(sessions),
                 'sessions_skipped_unk': len(skipped_unk_sessions),  # Track skipped UNK sessions
+                'sessions_skipped_angle_filter': len(skipped_angle_filter),  # Track skipped by ANGLES_TO_PROCESS
                 'sessions_uploaded': 0,
 
                 # Games

@@ -19,6 +19,7 @@ Example:
     court-a/2026-01-20/95efaeaa-8475-4db4-8967/2026-01-20_95efaeaa-8475-4db4-8967_FL.mp4
 """
 
+import json
 import os
 import subprocess
 import tempfile
@@ -1304,6 +1305,17 @@ def process_game_videos(
                 overlapping_sessions.append(session)
 
         logger.info(f"Found {len(overlapping_sessions)} overlapping recording sessions")
+
+        # Filter by ANGLES_TO_PROCESS if configured
+        angles_to_process = os.getenv('ANGLES_TO_PROCESS', '').strip()
+        if angles_to_process and overlapping_sessions:
+            allowed = frozenset(a.strip().upper() for a in angles_to_process.split(',') if a.strip())
+            before_count = len(overlapping_sessions)
+            filtered_out = [s for s in overlapping_sessions if s.get('angleCode', '').upper() not in allowed]
+            overlapping_sessions = [s for s in overlapping_sessions if s.get('angleCode', '').upper() in allowed]
+            if filtered_out:
+                skipped_angles = [s.get('angleCode') for s in filtered_out]
+                logger.info(f"[ProcessGame] ANGLES_TO_PROCESS={allowed}: filtered out {skipped_angles} ({before_count} -> {len(overlapping_sessions)} sessions)")
 
         # Sort sessions to process FL/FR first (priority angles), then NL/NR
         # This ensures the main game angles are processed before supplementary angles
