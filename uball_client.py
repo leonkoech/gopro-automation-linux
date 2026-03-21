@@ -163,6 +163,10 @@ class UballClient:
                 payload["team2_score"] = game_data["team2_score"]
             if game_data.get("video_name"):
                 payload["video_name"] = game_data["video_name"]
+            if game_data.get("team1_color"):
+                payload["team1_color"] = game_data["team1_color"]
+            if game_data.get("team2_color"):
+                payload["team2_color"] = game_data["team2_color"]
 
             response = requests.post(
                 f"{self.backend_url}/api/games/",

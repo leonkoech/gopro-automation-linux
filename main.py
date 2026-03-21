@@ -1902,6 +1902,15 @@ def sync_game_to_uball():
             'source': 'firebase'
         }
 
+        # Add team colors (color name for annotation tool classify endpoint)
+        team1_color_name = left_team.get('jerseyColorName', '')
+        team2_color_name = right_team.get('jerseyColorName', '')
+        if team1_color_name:
+            uball_game_data['team1_color'] = team1_color_name
+        if team2_color_name:
+            uball_game_data['team2_color'] = team2_color_name
+        logger.info(f"[GameSync] Team colors: {team1_color_name} vs {team2_color_name}")
+
         # Add scores and video_name from leftTeam/rightTeam
         left_team = firebase_game.get('leftTeam', {})
         right_team = firebase_game.get('rightTeam', {})
