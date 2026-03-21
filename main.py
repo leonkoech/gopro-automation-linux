@@ -1773,8 +1773,8 @@ def sync_game_to_uball():
         "team2_id": "uuid-of-team2"   // Optional - Uball team UUID
     }
 
-    If team IDs not provided, teams are auto-created from Firebase game data.
-    Each game creates NEW teams (even if same name exists) because rosters differ.
+    If team IDs not provided, teams are looked up by name in Uball Backend.
+    Existing teams are reused to avoid duplicates; new teams created only if not found.
 
     Flow:
     1. Fetch game from Firebase (basketball-games collection)
@@ -1857,32 +1857,32 @@ def sync_game_to_uball():
             left_team = firebase_game.get('leftTeam', {})
             team1_name = left_team.get('name', 'Team 1')
 
-            created_team1 = uball_client.create_team(team1_name)
-            if not created_team1:
+            resolved_team1 = uball_client.get_or_create_team(team1_name)
+            if not resolved_team1:
                 return jsonify({
                     'success': False,
-                    'error': f'Failed to create team: {team1_name}'
+                    'error': f'Failed to resolve team: {team1_name}'
                 }), 500
 
-            team1_id = str(created_team1.get('id'))
+            team1_id = str(resolved_team1.get('id'))
             teams_created.append({'name': team1_name, 'id': team1_id, 'side': 'left'})
-            logger.info(f"[GameSync] Auto-created team1: {team1_name} -> {team1_id}")
+            logger.info(f"[GameSync] Resolved team1: {team1_name} -> {team1_id}")
 
         if not team2_id:
             # Extract team2 name from Firebase (rightTeam)
             right_team = firebase_game.get('rightTeam', {})
             team2_name = right_team.get('name', 'Team 2')
 
-            created_team2 = uball_client.create_team(team2_name)
-            if not created_team2:
+            resolved_team2 = uball_client.get_or_create_team(team2_name)
+            if not resolved_team2:
                 return jsonify({
                     'success': False,
-                    'error': f'Failed to create team: {team2_name}'
+                    'error': f'Failed to resolve team: {team2_name}'
                 }), 500
 
-            team2_id = str(created_team2.get('id'))
+            team2_id = str(resolved_team2.get('id'))
             teams_created.append({'name': team2_name, 'id': team2_id, 'side': 'right'})
-            logger.info(f"[GameSync] Auto-created team2: {team2_name} -> {team2_id}")
+            logger.info(f"[GameSync] Resolved team2: {team2_name} -> {team2_id}")
 
         # 4. Prepare game data for Uball Backend
         logger.info(f"[GameSync] Step 4: Preparing game data for Uball Backend...")

@@ -1189,25 +1189,25 @@ def process_game_videos(
                     results['uball_game_id'] = uball_game_id
                     logger.info(f"[AUTO-SYNC] Found uballGameId in Firebase: {uball_game_id}")
                 else:
-                    # Create teams in Uball
+                    # Resolve teams in Uball (reuse existing, create only if not found)
                     left_team = firebase_game.get('leftTeam', {})
                     right_team = firebase_game.get('rightTeam', {})
                     team1_name = left_team.get('name', 'Team 1')
                     team2_name = right_team.get('name', 'Team 2')
 
-                    logger.info(f"[AUTO-SYNC] Creating teams: {team1_name} vs {team2_name}")
+                    logger.info(f"[AUTO-SYNC] Resolving teams: {team1_name} vs {team2_name}")
 
-                    created_team1 = uball_client.create_team(team1_name)
-                    if not created_team1:
-                        results['errors'].append(f"Failed to create team: {team1_name}")
+                    resolved_team1 = uball_client.get_or_create_team(team1_name)
+                    if not resolved_team1:
+                        results['errors'].append(f"Failed to resolve team: {team1_name}")
                         return results
-                    team1_id = str(created_team1.get('id'))
+                    team1_id = str(resolved_team1.get('id'))
 
-                    created_team2 = uball_client.create_team(team2_name)
-                    if not created_team2:
-                        results['errors'].append(f"Failed to create team: {team2_name}")
+                    resolved_team2 = uball_client.get_or_create_team(team2_name)
+                    if not resolved_team2:
+                        results['errors'].append(f"Failed to resolve team: {team2_name}")
                         return results
-                    team2_id = str(created_team2.get('id'))
+                    team2_id = str(resolved_team2.get('id'))
 
                     # Create game in Uball
                     created_at = firebase_game.get('createdAt', '')
@@ -1224,6 +1224,15 @@ def process_game_videos(
                         'source': 'firebase',
                         'video_name': f"{team1_name} vs {team2_name}"
                     }
+
+                    # Add team colors (color name for annotation tool classify endpoint)
+                    team1_color_name = left_team.get('jerseyColorName', '')
+                    team2_color_name = right_team.get('jerseyColorName', '')
+                    if team1_color_name:
+                        uball_game_data['team1_color'] = team1_color_name
+                    if team2_color_name:
+                        uball_game_data['team2_color'] = team2_color_name
+                    logger.info(f"[AUTO-SYNC] Team colors: {team1_color_name} vs {team2_color_name}")
 
                     # Add scores if available
                     if left_team.get('finalScore') is not None:

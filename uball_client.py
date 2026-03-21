@@ -265,12 +265,55 @@ class UballClient:
             logger.error(f"[UballClient] List teams failed: {e}")
             return []
 
+    def find_team_by_name(self, name: str) -> Optional[Dict[str, Any]]:
+        """
+        Find an existing team by exact name (case-insensitive).
+
+        Searches the full team list and returns the first exact match.
+
+        Args:
+            name: Team name to search for
+
+        Returns:
+            Team data dict with id and name, or None if not found
+        """
+        teams = self.list_teams()
+        name_lower = name.strip().lower()
+        for team in teams:
+            if team.get('name', '').strip().lower() == name_lower:
+                logger.info(f"[UballClient] Found existing team: {team.get('id')} ({team.get('name')})")
+                return team
+        return None
+
+    def get_or_create_team(self, name: str) -> Optional[Dict[str, Any]]:
+        """
+        Find an existing team by name, or create a new one if not found.
+
+        This prevents duplicate teams in the annotation tool. Teams are
+        synced from the annotation tool to Firebase for the dropdown, so
+        most teams should already exist.
+
+        Args:
+            name: Team name
+
+        Returns:
+            Team data with UUID (existing or newly created), or None on failure
+        """
+        # First try to find existing team by name
+        existing = self.find_team_by_name(name)
+        if existing:
+            logger.info(f"[UballClient] Reusing existing team: {existing.get('id')} ({name})")
+            return existing
+
+        # Not found — create new team
+        logger.info(f"[UballClient] Team '{name}' not found, creating new...")
+        return self.create_team(name)
+
     def create_team(self, name: str) -> Optional[Dict[str, Any]]:
         """
         Create a new team in Uball Backend.
 
-        Always creates a new team - even if same name exists,
-        because different games can have different rosters.
+        Prefer using get_or_create_team() to avoid duplicates.
 
         Args:
             name: Team name
