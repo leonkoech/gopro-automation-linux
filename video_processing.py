@@ -21,6 +21,7 @@ Example:
 
 import json
 import os
+import re
 import subprocess
 import tempfile
 from datetime import datetime, timedelta
@@ -962,10 +963,99 @@ class VideoProcessor:
 
             chapters.sort(key=chapter_sort_key)
 
+            # Filter out old/leftover chapters from previous GoPro recordings.
+            # GoPro filenames embed a 4-digit group number (e.g., GX010097 = group 0097).
+            # If ch001 has a different group than ch002, it's from an old recording still
+            # on the SD card and should be excluded from the timeline.
+            chapters = self._filter_old_gopro_chapters(chapters)
+
             logger.info(f"Found {len(chapters)} chapters in S3 at {s3_prefix}")
 
         except Exception as e:
             logger.error(f"Error listing S3 chapters: {e}")
+
+        return chapters
+
+    @staticmethod
+    def _extract_gopro_group(filename: str) -> Optional[str]:
+        """
+        Extract GoPro recording group number from chapter filename.
+
+        GoPro filenames like 'chapter_001_GX010097.MP4' (H.264) or
+        'chapter_001_GH010097.MP4' (HEVC) contain a 4-digit group number (0097).
+        Chapters within the same recording share the same group or sequential
+        groups (e.g., 0097, 0098 for multi-group recordings).
+
+        Returns the group number string or None if not parseable.
+        """
+        # Match GoPro naming: GX/GH + 2-digit chapter-in-group + 4-digit group number
+        match = re.search(r'G[XH]\d{2}(\d{4})', filename, re.IGNORECASE)
+        return match.group(1) if match else None
+
+    @staticmethod
+    def _filter_old_gopro_chapters(chapters: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        Filter out leftover chapters from previous GoPro recordings.
+
+        GoPro cameras keep old files on the SD card. When chapters are uploaded,
+        leading chapters may belong to older recording groups while later chapters
+        belong to the current recording. This causes phantom timeline that throws
+        off all offset calculations.
+
+        Detection: find the majority recording group among all chapters, then
+        filter out any leading chapters that belong to a different group.
+        """
+        if len(chapters) < 2:
+            return chapters
+
+        # Extract group for each chapter
+        groups = []
+        for ch in chapters:
+            group = VideoProcessor._extract_gopro_group(ch.get('filename', ''))
+            groups.append(group)
+
+        # If we can't determine groups for most chapters, keep all
+        known_groups = [g for g in groups if g is not None]
+        if len(known_groups) < 2:
+            return chapters
+
+        # Find the last chapter's group — the current recording's group(s)
+        # The actual recording groups are contiguous and at the end of the list
+        last_group = groups[-1]
+        if last_group is None:
+            return chapters
+
+        # Walk from the end to find all groups that are part of the current recording
+        # (GoPro recordings can span multiple groups, e.g., 0097 and 0098)
+        current_groups = set()
+        for g in reversed(groups):
+            if g is None:
+                break
+            if not current_groups or g in current_groups:
+                current_groups.add(g)
+            elif int(g) >= int(min(current_groups)) - 1:
+                # Adjacent group number — part of the same recording session
+                current_groups.add(g)
+            else:
+                break
+
+        # Filter out leading chapters that don't belong to current recording groups
+        first_valid_idx = 0
+        for i, g in enumerate(groups):
+            if g is not None and g in current_groups:
+                first_valid_idx = i
+                break
+
+        if first_valid_idx > 0:
+            removed = chapters[:first_valid_idx]
+            for ch in removed:
+                logger.warning(
+                    f"Filtering out old chapter {ch['filename']} "
+                    f"(group {VideoProcessor._extract_gopro_group(ch.get('filename', ''))}) — "
+                    f"not in current recording groups {sorted(current_groups)}. "
+                    f"Duration was {ch.get('duration_seconds', '?')}s"
+                )
+            return chapters[first_valid_idx:]
 
         return chapters
 
