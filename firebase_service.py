@@ -625,6 +625,100 @@ class FirebaseService:
             log.error(f"Failed to query stale pipelines on startup: {e}")
             return 0
 
+    def recover_batch_submitted_games(self) -> int:
+        """
+        On service startup, find completed pipeline-runs that still have games
+        stuck in 'batch_submitted' status. Check the actual AWS Batch job status
+        and update Firebase accordingly.
+
+        This handles the case where the background poller thread was killed
+        (service restart) after batch jobs were submitted but before they
+        were marked completed in Firebase.
+
+        Returns:
+            Number of games recovered (marked completed or failed).
+        """
+        import logging
+        log = logging.getLogger('gopro.firebase')
+        try:
+            from aws_batch_transcode import AWSBatchTranscoder
+            batch_transcoder = AWSBatchTranscoder()
+        except Exception as e:
+            log.error(f"Cannot init batch transcoder for recovery: {e}")
+            return 0
+
+        try:
+            # Find completed pipelines for this Jetson
+            q = (
+                self.db.collection(self.PIPELINE_RUNS_COLLECTION)
+                .where('jetson_id', '==', self.jetson_id)
+                .where('status', 'in', ['completed', 'completed_with_errors'])
+            )
+            docs = q.get()
+            recovered = 0
+
+            for doc in docs:
+                data = doc.to_dict()
+                games = data.get('games', {})
+                if not isinstance(games, dict):
+                    continue
+
+                needs_update = False
+                games_completed = data.get('games_completed', 0)
+                games_failed = data.get('games_failed', 0)
+
+                for game_key, game_data in games.items():
+                    if not isinstance(game_data, dict):
+                        continue
+                    if game_data.get('status') != 'batch_submitted':
+                        continue
+
+                    # Game is stuck in batch_submitted - check actual batch job status
+                    batch_job_ids = game_data.get('batch_jobs', [])
+                    if not batch_job_ids:
+                        continue
+
+                    all_done = True
+                    any_failed = False
+                    for job_id in batch_job_ids:
+                        try:
+                            status_info = batch_transcoder.get_job_status(job_id)
+                            job_status = status_info.get('status', 'UNKNOWN')
+                            if job_status == 'SUCCEEDED':
+                                pass  # good
+                            elif job_status == 'FAILED':
+                                any_failed = True
+                            else:
+                                all_done = False
+                        except Exception:
+                            all_done = False
+
+                    if all_done:
+                        if any_failed:
+                            game_data['status'] = 'failed'
+                            games_failed += 1
+                        else:
+                            game_data['status'] = 'completed'
+                            games_completed += 1
+                        needs_update = True
+                        recovered += 1
+                        game_name = game_data.get('video_name', game_key)
+                        log.info(f"Recovered game '{game_name}' in pipeline {doc.id}: -> {game_data['status']}")
+
+                if needs_update:
+                    doc.reference.update({
+                        'games': games,
+                        'games_completed': games_completed,
+                        'games_failed': games_failed,
+                    })
+
+            if recovered:
+                log.info(f"Startup recovery: updated {recovered} game(s) stuck in batch_submitted")
+            return recovered
+        except Exception as e:
+            log.error(f"Failed to recover batch_submitted games: {e}")
+            return 0
+
     def migrate_legacy_uploaded_sessions(self) -> int:
         """
         On startup, fix legacy sessions that have s3Prefix but still show status='stopped'.

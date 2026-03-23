@@ -5279,6 +5279,11 @@ if __name__ == '__main__':
         if stale_count:
             logger.warning(f"Startup cleanup: marked {stale_count} stale pipeline(s) as failed due to service restart")
 
+        # Recover games stuck in 'batch_submitted' after a service restart
+        recovered_count = firebase_service.recover_batch_submitted_games()
+        if recovered_count:
+            logger.info(f"Startup recovery: updated {recovered_count} game(s) stuck in batch_submitted")
+
         # Migrate legacy sessions that have s3Prefix but still show status='stopped'
         migrated_count = firebase_service.migrate_legacy_uploaded_sessions()
         if migrated_count:
