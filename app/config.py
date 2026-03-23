@@ -35,7 +35,7 @@ class Config:
     AWS_BATCH_JOB_QUEUE = os.getenv('AWS_BATCH_JOB_QUEUE', 'gpu-transcode-queue')
     AWS_BATCH_JOB_QUEUE_LARGE = os.getenv('AWS_BATCH_JOB_QUEUE_LARGE', 'gpu-transcode-queue-large')
     AWS_BATCH_JOB_DEFINITION = os.getenv('AWS_BATCH_JOB_DEFINITION', 'ffmpeg-nvenc-transcode:17')
-    AWS_BATCH_JOB_DEFINITION_EXTRACT = os.getenv('AWS_BATCH_JOB_DEFINITION_EXTRACT', 'ffmpeg-extract-transcode:4')
+    AWS_BATCH_JOB_DEFINITION_EXTRACT = os.getenv('AWS_BATCH_JOB_DEFINITION_EXTRACT', 'ffmpeg-extract-transcode:10')
     AWS_BATCH_REGION = os.getenv('AWS_BATCH_REGION', 'us-east-1')
 
     # Court location
