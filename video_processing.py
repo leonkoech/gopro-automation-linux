@@ -117,6 +117,34 @@ class VideoProcessor:
         except Exception as e:
             logger.warning(f"Could not get duration for {filepath}: {e}")
 
+    def _get_video_metadata(self, filepath: str) -> Dict[str, Any]:
+        """Get video duration and creation_time using ffprobe (JSON output).
+
+        Returns dict with 'duration' (float|None) and 'creation_time' (str|None).
+        """
+        try:
+            result = subprocess.run([
+                'ffprobe',
+                '-v', 'error',
+                '-show_entries', 'format=duration:format_tags=creation_time',
+                '-of', 'json',
+                filepath
+            ], capture_output=True, text=True, timeout=120)
+
+            if result.returncode == 0 and result.stdout.strip():
+                data = json.loads(result.stdout)
+                fmt = data.get('format', {})
+                duration = float(fmt['duration']) if fmt.get('duration') else None
+                creation_time = fmt.get('tags', {}).get('creation_time')
+                return {'duration': duration, 'creation_time': creation_time}
+
+            if 'moov atom not found' in result.stderr:
+                logger.error(f"Video file corrupted (moov atom not found): {filepath}")
+        except Exception as e:
+            logger.warning(f"Could not get metadata for {filepath}: {e}")
+
+        return {'duration': None, 'creation_time': None}
+
     def _is_video_corrupted(self, filepath: str) -> Tuple[bool, str]:
         """
         Check if a video file is corrupted.
@@ -932,8 +960,10 @@ class VideoProcessor:
                         ExpiresIn=url_expiration
                     )
 
-                    # Get video duration using ffprobe with presigned URL
-                    duration = self._get_video_duration(presigned_url)
+                    # Get video duration and creation_time using ffprobe
+                    metadata = self._get_video_metadata(presigned_url)
+                    duration = metadata.get('duration')
+                    creation_time = metadata.get('creation_time')
 
                     chapter_info = {
                         'filename': filename,
@@ -942,6 +972,7 @@ class VideoProcessor:
                         'size_bytes': obj['Size'],
                         'size_mb': round(obj['Size'] / (1024 * 1024), 2),
                         'duration_seconds': duration,
+                        'creation_time': creation_time,
                         'duration_str': self._format_duration(duration) if duration else 'unknown',
                         'is_corrupted': False,  # Assume S3 files are valid
                         'corruption_error': None,
@@ -1002,31 +1033,72 @@ class VideoProcessor:
         belong to the current recording. This causes phantom timeline that throws
         off all offset calculations.
 
-        Detection: find the majority recording group among all chapters, then
-        filter out any leading chapters that belong to a different group.
+        Primary detection: use creation_time from ffprobe metadata to identify
+        chapters from different recording dates. Chapters whose creation_time is
+        more than 6 hours older than the last chapter are from a previous session.
+
+        Fallback: group-number heuristic for chapters without creation_time.
         """
         if len(chapters) < 2:
             return chapters
 
-        # Extract group for each chapter
+        # --- Strategy 1: creation_time-based filtering (most reliable) ---
+        from datetime import datetime, timedelta, timezone
+
+        parsed_times = []
+        for ch in chapters:
+            ct = ch.get('creation_time')
+            if ct:
+                try:
+                    # Handle both "2026-03-21T00:33:42.000000Z" and "2026-03-21T00:33:42Z"
+                    parsed = datetime.fromisoformat(ct.replace('Z', '+00:00'))
+                    parsed_times.append(parsed)
+                except (ValueError, TypeError):
+                    parsed_times.append(None)
+            else:
+                parsed_times.append(None)
+
+        valid_times = [(i, t) for i, t in enumerate(parsed_times) if t is not None]
+
+        if len(valid_times) >= 2:
+            last_time = valid_times[-1][1]
+            threshold = timedelta(hours=6)
+
+            keep_indices = set()
+            for i, t in valid_times:
+                if abs(t - last_time) <= threshold:
+                    keep_indices.add(i)
+
+            removed_count = len(chapters) - len(keep_indices)
+            if keep_indices and removed_count > 0:
+                filtered = []
+                for i, ch in enumerate(chapters):
+                    if i in keep_indices:
+                        filtered.append(ch)
+                    else:
+                        logger.warning(
+                            f"Filtering out old chapter {ch['filename']} "
+                            f"(creation_time={ch.get('creation_time')}) — "
+                            f"current recording is {last_time.isoformat()}. "
+                            f"Duration was {ch.get('duration_seconds', '?')}s"
+                        )
+                return filtered
+
+        # --- Strategy 2: group-number heuristic (fallback) ---
         groups = []
         for ch in chapters:
             group = VideoProcessor._extract_gopro_group(ch.get('filename', ''))
             groups.append(group)
 
-        # If we can't determine groups for most chapters, keep all
         known_groups = [g for g in groups if g is not None]
         if len(known_groups) < 2:
             return chapters
 
-        # Find the last chapter's group — the current recording's group(s)
-        # The actual recording groups are contiguous and at the end of the list
         last_group = groups[-1]
         if last_group is None:
             return chapters
 
         # Walk from the end to find all groups that are part of the current recording
-        # (GoPro recordings can span multiple groups, e.g., 0097 and 0098)
         current_groups = set()
         for g in reversed(groups):
             if g is None:
@@ -1034,12 +1106,10 @@ class VideoProcessor:
             if not current_groups or g in current_groups:
                 current_groups.add(g)
             elif int(g) >= int(min(current_groups)) - 1:
-                # Adjacent group number — part of the same recording session
                 current_groups.add(g)
             else:
                 break
 
-        # Filter out leading chapters that don't belong to current recording groups
         first_valid_idx = 0
         for i, g in enumerate(groups):
             if g is not None and g in current_groups:
