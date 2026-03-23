@@ -195,23 +195,6 @@ class PipelineOrchestrator:
         """
         pipeline_id = str(uuid.uuid4())[:8]
 
-        # Calculate total recording timerange
-        earliest_start = None
-        latest_end = None
-
-        # Use startedAt/endedAt from Firebase (ISO 8601 UTC). All timestamps must be UTC for matching.
-        for session in sessions:
-            start = session.get('startedAt')
-            end = session.get('endedAt')
-            if start:
-                start_dt = datetime.fromisoformat(start.replace('Z', '+00:00'))
-                if earliest_start is None or start_dt < earliest_start:
-                    earliest_start = start_dt
-            if end:
-                end_dt = datetime.fromisoformat(end.replace('Z', '+00:00'))
-                if latest_end is None or end_dt > latest_end:
-                    latest_end = end_dt
-
         # Filter out sessions with UNK/unknown angles early
         valid_sessions = [s for s in sessions if _is_valid_angle(s.get('angleCode'))]
         skipped_unk_sessions = [s for s in sessions if not _is_valid_angle(s.get('angleCode'))]
@@ -237,6 +220,23 @@ class PipelineOrchestrator:
 
         # Use valid_sessions for the rest of the pipeline
         sessions = valid_sessions
+
+        # Calculate recording timerange from VALID sessions only.
+        # Must happen after filtering to avoid stale sessions from other dates
+        # expanding the window and pulling in games from wrong nights.
+        earliest_start = None
+        latest_end = None
+        for session in sessions:
+            start = session.get('startedAt')
+            end = session.get('endedAt')
+            if start:
+                start_dt = datetime.fromisoformat(start.replace('Z', '+00:00'))
+                if earliest_start is None or start_dt < earliest_start:
+                    earliest_start = start_dt
+            if end:
+                end_dt = datetime.fromisoformat(end.replace('Z', '+00:00'))
+                if latest_end is None or end_dt > latest_end:
+                    latest_end = end_dt
 
         # Initialize pipeline state
         with self._lock:
