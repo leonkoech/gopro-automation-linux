@@ -252,7 +252,7 @@ class AWSBatchTranscoder:
         # Get job definition for extract+transcode
         extract_job_definition = os.getenv(
             'AWS_BATCH_JOB_DEFINITION_EXTRACT',
-            'ffmpeg-extract-transcode:10'
+            'ffmpeg-extract-transcode:11'
         )
 
         # Use large queue for extraction jobs (they process multiple chapters)
