@@ -1261,12 +1261,40 @@ def _start_auto_pipeline_internal(auto_delete_sd: bool = True, from_background: 
 
         # Include sessions that are stopped — either needing upload or already uploaded
         # Sessions with s3Prefix already set will skip upload in the pipeline
-        sessions = [
-            s for s in all_sessions
-            if s.get('status') == 'stopped'
-        ]
+        # Filter by age: only include sessions from the last 48 hours to prevent
+        # orphan sessions from expanding the game detection timerange and pulling
+        # in wrong games from different nights.
+        from datetime import datetime, timedelta, timezone
+        age_cutoff = datetime.now(timezone.utc) - timedelta(hours=48)
 
-        logger.info(f"[Pipeline] Found {len(sessions)} unprocessed sessions (out of {len(all_sessions)} total)")
+        sessions = []
+        stale_sessions = []
+        for s in all_sessions:
+            if s.get('status') != 'stopped':
+                continue
+            started_at = s.get('startedAt')
+            if started_at:
+                try:
+                    if isinstance(started_at, str):
+                        session_time = datetime.fromisoformat(started_at.replace('Z', '+00:00'))
+                    elif hasattr(started_at, 'timestamp'):
+                        session_time = started_at if started_at.tzinfo else started_at.replace(tzinfo=timezone.utc)
+                    else:
+                        session_time = age_cutoff  # Can't parse, include it
+                    if session_time >= age_cutoff:
+                        sessions.append(s)
+                    else:
+                        stale_sessions.append(s)
+                except (ValueError, TypeError):
+                    sessions.append(s)  # Can't parse, include it
+            else:
+                sessions.append(s)  # No startedAt, include it
+
+        if stale_sessions:
+            stale_angles = [f"{s.get('angleCode', '?')}({s.get('id', '?')[:8]})" for s in stale_sessions]
+            logger.info(f"[Pipeline] Skipping {len(stale_sessions)} stale sessions (>48h old): {stale_angles}")
+
+        logger.info(f"[Pipeline] Found {len(sessions)} unprocessed sessions (out of {len(all_sessions)} total, {len(stale_sessions)} stale skipped)")
 
         if not sessions:
             if from_background:
