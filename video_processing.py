@@ -922,7 +922,8 @@ class VideoProcessor:
         s3_prefix: str,
         s3_client,
         bucket: str,
-        url_expiration: int = 7200
+        url_expiration: int = 7200,
+        session_started_at: Optional[datetime] = None
     ) -> List[Dict[str, Any]]:
         """
         Get list of chapter files from S3 with presigned URLs for FFmpeg.
@@ -932,6 +933,7 @@ class VideoProcessor:
             s3_client: boto3 S3 client instance
             bucket: S3 bucket name
             url_expiration: Presigned URL expiration in seconds (default 2 hours)
+            session_started_at: When the recording session started (for filtering old chapters)
 
         Returns:
             List of chapter info dicts with path (presigned URL), filename, size, duration
@@ -998,7 +1000,7 @@ class VideoProcessor:
             # GoPro filenames embed a 4-digit group number (e.g., GX010097 = group 0097).
             # If ch001 has a different group than ch002, it's from an old recording still
             # on the SD card and should be excluded from the timeline.
-            chapters = self._filter_old_gopro_chapters(chapters)
+            chapters = self._filter_old_gopro_chapters(chapters, session_started_at=session_started_at)
 
             logger.info(f"Found {len(chapters)} chapters in S3 at {s3_prefix}")
 
@@ -1024,7 +1026,10 @@ class VideoProcessor:
         return match.group(1) if match else None
 
     @staticmethod
-    def _filter_old_gopro_chapters(chapters: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def _filter_old_gopro_chapters(
+        chapters: List[Dict[str, Any]],
+        session_started_at: Optional[datetime] = None
+    ) -> List[Dict[str, Any]]:
         """
         Filter out leftover chapters from previous GoPro recordings.
 
@@ -1033,9 +1038,13 @@ class VideoProcessor:
         belong to the current recording. This causes phantom timeline that throws
         off all offset calculations.
 
-        Primary detection: use creation_time from ffprobe metadata to identify
-        chapters from different recording dates. Chapters whose creation_time is
-        more than 6 hours older than the last chapter are from a previous session.
+        Primary detection: if session_started_at is provided, filter out any chapter
+        whose creation_time is more than 10 minutes before the session started.
+        This is the most reliable method as it compares against the actual session
+        start time from Firebase rather than relying on inter-chapter time gaps.
+
+        Secondary: use creation_time from ffprobe metadata to identify chapters from
+        different recording dates (6-hour threshold against last chapter).
 
         Fallback: group-number heuristic for chapters without creation_time.
         """
@@ -1060,6 +1069,36 @@ class VideoProcessor:
 
         valid_times = [(i, t) for i, t in enumerate(parsed_times) if t is not None]
 
+        # Strategy 1a: Compare against session startedAt (best method)
+        # Chapters recorded before the session started are definitely old leftovers.
+        if session_started_at and valid_times:
+            # Ensure session_started_at is timezone-aware
+            if session_started_at.tzinfo is None:
+                session_started_at = session_started_at.replace(tzinfo=timezone.utc)
+
+            session_threshold = timedelta(minutes=10)
+            keep_indices = set()
+            for i, t in valid_times:
+                # Keep chapters whose creation_time is within 10 min before session start or after
+                if t >= (session_started_at - session_threshold):
+                    keep_indices.add(i)
+
+            removed_count = len(valid_times) - len(keep_indices)
+            if keep_indices and removed_count > 0:
+                filtered = []
+                for i, ch in enumerate(chapters):
+                    if i in keep_indices:
+                        filtered.append(ch)
+                    else:
+                        logger.warning(
+                            f"Filtering out old chapter {ch['filename']} "
+                            f"(creation_time={ch.get('creation_time')}) — "
+                            f"session started at {session_started_at.isoformat()}. "
+                            f"Duration was {ch.get('duration_seconds', '?')}s"
+                        )
+                return filtered
+
+        # Strategy 1b: Compare against last chapter (fallback when no session time)
         if len(valid_times) >= 2:
             last_time = valid_times[-1][1]
             threshold = timedelta(hours=6)
@@ -1265,7 +1304,18 @@ class VideoProcessor:
         if s3_prefix and s3_client and bucket:
             # Chapters are in S3 - use presigned URLs
             logger.info(f"[{session_name}] Using S3 chapters from: {s3_prefix}")
-            return self.get_session_chapters_from_s3(s3_prefix, s3_client, bucket)
+            # Parse session startedAt for old chapter filtering
+            session_started_at = None
+            started_at_raw = session.get('startedAt')
+            if started_at_raw:
+                try:
+                    if isinstance(started_at_raw, str):
+                        session_started_at = datetime.fromisoformat(started_at_raw.replace('Z', '+00:00'))
+                    elif hasattr(started_at_raw, 'isoformat'):
+                        session_started_at = started_at_raw
+                except (ValueError, TypeError):
+                    pass
+            return self.get_session_chapters_from_s3(s3_prefix, s3_client, bucket, session_started_at=session_started_at)
         else:
             # Fall back to local chapters
             logger.info(f"[{session_name}] Using local chapters from disk")
