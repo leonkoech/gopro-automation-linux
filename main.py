@@ -1294,7 +1294,7 @@ def _start_auto_pipeline_internal(auto_delete_sd: bool = True, from_background: 
 
         if stale_sessions:
             stale_angles = [f"{s.get('angleCode', '?')}({s.get('id', '?')[:8]})" for s in stale_sessions]
-            logger.info(f"[Pipeline] Skipping {len(stale_sessions)} stale sessions (>48h old): {stale_angles}")
+            logger.info(f"[Pipeline] Skipping {len(stale_sessions)} stale sessions (>12h old): {stale_angles}")
 
         logger.info(f"[Pipeline] Found {len(sessions)} unprocessed sessions (out of {len(all_sessions)} total, {len(stale_sessions)} stale skipped)")
 

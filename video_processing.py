@@ -1589,7 +1589,10 @@ def process_game_videos(
                     key_1080p = f"{court_location}/{game_date}/{game_folder}/{game_date}_{game_folder}_{angle}.mp4"
                     try:
                         s3_check.head_object(Bucket=upload_service.bucket_name, Key=key_1080p)
-                    except s3_check.exceptions.ClientError:
+                    except s3_check.exceptions.ClientError as e:
+                        error_code = e.response['Error']['Code']
+                        if error_code != '404':
+                            logger.warning(f"[SKIP-GAME] S3 error checking {angle} 1080p (code={error_code}): {e}")
                         all_exist = False
                         break
 
