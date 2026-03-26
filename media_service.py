@@ -56,7 +56,7 @@ class MediaService:
                 dir_name = directory['d']
                 for file_info in directory.get('fs', []):
                     filename = file_info['n']
-                    size = file_info.get('s', 0)
+                    size = int(file_info.get('s', 0))
                     total_size += size
 
                     # Build file info

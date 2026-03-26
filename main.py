@@ -4729,6 +4729,88 @@ def cancel_admin_job(job_id):
     return jsonify({'success': True, 'message': 'Job cancellation requested'})
 
 
+# ==================== Session Recovery Endpoints ====================
+
+@app.route('/api/recording/recover-session/<session_id>', methods=['POST'])
+def recover_session(session_id):
+    """
+    Recover a failed recording session by fetching chapters from the GoPro.
+
+    When a GoPro disconnects during recording, the session is marked as 'failed'
+    with no chapter files. If the GoPro comes back online, this endpoint:
+    1. Looks up the session in Firebase
+    2. Gets files from the GoPro SD card
+    3. Updates the session with chapter files, status='stopped', and endedAt
+
+    The old-chapter filter in video_processing.py handles removing stale files
+    from previous recordings during extraction.
+    """
+    if not firebase_service:
+        return jsonify({'success': False, 'error': 'Firebase service not configured'}), 503
+
+    try:
+        # Get session from Firebase
+        doc = firebase_service.db.collection('recording-sessions').document(session_id).get()
+        if not doc.exists:
+            return jsonify({'success': False, 'error': f'Session {session_id} not found'}), 404
+
+        session = doc.to_dict()
+        session['id'] = doc.id
+        interface_id = session.get('interfaceId')
+        angle = session.get('angleCode', '?')
+
+        logger.info(f"[Recover] Session {session_id}: angle={angle}, status={session.get('status')}, interface={interface_id}")
+
+        # Get GoPro IP for this interface
+        gopro_ip = get_gopro_wired_ip(interface_id)
+        if not gopro_ip:
+            return jsonify({
+                'success': False,
+                'error': f'GoPro not connected on interface {interface_id}'
+            }), 400
+
+        logger.info(f"[Recover] GoPro found at {gopro_ip} for {interface_id}")
+
+        # Fetch ALL files from GoPro (no pre_record_files filter).
+        # The old-chapter filter in video_processing.py will handle removing
+        # stale files during extraction based on creation_time.
+        chapters = _fetch_gopro_chapters(gopro_ip, pre_record_files=None, label=f'recover-{angle}')
+
+        if not chapters:
+            return jsonify({
+                'success': False,
+                'error': 'No MP4 files found on GoPro SD card'
+            }), 400
+
+        total_size = sum(ch['size'] for ch in chapters)
+
+        # Update Firebase session
+        stop_data = {
+            'total_chapters': len(chapters),
+            'total_size_bytes': total_size,
+            'chapter_files': chapters
+        }
+        firebase_service.register_recording_stop(session_id, stop_data)
+
+        logger.info(f"[Recover] Session {session_id} recovered: {len(chapters)} chapters, {total_size / 1e9:.2f} GB")
+
+        return jsonify({
+            'success': True,
+            'session_id': session_id,
+            'angle': angle,
+            'chapters': len(chapters),
+            'total_size_gb': round(total_size / (1024**3), 2),
+            'files': [ch['filename'] for ch in chapters],
+            'message': f'Session recovered with {len(chapters)} chapters. Run process-only to start pipeline.'
+        })
+
+    except Exception as e:
+        logger.error(f"[Recover] Error recovering session {session_id}: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
 # ==================== Chapter Upload Pipeline Endpoints ====================
 
 # Pipeline job tracking
