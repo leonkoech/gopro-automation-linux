@@ -241,8 +241,11 @@ class ChapterUploadService:
                 # Verify final size
                 final_size = os.path.getsize(local_path)
                 
-                if expected_size > 0 and final_size >= expected_size:
-                    logger.info(f"  Download complete: {final_size:,} bytes")
+                # Accept if within 0.1% of expected (GoPro media list API can
+                # report slightly different sizes than the actual HTTP download)
+                size_tolerance = max(expected_size * 0.001, 1024 * 1024)  # 0.1% or 1MB
+                if expected_size > 0 and final_size >= expected_size - size_tolerance:
+                    logger.info(f"  Download complete: {final_size:,} bytes (expected {expected_size:,}, diff {expected_size - final_size:,})")
                     return {
                         'success': True,
                         'local_path': local_path,
