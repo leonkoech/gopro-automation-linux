@@ -1536,6 +1536,21 @@ def process_game_videos(
                 skipped_angles = [s.get('angleCode') for s in filtered_out]
                 logger.info(f"[ProcessGame] ANGLES_TO_PROCESS={allowed}: filtered out {skipped_angles} ({before_count} -> {len(overlapping_sessions)} sessions)")
 
+        # De-duplicate sessions per angle: keep only the most recent session for
+        # each angle.  This prevents old sessions from previous nights (which overlap
+        # due to wide endedAt timestamps) from being used when a newer session exists.
+        if overlapping_sessions:
+            best_per_angle = {}
+            for s in overlapping_sessions:
+                angle = s.get('angleCode', 'UNKNOWN')
+                existing = best_per_angle.get(angle)
+                if existing is None or s['parsed_start'] > existing['parsed_start']:
+                    best_per_angle[angle] = s
+            before_dedup = len(overlapping_sessions)
+            overlapping_sessions = list(best_per_angle.values())
+            if len(overlapping_sessions) < before_dedup:
+                logger.info(f"[ProcessGame] De-duplicated sessions by angle: {before_dedup} -> {len(overlapping_sessions)} (kept most recent per angle)")
+
         # Sort sessions to process FL/FR first (priority angles), then NL/NR
         # This ensures the main game angles are processed before supplementary angles
         angle_priority = {'FL': 0, 'FR': 1, 'NL': 2, 'NR': 3}
@@ -1552,6 +1567,45 @@ def process_game_videos(
             results['skip_reason'] = f"No recording sessions overlap with game timeframe on {jetson_id}"
             report_progress('completed', f'No videos found on {jetson_id} for this game timeframe (skipped)', 100)
             return results
+
+        # ============================================================
+        # GAME-LEVEL 1080p PRE-CHECK: If ALL angles already have 1080p
+        # files in S3, skip the entire game upfront. This avoids wasting
+        # time fetching chapters from S3 for already-processed games.
+        # ============================================================
+        if uball_game_id and upload_service:
+            try:
+                import boto3
+                from botocore.config import Config as BotoConfig
+                boto_config = BotoConfig(retries={'max_attempts': 2, 'mode': 'adaptive'})
+                s3_check = boto3.client('s3', config=boto_config, verify=False)
+                court_location = os.getenv('COURT_LOCATION', 'court-a')
+                uuid_parts = uball_game_id.split('-')[:4]
+                game_folder = '-'.join(uuid_parts)
+
+                unique_angles = {s.get('angleCode', '').upper() for s in overlapping_sessions}
+                all_exist = True
+                for angle in unique_angles:
+                    key_1080p = f"{court_location}/{game_date}/{game_folder}/{game_date}_{game_folder}_{angle}.mp4"
+                    try:
+                        s3_check.head_object(Bucket=upload_service.bucket_name, Key=key_1080p)
+                    except s3_check.exceptions.ClientError:
+                        all_exist = False
+                        break
+
+                if all_exist and unique_angles:
+                    logger.info(f"[SKIP-GAME] All {len(unique_angles)} angles already have 1080p for game {firebase_game_id} — skipping entirely")
+                    results['success'] = True
+                    results['skipped'] = True
+                    results['skip_reason'] = 'all_angles_1080p_exist'
+                    for angle in unique_angles:
+                        results['processed_videos'].append({
+                            'angle': angle, 'status': 'skipped', 'skip_reason': '1080p_exists'
+                        })
+                    report_progress('completed', f'All {len(unique_angles)} angles already processed — skipped', 100)
+                    return results
+            except Exception as e:
+                logger.warning(f"[SKIP-GAME] Pre-check failed: {e} — proceeding with processing")
 
         report_progress('processing', f'Processing {len(overlapping_sessions)} video angles...', 15)
 
