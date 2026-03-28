@@ -333,6 +333,58 @@ def get_gopro_files(gopro_ip):
     return files
 
 
+def _stop_gopro_with_retry(gopro_ip, gopro_id, max_retries=3):
+    """Send stop command to GoPro with retries and verify it actually stopped.
+
+    Args:
+        gopro_ip: GoPro HTTP API IP address
+        gopro_id: GoPro identifier for logging
+        max_retries: Maximum number of stop attempts (default: 3)
+
+    Returns:
+        True if GoPro was confirmed stopped, False if all retries exhausted
+    """
+    for attempt in range(1, max_retries + 1):
+        try:
+            response = requests.get(
+                f'http://{gopro_ip}:8080/gopro/camera/shutter/stop',
+                timeout=5
+            )
+            if response.status_code == 200:
+                logger.info(f"[{gopro_id}] Stop command accepted (attempt {attempt}/{max_retries})")
+            else:
+                logger.warning(f"[{gopro_id}] Stop command returned HTTP {response.status_code} (attempt {attempt}/{max_retries})")
+        except Exception as e:
+            logger.warning(f"[{gopro_id}] Stop command failed (attempt {attempt}/{max_retries}): {e}")
+
+        # Verify GoPro actually stopped by checking camera state
+        time.sleep(2)
+        try:
+            state_response = requests.get(
+                f'http://{gopro_ip}:8080/gopro/camera/state',
+                timeout=5
+            )
+            if state_response.status_code == 200:
+                state = state_response.json()
+                is_encoding = state.get('status', {}).get('8', 0)
+                system_busy = state.get('status', {}).get('31', 0)
+                if not is_encoding and not system_busy:
+                    logger.info(f"[{gopro_id}] ✓ Recording confirmed stopped (encoding={is_encoding}, busy={system_busy})")
+                    return True
+                else:
+                    logger.warning(f"[{gopro_id}] GoPro still active after stop (encoding={is_encoding}, busy={system_busy})")
+        except Exception as e:
+            logger.warning(f"[{gopro_id}] Could not verify stop state: {e}")
+
+        if attempt < max_retries:
+            backoff = 2 * attempt
+            logger.info(f"[{gopro_id}] Retrying stop in {backoff}s...")
+            time.sleep(backoff)
+
+    logger.error(f"[{gopro_id}] Failed to confirm GoPro stopped after {max_retries} attempts")
+    return False
+
+
 def _fetch_gopro_chapters(gopro_ip, pre_record_files=None, label=''):
     """Fetch chapter files from GoPro SD card, waiting for file count to stabilize.
 
@@ -865,16 +917,11 @@ def stop_recording(gopro_id):
                     del recording_processes[gopro_id]
             return jsonify({'success': False, 'error': 'Could not detect GoPro IP'}), 500
 
-        # Send stop command to camera via HTTP API
+        # Send stop command to camera with retries and state verification
         logger.info(f"[{gopro_id}] Stopping recording on {gopro_ip}...")
-        try:
-            response = requests.get(f'http://{gopro_ip}:8080/gopro/camera/shutter/stop', timeout=5)
-            if response.status_code == 200:
-                logger.info(f"[{gopro_id}] ✓ Recording stopped")
-            else:
-                logger.warning(f"[{gopro_id}] Stop command returned: {response.status_code}")
-        except Exception as e:
-            logger.warning(f"[{gopro_id}] Could not send stop command: {e}")
+        stop_confirmed = _stop_gopro_with_retry(gopro_ip, gopro_id)
+        if not stop_confirmed:
+            logger.warning(f"[{gopro_id}] Stop not confirmed, proceeding with finalization anyway")
 
         with recording_lock:
             if gopro_id in recording_processes:
@@ -1097,18 +1144,16 @@ def stop_all_and_process():
                         gopro_ip = get_gopro_wired_ip(gopro_id)
 
             if gopro_ip:
-                # Send stop command
-                try:
-                    response = requests.get(
-                        f'http://{gopro_ip}:8080/gopro/camera/shutter/stop',
-                        timeout=5
-                    )
-                    if response.status_code == 200:
-                        stopped_gopros.append(gopro_id)
-                        logger.info(f"[Stop All] Stopped recording on {gopro_id}")
-                except Exception as e:
-                    stop_errors.append(f"{gopro_id}: {e}")
-                    logger.warning(f"[Stop All] Failed to stop {gopro_id}: {e}")
+                # Send stop command with retries
+                stop_confirmed = _stop_gopro_with_retry(gopro_ip, gopro_id)
+                if stop_confirmed:
+                    stopped_gopros.append(gopro_id)
+                    logger.info(f"[Stop All] Stopped recording on {gopro_id}")
+                else:
+                    stop_errors.append(f"{gopro_id}: stop not confirmed after retries")
+                    logger.warning(f"[Stop All] Failed to confirm stop on {gopro_id}")
+                    # Still add to stopped list — GoPro may have stopped but state check failed
+                    stopped_gopros.append(gopro_id)
 
                 # Mark as stopping
                 with recording_lock:
