@@ -1306,13 +1306,12 @@ def _start_auto_pipeline_internal(auto_delete_sd: bool = True, from_background: 
 
         # Include sessions that are stopped — either needing upload or already uploaded
         # Sessions with s3Prefix already set will skip upload in the pipeline
-        # Filter by age: only include sessions from the last 12 hours to prevent
+        # Filter by age: only include sessions from the last N hours to prevent
         # orphan sessions from expanding the game detection timerange and pulling
-        # in wrong games from different nights.  48h was too generous — sessions
-        # from the previous night (~28h old) slipped through and caused false
-        # game detection.  12h covers a full evening session (start 6pm, process 3am = 9h).
+        # in wrong games from different nights.  TEMPORARY: 96h to allow Mar 28
+        # reprocessing.  Revert to 12h after reprocessing is done.
         from datetime import datetime, timedelta, timezone
-        age_cutoff = datetime.now(timezone.utc) - timedelta(hours=12)
+        age_cutoff = datetime.now(timezone.utc) - timedelta(hours=96)
 
         sessions = []
         stale_sessions = []
