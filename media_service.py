@@ -188,12 +188,17 @@ class MediaService:
             if response.status_code == 200:
                 state = response.json()
                 # Extract storage-related status
+                # GoPro API returns status keys as integers (33, 34, 35)
+                # but JSON parsing may yield string or int keys depending on firmware
                 status = state.get('status', {})
+                remaining_photos = status.get(34, status.get('34', 0))
+                remaining_video_seconds = status.get(35, status.get('35', 0))
+                sd_status = status.get(33, status.get('33', 0))
                 return {
                     'success': True,
-                    'remaining_photos': status.get('34', 0),
-                    'remaining_video_seconds': status.get('35', 0),
-                    'sd_card_present': status.get('33', 0) == 0,
+                    'remaining_photos': remaining_photos,
+                    'remaining_video_seconds': remaining_video_seconds,
+                    'sd_card_present': sd_status == 0,
                     'raw_state': state
                 }
             else:
