@@ -150,11 +150,14 @@ class ChapterUploadService:
         # Ensure parent directory exists
         os.makedirs(os.path.dirname(local_path), exist_ok=True)
         
-        for attempt in range(MAX_DOWNLOAD_RETRIES):
+        consecutive_failures = 0
+        total_attempts = 0
+        while consecutive_failures < MAX_DOWNLOAD_RETRIES:
+            total_attempts += 1
             try:
                 # Check current file size for resume
                 current_size = os.path.getsize(local_path) if os.path.exists(local_path) else 0
-                
+
                 # Skip if already complete
                 if expected_size > 0 and current_size >= expected_size:
                     logger.info(f"  Already complete: {current_size:,} bytes")
@@ -238,15 +241,24 @@ class ChapterUploadService:
                 # Verify final size
                 final_size = os.path.getsize(local_path)
                 
-                if expected_size > 0 and final_size >= expected_size:
-                    logger.info(f"  Download complete: {final_size:,} bytes")
+                # Accept if within 0.1% of expected (GoPro media list API can
+                # report slightly different sizes than the actual HTTP download)
+                size_tolerance = max(expected_size * 0.001, 1024 * 1024)  # 0.1% or 1MB
+                if expected_size > 0 and final_size >= expected_size - size_tolerance:
+                    logger.info(f"  Download complete: {final_size:,} bytes (expected {expected_size:,}, diff {expected_size - final_size:,})")
                     return {
                         'success': True,
                         'local_path': local_path,
                         'bytes_downloaded': final_size
                     }
                 elif expected_size > 0:
-                    logger.warning(f"  Incomplete: {final_size:,} / {expected_size:,} bytes - will retry")
+                    # Progress was made if bytes_written > 0 — reset consecutive failures
+                    if bytes_written > 0:
+                        logger.info(f"  Incomplete but made progress ({bytes_written/1024/1024:.0f} MB) — resetting retry counter")
+                        consecutive_failures = 0
+                    else:
+                        consecutive_failures += 1
+                    logger.warning(f"  Incomplete: {final_size:,} / {expected_size:,} bytes - will retry (consecutive failures: {consecutive_failures})")
                 else:
                     logger.info(f"  Downloaded: {final_size:,} bytes (expected size unknown)")
                     return {
@@ -254,33 +266,33 @@ class ChapterUploadService:
                         'local_path': local_path,
                         'bytes_downloaded': final_size
                     }
-            
+
             except requests.exceptions.Timeout as e:
-                logger.warning(f"  Timeout on attempt {attempt + 1}/{MAX_DOWNLOAD_RETRIES}: {e}")
+                consecutive_failures += 1
+                logger.warning(f"  Timeout on attempt {total_attempts} (consecutive failures: {consecutive_failures}/{MAX_DOWNLOAD_RETRIES}): {e}")
             except requests.exceptions.ConnectionError as e:
-                logger.warning(f"  Connection error on attempt {attempt + 1}/{MAX_DOWNLOAD_RETRIES}: {e}")
+                consecutive_failures += 1
+                logger.warning(f"  Connection error on attempt {total_attempts} (consecutive failures: {consecutive_failures}/{MAX_DOWNLOAD_RETRIES}): {e}")
             except Exception as e:
-                logger.error(f"  Error on attempt {attempt + 1}/{MAX_DOWNLOAD_RETRIES}: {e}")
-            
-            # Wait before retry (exponential backoff, max 30 seconds)
-            if attempt < MAX_DOWNLOAD_RETRIES - 1:
-                wait_time = min(2 ** attempt, 30)
+                consecutive_failures += 1
+                logger.error(f"  Error on attempt {total_attempts} (consecutive failures: {consecutive_failures}/{MAX_DOWNLOAD_RETRIES}): {e}")
+
+            # Wait before retry (exponential backoff on consecutive failures, max 30s)
+            if consecutive_failures < MAX_DOWNLOAD_RETRIES:
+                wait_time = min(2 ** min(consecutive_failures, 5), 30)
                 logger.info(f"  Waiting {wait_time}s before retry...")
                 time.sleep(wait_time)
-        
-        logger.error(f"  FAILED after {MAX_DOWNLOAD_RETRIES} attempts")
-        # Clean up partial file on final failure
-        if os.path.exists(local_path):
-            try:
-                os.remove(local_path)
-                logger.info(f"  Cleaned up partial file: {local_path}")
-            except:
-                pass
-        
+
+        logger.error(f"  FAILED after {consecutive_failures} consecutive failures ({total_attempts} total attempts)")
+        # Keep partial file so next pipeline run can resume from it
+        partial_size = os.path.getsize(local_path) if os.path.exists(local_path) else 0
+        if partial_size > 0:
+            logger.info(f"  Keeping partial file ({partial_size/1024/1024/1024:.2f} GB) for future resume")
+
         return {
             'success': False,
             'local_path': local_path,
-            'bytes_downloaded': 0,
+            'bytes_downloaded': partial_size,
             'error': f'Failed after {MAX_DOWNLOAD_RETRIES} attempts'
         }
 

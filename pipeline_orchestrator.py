@@ -195,11 +195,37 @@ class PipelineOrchestrator:
         """
         pipeline_id = str(uuid.uuid4())[:8]
 
-        # Calculate total recording timerange
+        # Filter out sessions with UNK/unknown angles early
+        valid_sessions = [s for s in sessions if _is_valid_angle(s.get('angleCode'))]
+        skipped_unk_sessions = [s for s in sessions if not _is_valid_angle(s.get('angleCode'))]
+
+        if skipped_unk_sessions:
+            skipped_angles = [s.get('angleCode', 'NONE') for s in skipped_unk_sessions]
+            logger.info(f"[Pipeline {pipeline_id}] Skipping {len(skipped_unk_sessions)} sessions with unknown angles: {skipped_angles}")
+
+        # Filter by ANGLES_TO_PROCESS if configured
+        angles_to_process = os.getenv('ANGLES_TO_PROCESS', '').strip()
+        skipped_angle_filter = []
+        if angles_to_process:
+            allowed = frozenset(a.strip().upper() for a in angles_to_process.split(',') if a.strip())
+            logger.info(f"[Pipeline {pipeline_id}] ANGLES_TO_PROCESS={allowed}")
+            filtered = []
+            for s in valid_sessions:
+                if s.get('angleCode', '').upper() in allowed:
+                    filtered.append(s)
+                else:
+                    skipped_angle_filter.append(s)
+                    logger.info(f"[Pipeline {pipeline_id}] Skipping {s.get('angleCode')} session {s.get('id')} - not in ANGLES_TO_PROCESS")
+            valid_sessions = filtered
+
+        # Use valid_sessions for the rest of the pipeline
+        sessions = valid_sessions
+
+        # Calculate recording timerange from VALID sessions only.
+        # Must happen after filtering to avoid stale sessions from other dates
+        # expanding the window and pulling in games from wrong nights.
         earliest_start = None
         latest_end = None
-
-        # Use startedAt/endedAt from Firebase (ISO 8601 UTC). All timestamps must be UTC for matching.
         for session in sessions:
             start = session.get('startedAt')
             end = session.get('endedAt')
@@ -211,17 +237,6 @@ class PipelineOrchestrator:
                 end_dt = datetime.fromisoformat(end.replace('Z', '+00:00'))
                 if latest_end is None or end_dt > latest_end:
                     latest_end = end_dt
-
-        # Filter out sessions with UNK/unknown angles early
-        valid_sessions = [s for s in sessions if _is_valid_angle(s.get('angleCode'))]
-        skipped_unk_sessions = [s for s in sessions if not _is_valid_angle(s.get('angleCode'))]
-
-        if skipped_unk_sessions:
-            skipped_angles = [s.get('angleCode', 'NONE') for s in skipped_unk_sessions]
-            logger.info(f"[Pipeline {pipeline_id}] Skipping {len(skipped_unk_sessions)} sessions with unknown angles: {skipped_angles}")
-
-        # Use valid_sessions for the rest of the pipeline
-        sessions = valid_sessions
 
         # Initialize pipeline state
         with self._lock:
@@ -241,6 +256,7 @@ class PipelineOrchestrator:
                 },
                 'sessions_total': len(sessions),
                 'sessions_skipped_unk': len(skipped_unk_sessions),  # Track skipped UNK sessions
+                'sessions_skipped_angle_filter': len(skipped_angle_filter),  # Track skipped by ANGLES_TO_PROCESS
                 'sessions_uploaded': 0,
 
                 # Games
@@ -355,6 +371,10 @@ class PipelineOrchestrator:
             # Skip upload if session already has chapters in S3
             if existing_s3_prefix:
                 logger.info(f"[Pipeline {pipeline_id}] Session {session_id} already uploaded to {existing_s3_prefix}, skipping upload")
+                # Fix session status in Firebase so it won't be re-picked up next pipeline run
+                if session.get('status') == 'stopped':
+                    self.firebase_service.update_session_s3_prefix(session_id, existing_s3_prefix)
+                    logger.info(f"[Pipeline {pipeline_id}] Fixed session {session_id} status: stopped -> uploaded")
                 self._update_session_state(pipeline_id, session_id, {
                     'status': 'completed',
                     's3_prefix': existing_s3_prefix,

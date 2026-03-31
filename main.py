@@ -333,6 +333,58 @@ def get_gopro_files(gopro_ip):
     return files
 
 
+def _stop_gopro_with_retry(gopro_ip, gopro_id, max_retries=3):
+    """Send stop command to GoPro with retries and verify it actually stopped.
+
+    Args:
+        gopro_ip: GoPro HTTP API IP address
+        gopro_id: GoPro identifier for logging
+        max_retries: Maximum number of stop attempts (default: 3)
+
+    Returns:
+        True if GoPro was confirmed stopped, False if all retries exhausted
+    """
+    for attempt in range(1, max_retries + 1):
+        try:
+            response = requests.get(
+                f'http://{gopro_ip}:8080/gopro/camera/shutter/stop',
+                timeout=5
+            )
+            if response.status_code == 200:
+                logger.info(f"[{gopro_id}] Stop command accepted (attempt {attempt}/{max_retries})")
+            else:
+                logger.warning(f"[{gopro_id}] Stop command returned HTTP {response.status_code} (attempt {attempt}/{max_retries})")
+        except Exception as e:
+            logger.warning(f"[{gopro_id}] Stop command failed (attempt {attempt}/{max_retries}): {e}")
+
+        # Verify GoPro actually stopped by checking camera state
+        time.sleep(2)
+        try:
+            state_response = requests.get(
+                f'http://{gopro_ip}:8080/gopro/camera/state',
+                timeout=5
+            )
+            if state_response.status_code == 200:
+                state = state_response.json()
+                is_encoding = state.get('status', {}).get('8', 0)
+                system_busy = state.get('status', {}).get('31', 0)
+                if not is_encoding and not system_busy:
+                    logger.info(f"[{gopro_id}] ✓ Recording confirmed stopped (encoding={is_encoding}, busy={system_busy})")
+                    return True
+                else:
+                    logger.warning(f"[{gopro_id}] GoPro still active after stop (encoding={is_encoding}, busy={system_busy})")
+        except Exception as e:
+            logger.warning(f"[{gopro_id}] Could not verify stop state: {e}")
+
+        if attempt < max_retries:
+            backoff = 2 * attempt
+            logger.info(f"[{gopro_id}] Retrying stop in {backoff}s...")
+            time.sleep(backoff)
+
+    logger.error(f"[{gopro_id}] Failed to confirm GoPro stopped after {max_retries} attempts")
+    return False
+
+
 def _fetch_gopro_chapters(gopro_ip, pre_record_files=None, label=''):
     """Fetch chapter files from GoPro SD card, waiting for file count to stabilize.
 
@@ -865,16 +917,11 @@ def stop_recording(gopro_id):
                     del recording_processes[gopro_id]
             return jsonify({'success': False, 'error': 'Could not detect GoPro IP'}), 500
 
-        # Send stop command to camera via HTTP API
+        # Send stop command to camera with retries and state verification
         logger.info(f"[{gopro_id}] Stopping recording on {gopro_ip}...")
-        try:
-            response = requests.get(f'http://{gopro_ip}:8080/gopro/camera/shutter/stop', timeout=5)
-            if response.status_code == 200:
-                logger.info(f"[{gopro_id}] ✓ Recording stopped")
-            else:
-                logger.warning(f"[{gopro_id}] Stop command returned: {response.status_code}")
-        except Exception as e:
-            logger.warning(f"[{gopro_id}] Could not send stop command: {e}")
+        stop_confirmed = _stop_gopro_with_retry(gopro_ip, gopro_id)
+        if not stop_confirmed:
+            logger.warning(f"[{gopro_id}] Stop not confirmed, proceeding with finalization anyway")
 
         with recording_lock:
             if gopro_id in recording_processes:
@@ -1097,18 +1144,16 @@ def stop_all_and_process():
                         gopro_ip = get_gopro_wired_ip(gopro_id)
 
             if gopro_ip:
-                # Send stop command
-                try:
-                    response = requests.get(
-                        f'http://{gopro_ip}:8080/gopro/camera/shutter/stop',
-                        timeout=5
-                    )
-                    if response.status_code == 200:
-                        stopped_gopros.append(gopro_id)
-                        logger.info(f"[Stop All] Stopped recording on {gopro_id}")
-                except Exception as e:
-                    stop_errors.append(f"{gopro_id}: {e}")
-                    logger.warning(f"[Stop All] Failed to stop {gopro_id}: {e}")
+                # Send stop command with retries
+                stop_confirmed = _stop_gopro_with_retry(gopro_ip, gopro_id)
+                if stop_confirmed:
+                    stopped_gopros.append(gopro_id)
+                    logger.info(f"[Stop All] Stopped recording on {gopro_id}")
+                else:
+                    stop_errors.append(f"{gopro_id}: stop not confirmed after retries")
+                    logger.warning(f"[Stop All] Failed to confirm stop on {gopro_id}")
+                    # Still add to stopped list — GoPro may have stopped but state check failed
+                    stopped_gopros.append(gopro_id)
 
                 # Mark as stopping
                 with recording_lock:
@@ -1261,12 +1306,41 @@ def _start_auto_pipeline_internal(auto_delete_sd: bool = True, from_background: 
 
         # Include sessions that are stopped — either needing upload or already uploaded
         # Sessions with s3Prefix already set will skip upload in the pipeline
-        sessions = [
-            s for s in all_sessions
-            if s.get('status') == 'stopped'
-        ]
+        # Filter by age: only include sessions from the last N hours to prevent
+        # orphan sessions from expanding the game detection timerange and pulling
+        # in wrong games from different nights.  TEMPORARY: 96h to allow Mar 28
+        # reprocessing.  Revert to 12h after reprocessing is done.
+        from datetime import datetime, timedelta, timezone
+        age_cutoff = datetime.now(timezone.utc) - timedelta(hours=96)
 
-        logger.info(f"[Pipeline] Found {len(sessions)} unprocessed sessions (out of {len(all_sessions)} total)")
+        sessions = []
+        stale_sessions = []
+        for s in all_sessions:
+            if s.get('status') != 'stopped':
+                continue
+            started_at = s.get('startedAt')
+            if started_at:
+                try:
+                    if isinstance(started_at, str):
+                        session_time = datetime.fromisoformat(started_at.replace('Z', '+00:00'))
+                    elif hasattr(started_at, 'timestamp'):
+                        session_time = started_at if started_at.tzinfo else started_at.replace(tzinfo=timezone.utc)
+                    else:
+                        session_time = age_cutoff  # Can't parse, include it
+                    if session_time >= age_cutoff:
+                        sessions.append(s)
+                    else:
+                        stale_sessions.append(s)
+                except (ValueError, TypeError):
+                    sessions.append(s)  # Can't parse, include it
+            else:
+                sessions.append(s)  # No startedAt, include it
+
+        if stale_sessions:
+            stale_angles = [f"{s.get('angleCode', '?')}({s.get('id', '?')[:8]})" for s in stale_sessions]
+            logger.info(f"[Pipeline] Skipping {len(stale_sessions)} stale sessions (>12h old): {stale_angles}")
+
+        logger.info(f"[Pipeline] Found {len(sessions)} unprocessed sessions (out of {len(all_sessions)} total, {len(stale_sessions)} stale skipped)")
 
         if not sessions:
             if from_background:
@@ -1773,8 +1847,8 @@ def sync_game_to_uball():
         "team2_id": "uuid-of-team2"   // Optional - Uball team UUID
     }
 
-    If team IDs not provided, teams are auto-created from Firebase game data.
-    Each game creates NEW teams (even if same name exists) because rosters differ.
+    If team IDs not provided, teams are looked up by name in Uball Backend.
+    Existing teams are reused to avoid duplicates; new teams created only if not found.
 
     Flow:
     1. Fetch game from Firebase (basketball-games collection)
@@ -1857,32 +1931,32 @@ def sync_game_to_uball():
             left_team = firebase_game.get('leftTeam', {})
             team1_name = left_team.get('name', 'Team 1')
 
-            created_team1 = uball_client.create_team(team1_name)
-            if not created_team1:
+            resolved_team1 = uball_client.get_or_create_team(team1_name)
+            if not resolved_team1:
                 return jsonify({
                     'success': False,
-                    'error': f'Failed to create team: {team1_name}'
+                    'error': f'Failed to resolve team: {team1_name}'
                 }), 500
 
-            team1_id = str(created_team1.get('id'))
+            team1_id = str(resolved_team1.get('id'))
             teams_created.append({'name': team1_name, 'id': team1_id, 'side': 'left'})
-            logger.info(f"[GameSync] Auto-created team1: {team1_name} -> {team1_id}")
+            logger.info(f"[GameSync] Resolved team1: {team1_name} -> {team1_id}")
 
         if not team2_id:
             # Extract team2 name from Firebase (rightTeam)
             right_team = firebase_game.get('rightTeam', {})
             team2_name = right_team.get('name', 'Team 2')
 
-            created_team2 = uball_client.create_team(team2_name)
-            if not created_team2:
+            resolved_team2 = uball_client.get_or_create_team(team2_name)
+            if not resolved_team2:
                 return jsonify({
                     'success': False,
-                    'error': f'Failed to create team: {team2_name}'
+                    'error': f'Failed to resolve team: {team2_name}'
                 }), 500
 
-            team2_id = str(created_team2.get('id'))
+            team2_id = str(resolved_team2.get('id'))
             teams_created.append({'name': team2_name, 'id': team2_id, 'side': 'right'})
-            logger.info(f"[GameSync] Auto-created team2: {team2_name} -> {team2_id}")
+            logger.info(f"[GameSync] Resolved team2: {team2_name} -> {team2_id}")
 
         # 4. Prepare game data for Uball Backend
         logger.info(f"[GameSync] Step 4: Preparing game data for Uball Backend...")
@@ -1901,6 +1975,15 @@ def sync_game_to_uball():
             'end_time': ended_at if ended_at else None,
             'source': 'firebase'
         }
+
+        # Add team colors (color name for annotation tool classify endpoint)
+        team1_color_name = left_team.get('jerseyColorName', '')
+        team2_color_name = right_team.get('jerseyColorName', '')
+        if team1_color_name:
+            uball_game_data['team1_color'] = team1_color_name
+        if team2_color_name:
+            uball_game_data['team2_color'] = team2_color_name
+        logger.info(f"[GameSync] Team colors: {team1_color_name} vs {team2_color_name}")
 
         # Add scores and video_name from leftTeam/rightTeam
         left_team = firebase_game.get('leftTeam', {})
@@ -4690,6 +4773,88 @@ def cancel_admin_job(job_id):
     return jsonify({'success': True, 'message': 'Job cancellation requested'})
 
 
+# ==================== Session Recovery Endpoints ====================
+
+@app.route('/api/recording/recover-session/<session_id>', methods=['POST'])
+def recover_session(session_id):
+    """
+    Recover a failed recording session by fetching chapters from the GoPro.
+
+    When a GoPro disconnects during recording, the session is marked as 'failed'
+    with no chapter files. If the GoPro comes back online, this endpoint:
+    1. Looks up the session in Firebase
+    2. Gets files from the GoPro SD card
+    3. Updates the session with chapter files, status='stopped', and endedAt
+
+    The old-chapter filter in video_processing.py handles removing stale files
+    from previous recordings during extraction.
+    """
+    if not firebase_service:
+        return jsonify({'success': False, 'error': 'Firebase service not configured'}), 503
+
+    try:
+        # Get session from Firebase
+        doc = firebase_service.db.collection('recording-sessions').document(session_id).get()
+        if not doc.exists:
+            return jsonify({'success': False, 'error': f'Session {session_id} not found'}), 404
+
+        session = doc.to_dict()
+        session['id'] = doc.id
+        interface_id = session.get('interfaceId')
+        angle = session.get('angleCode', '?')
+
+        logger.info(f"[Recover] Session {session_id}: angle={angle}, status={session.get('status')}, interface={interface_id}")
+
+        # Get GoPro IP for this interface
+        gopro_ip = get_gopro_wired_ip(interface_id)
+        if not gopro_ip:
+            return jsonify({
+                'success': False,
+                'error': f'GoPro not connected on interface {interface_id}'
+            }), 400
+
+        logger.info(f"[Recover] GoPro found at {gopro_ip} for {interface_id}")
+
+        # Fetch ALL files from GoPro (no pre_record_files filter).
+        # The old-chapter filter in video_processing.py will handle removing
+        # stale files during extraction based on creation_time.
+        chapters = _fetch_gopro_chapters(gopro_ip, pre_record_files=None, label=f'recover-{angle}')
+
+        if not chapters:
+            return jsonify({
+                'success': False,
+                'error': 'No MP4 files found on GoPro SD card'
+            }), 400
+
+        total_size = sum(ch['size'] for ch in chapters)
+
+        # Update Firebase session
+        stop_data = {
+            'total_chapters': len(chapters),
+            'total_size_bytes': total_size,
+            'chapter_files': chapters
+        }
+        firebase_service.register_recording_stop(session_id, stop_data)
+
+        logger.info(f"[Recover] Session {session_id} recovered: {len(chapters)} chapters, {total_size / 1e9:.2f} GB")
+
+        return jsonify({
+            'success': True,
+            'session_id': session_id,
+            'angle': angle,
+            'chapters': len(chapters),
+            'total_size_gb': round(total_size / (1024**3), 2),
+            'files': [ch['filename'] for ch in chapters],
+            'message': f'Session recovered with {len(chapters)} chapters. Run process-only to start pipeline.'
+        })
+
+    except Exception as e:
+        logger.error(f"[Recover] Error recovering session {session_id}: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
 # ==================== Chapter Upload Pipeline Endpoints ====================
 
 # Pipeline job tracking
@@ -5269,6 +5434,11 @@ if __name__ == '__main__':
         stale_count = firebase_service.cleanup_stale_running_pipelines()
         if stale_count:
             logger.warning(f"Startup cleanup: marked {stale_count} stale pipeline(s) as failed due to service restart")
+
+        # Recover games stuck in 'batch_submitted' after a service restart
+        recovered_count = firebase_service.recover_batch_submitted_games()
+        if recovered_count:
+            logger.info(f"Startup recovery: updated {recovered_count} game(s) stuck in batch_submitted")
 
         # Migrate legacy sessions that have s3Prefix but still show status='stopped'
         migrated_count = firebase_service.migrate_legacy_uploaded_sessions()

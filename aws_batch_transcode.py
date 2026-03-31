@@ -28,6 +28,7 @@ Environment Variables:
     AWS_BATCH_REGION: AWS region for Batch (default: us-east-1)
 """
 
+import json
 import os
 import ssl
 import time
@@ -221,22 +222,28 @@ class AWSBatchTranscoder:
         Returns:
             Dict with jobId, jobName, and submission details
         """
-        import json
-
-        # Extract S3 keys from chapters
+        # Extract S3 keys and durations from chapters
         chapter_keys = []
+        chapter_durations = []
         for ch in chapters:
             if isinstance(ch, dict) and 's3_key' in ch:
                 chapter_keys.append(ch['s3_key'])
+                chapter_durations.append(ch.get('duration_seconds') or 0)
             elif isinstance(ch, str):
                 chapter_keys.append(ch)
+                chapter_durations.append(0)
             else:
                 logger.warning(f"Unexpected chapter format: {ch}")
 
         if not chapter_keys:
             raise ValueError("No valid chapter S3 keys found")
 
+        assert len(chapter_keys) == len(chapter_durations), (
+            f"Chapter keys/durations length mismatch: {len(chapter_keys)} vs {len(chapter_durations)}"
+        )
+
         chapters_json = json.dumps(chapter_keys)
+        durations_json = json.dumps(chapter_durations)
 
         # Generate unique job name
         timestamp = int(time.time())
@@ -245,7 +252,7 @@ class AWSBatchTranscoder:
         # Get job definition for extract+transcode
         extract_job_definition = os.getenv(
             'AWS_BATCH_JOB_DEFINITION_EXTRACT',
-            'ffmpeg-extract-transcode:1'
+            'ffmpeg-extract-transcode:11'
         )
 
         # Use large queue for extraction jobs (they process multiple chapters)
@@ -266,6 +273,7 @@ class AWSBatchTranscoder:
                 containerOverrides={
                     'environment': [
                         {'name': 'CHAPTERS_JSON', 'value': chapters_json},
+                        {'name': 'CHAPTER_DURATIONS_JSON', 'value': durations_json},
                         {'name': 'BUCKET', 'value': bucket},
                         {'name': 'OFFSET_SECONDS', 'value': str(offset_seconds)},
                         {'name': 'DURATION_SECONDS', 'value': str(duration_seconds)},

@@ -19,7 +19,9 @@ Example:
     court-a/2026-01-20/95efaeaa-8475-4db4-8967/2026-01-20_95efaeaa-8475-4db4-8967_FL.mp4
 """
 
+import json
 import os
+import re
 import subprocess
 import tempfile
 from datetime import datetime, timedelta
@@ -114,6 +116,34 @@ class VideoProcessor:
                 logger.error(f"Video file corrupted (moov atom not found): {filepath}")
         except Exception as e:
             logger.warning(f"Could not get duration for {filepath}: {e}")
+
+    def _get_video_metadata(self, filepath: str) -> Dict[str, Any]:
+        """Get video duration and creation_time using ffprobe (JSON output).
+
+        Returns dict with 'duration' (float|None) and 'creation_time' (str|None).
+        """
+        try:
+            result = subprocess.run([
+                'ffprobe',
+                '-v', 'error',
+                '-show_entries', 'format=duration:format_tags=creation_time',
+                '-of', 'json',
+                filepath
+            ], capture_output=True, text=True, timeout=120)
+
+            if result.returncode == 0 and result.stdout.strip():
+                data = json.loads(result.stdout)
+                fmt = data.get('format', {})
+                duration = float(fmt['duration']) if fmt.get('duration') else None
+                creation_time = fmt.get('tags', {}).get('creation_time')
+                return {'duration': duration, 'creation_time': creation_time}
+
+            if 'moov atom not found' in result.stderr:
+                logger.error(f"Video file corrupted (moov atom not found): {filepath}")
+        except Exception as e:
+            logger.warning(f"Could not get metadata for {filepath}: {e}")
+
+        return {'duration': None, 'creation_time': None}
 
     def _is_video_corrupted(self, filepath: str) -> Tuple[bool, str]:
         """
@@ -892,7 +922,8 @@ class VideoProcessor:
         s3_prefix: str,
         s3_client,
         bucket: str,
-        url_expiration: int = 7200
+        url_expiration: int = 7200,
+        session_started_at: Optional[datetime] = None
     ) -> List[Dict[str, Any]]:
         """
         Get list of chapter files from S3 with presigned URLs for FFmpeg.
@@ -902,6 +933,7 @@ class VideoProcessor:
             s3_client: boto3 S3 client instance
             bucket: S3 bucket name
             url_expiration: Presigned URL expiration in seconds (default 2 hours)
+            session_started_at: When the recording session started (for filtering old chapters)
 
         Returns:
             List of chapter info dicts with path (presigned URL), filename, size, duration
@@ -930,8 +962,10 @@ class VideoProcessor:
                         ExpiresIn=url_expiration
                     )
 
-                    # Get video duration using ffprobe with presigned URL
-                    duration = self._get_video_duration(presigned_url)
+                    # Get video duration and creation_time using ffprobe
+                    metadata = self._get_video_metadata(presigned_url)
+                    duration = metadata.get('duration')
+                    creation_time = metadata.get('creation_time')
 
                     chapter_info = {
                         'filename': filename,
@@ -940,6 +974,7 @@ class VideoProcessor:
                         'size_bytes': obj['Size'],
                         'size_mb': round(obj['Size'] / (1024 * 1024), 2),
                         'duration_seconds': duration,
+                        'creation_time': creation_time,
                         'duration_str': self._format_duration(duration) if duration else 'unknown',
                         'is_corrupted': False,  # Assume S3 files are valid
                         'corruption_error': None,
@@ -961,10 +996,175 @@ class VideoProcessor:
 
             chapters.sort(key=chapter_sort_key)
 
+            # Filter out old/leftover chapters from previous GoPro recordings.
+            # GoPro filenames embed a 4-digit group number (e.g., GX010097 = group 0097).
+            # If ch001 has a different group than ch002, it's from an old recording still
+            # on the SD card and should be excluded from the timeline.
+            chapters = self._filter_old_gopro_chapters(chapters, session_started_at=session_started_at)
+
             logger.info(f"Found {len(chapters)} chapters in S3 at {s3_prefix}")
 
         except Exception as e:
             logger.error(f"Error listing S3 chapters: {e}")
+
+        return chapters
+
+    @staticmethod
+    def _extract_gopro_group(filename: str) -> Optional[str]:
+        """
+        Extract GoPro recording group number from chapter filename.
+
+        GoPro filenames like 'chapter_001_GX010097.MP4' (H.264) or
+        'chapter_001_GH010097.MP4' (HEVC) contain a 4-digit group number (0097).
+        Chapters within the same recording share the same group or sequential
+        groups (e.g., 0097, 0098 for multi-group recordings).
+
+        Returns the group number string or None if not parseable.
+        """
+        # Match GoPro naming: GX/GH + 2-digit chapter-in-group + 4-digit group number
+        match = re.search(r'G[XH]\d{2}(\d{4})', filename, re.IGNORECASE)
+        return match.group(1) if match else None
+
+    @staticmethod
+    def _filter_old_gopro_chapters(
+        chapters: List[Dict[str, Any]],
+        session_started_at: Optional[datetime] = None
+    ) -> List[Dict[str, Any]]:
+        """
+        Filter out leftover chapters from previous GoPro recordings.
+
+        GoPro cameras keep old files on the SD card. When chapters are uploaded,
+        leading chapters may belong to older recording groups while later chapters
+        belong to the current recording. This causes phantom timeline that throws
+        off all offset calculations.
+
+        Primary detection: if session_started_at is provided, filter out any chapter
+        whose creation_time is more than 10 minutes before the session started.
+        This is the most reliable method as it compares against the actual session
+        start time from Firebase rather than relying on inter-chapter time gaps.
+
+        Secondary: use creation_time from ffprobe metadata to identify chapters from
+        different recording dates (6-hour threshold against last chapter).
+
+        Fallback: group-number heuristic for chapters without creation_time.
+        """
+        if len(chapters) < 2:
+            return chapters
+
+        # --- Strategy 1: creation_time-based filtering (most reliable) ---
+        from datetime import datetime, timedelta, timezone
+
+        parsed_times = []
+        for ch in chapters:
+            ct = ch.get('creation_time')
+            if ct:
+                try:
+                    # Handle both "2026-03-21T00:33:42.000000Z" and "2026-03-21T00:33:42Z"
+                    parsed = datetime.fromisoformat(ct.replace('Z', '+00:00'))
+                    parsed_times.append(parsed)
+                except (ValueError, TypeError):
+                    parsed_times.append(None)
+            else:
+                parsed_times.append(None)
+
+        valid_times = [(i, t) for i, t in enumerate(parsed_times) if t is not None]
+
+        # Strategy 1a: Compare against session startedAt (best method)
+        # Chapters recorded before the session started are definitely old leftovers.
+        if session_started_at and valid_times:
+            # Ensure session_started_at is timezone-aware
+            if session_started_at.tzinfo is None:
+                session_started_at = session_started_at.replace(tzinfo=timezone.utc)
+
+            session_threshold = timedelta(minutes=10)
+            keep_indices = set()
+            for i, t in valid_times:
+                # Keep chapters whose creation_time is within 10 min before session start or after
+                if t >= (session_started_at - session_threshold):
+                    keep_indices.add(i)
+
+            removed_count = len(valid_times) - len(keep_indices)
+            if keep_indices and removed_count > 0:
+                filtered = []
+                for i, ch in enumerate(chapters):
+                    if i in keep_indices:
+                        filtered.append(ch)
+                    else:
+                        logger.warning(
+                            f"Filtering out old chapter {ch['filename']} "
+                            f"(creation_time={ch.get('creation_time')}) — "
+                            f"session started at {session_started_at.isoformat()}. "
+                            f"Duration was {ch.get('duration_seconds', '?')}s"
+                        )
+                return filtered
+
+        # Strategy 1b: Compare against last chapter (fallback when no session time)
+        if len(valid_times) >= 2:
+            last_time = valid_times[-1][1]
+            threshold = timedelta(hours=6)
+
+            keep_indices = set()
+            for i, t in valid_times:
+                if abs(t - last_time) <= threshold:
+                    keep_indices.add(i)
+
+            removed_count = len(chapters) - len(keep_indices)
+            if keep_indices and removed_count > 0:
+                filtered = []
+                for i, ch in enumerate(chapters):
+                    if i in keep_indices:
+                        filtered.append(ch)
+                    else:
+                        logger.warning(
+                            f"Filtering out old chapter {ch['filename']} "
+                            f"(creation_time={ch.get('creation_time')}) — "
+                            f"current recording is {last_time.isoformat()}. "
+                            f"Duration was {ch.get('duration_seconds', '?')}s"
+                        )
+                return filtered
+
+        # --- Strategy 2: group-number heuristic (fallback) ---
+        groups = []
+        for ch in chapters:
+            group = VideoProcessor._extract_gopro_group(ch.get('filename', ''))
+            groups.append(group)
+
+        known_groups = [g for g in groups if g is not None]
+        if len(known_groups) < 2:
+            return chapters
+
+        last_group = groups[-1]
+        if last_group is None:
+            return chapters
+
+        # Walk from the end to find all groups that are part of the current recording
+        current_groups = set()
+        for g in reversed(groups):
+            if g is None:
+                break
+            if not current_groups or g in current_groups:
+                current_groups.add(g)
+            elif int(g) >= int(min(current_groups)) - 1:
+                current_groups.add(g)
+            else:
+                break
+
+        first_valid_idx = 0
+        for i, g in enumerate(groups):
+            if g is not None and g in current_groups:
+                first_valid_idx = i
+                break
+
+        if first_valid_idx > 0:
+            removed = chapters[:first_valid_idx]
+            for ch in removed:
+                logger.warning(
+                    f"Filtering out old chapter {ch['filename']} "
+                    f"(group {VideoProcessor._extract_gopro_group(ch.get('filename', ''))}) — "
+                    f"not in current recording groups {sorted(current_groups)}. "
+                    f"Duration was {ch.get('duration_seconds', '?')}s"
+                )
+            return chapters[first_valid_idx:]
 
         return chapters
 
@@ -1104,7 +1304,18 @@ class VideoProcessor:
         if s3_prefix and s3_client and bucket:
             # Chapters are in S3 - use presigned URLs
             logger.info(f"[{session_name}] Using S3 chapters from: {s3_prefix}")
-            return self.get_session_chapters_from_s3(s3_prefix, s3_client, bucket)
+            # Parse session startedAt for old chapter filtering
+            session_started_at = None
+            started_at_raw = session.get('startedAt')
+            if started_at_raw:
+                try:
+                    if isinstance(started_at_raw, str):
+                        session_started_at = datetime.fromisoformat(started_at_raw.replace('Z', '+00:00'))
+                    elif hasattr(started_at_raw, 'isoformat'):
+                        session_started_at = started_at_raw
+                except (ValueError, TypeError):
+                    pass
+            return self.get_session_chapters_from_s3(s3_prefix, s3_client, bucket, session_started_at=session_started_at)
         else:
             # Fall back to local chapters
             logger.info(f"[{session_name}] Using local chapters from disk")
@@ -1188,25 +1399,25 @@ def process_game_videos(
                     results['uball_game_id'] = uball_game_id
                     logger.info(f"[AUTO-SYNC] Found uballGameId in Firebase: {uball_game_id}")
                 else:
-                    # Create teams in Uball
+                    # Resolve teams in Uball (reuse existing, create only if not found)
                     left_team = firebase_game.get('leftTeam', {})
                     right_team = firebase_game.get('rightTeam', {})
                     team1_name = left_team.get('name', 'Team 1')
                     team2_name = right_team.get('name', 'Team 2')
 
-                    logger.info(f"[AUTO-SYNC] Creating teams: {team1_name} vs {team2_name}")
+                    logger.info(f"[AUTO-SYNC] Resolving teams: {team1_name} vs {team2_name}")
 
-                    created_team1 = uball_client.create_team(team1_name)
-                    if not created_team1:
-                        results['errors'].append(f"Failed to create team: {team1_name}")
+                    resolved_team1 = uball_client.get_or_create_team(team1_name)
+                    if not resolved_team1:
+                        results['errors'].append(f"Failed to resolve team: {team1_name}")
                         return results
-                    team1_id = str(created_team1.get('id'))
+                    team1_id = str(resolved_team1.get('id'))
 
-                    created_team2 = uball_client.create_team(team2_name)
-                    if not created_team2:
-                        results['errors'].append(f"Failed to create team: {team2_name}")
+                    resolved_team2 = uball_client.get_or_create_team(team2_name)
+                    if not resolved_team2:
+                        results['errors'].append(f"Failed to resolve team: {team2_name}")
                         return results
-                    team2_id = str(created_team2.get('id'))
+                    team2_id = str(resolved_team2.get('id'))
 
                     # Create game in Uball
                     created_at = firebase_game.get('createdAt', '')
@@ -1223,6 +1434,15 @@ def process_game_videos(
                         'source': 'firebase',
                         'video_name': f"{team1_name} vs {team2_name}"
                     }
+
+                    # Add team colors (color name for annotation tool classify endpoint)
+                    team1_color_name = left_team.get('jerseyColorName', '')
+                    team2_color_name = right_team.get('jerseyColorName', '')
+                    if team1_color_name:
+                        uball_game_data['team1_color'] = team1_color_name
+                    if team2_color_name:
+                        uball_game_data['team2_color'] = team2_color_name
+                    logger.info(f"[AUTO-SYNC] Team colors: {team1_color_name} vs {team2_color_name}")
 
                     # Add scores if available
                     if left_team.get('finalScore') is not None:
@@ -1305,6 +1525,32 @@ def process_game_videos(
 
         logger.info(f"Found {len(overlapping_sessions)} overlapping recording sessions")
 
+        # Filter by ANGLES_TO_PROCESS if configured
+        angles_to_process = os.getenv('ANGLES_TO_PROCESS', '').strip()
+        if angles_to_process and overlapping_sessions:
+            allowed = frozenset(a.strip().upper() for a in angles_to_process.split(',') if a.strip())
+            before_count = len(overlapping_sessions)
+            filtered_out = [s for s in overlapping_sessions if s.get('angleCode', '').upper() not in allowed]
+            overlapping_sessions = [s for s in overlapping_sessions if s.get('angleCode', '').upper() in allowed]
+            if filtered_out:
+                skipped_angles = [s.get('angleCode') for s in filtered_out]
+                logger.info(f"[ProcessGame] ANGLES_TO_PROCESS={allowed}: filtered out {skipped_angles} ({before_count} -> {len(overlapping_sessions)} sessions)")
+
+        # De-duplicate sessions per angle: keep only the most recent session for
+        # each angle.  This prevents old sessions from previous nights (which overlap
+        # due to wide endedAt timestamps) from being used when a newer session exists.
+        if overlapping_sessions:
+            best_per_angle = {}
+            for s in overlapping_sessions:
+                angle = s.get('angleCode', 'UNKNOWN')
+                existing = best_per_angle.get(angle)
+                if existing is None or s['parsed_start'] > existing['parsed_start']:
+                    best_per_angle[angle] = s
+            before_dedup = len(overlapping_sessions)
+            overlapping_sessions = list(best_per_angle.values())
+            if len(overlapping_sessions) < before_dedup:
+                logger.info(f"[ProcessGame] De-duplicated sessions by angle: {before_dedup} -> {len(overlapping_sessions)} (kept most recent per angle)")
+
         # Sort sessions to process FL/FR first (priority angles), then NL/NR
         # This ensures the main game angles are processed before supplementary angles
         angle_priority = {'FL': 0, 'FR': 1, 'NL': 2, 'NR': 3}
@@ -1321,6 +1567,48 @@ def process_game_videos(
             results['skip_reason'] = f"No recording sessions overlap with game timeframe on {jetson_id}"
             report_progress('completed', f'No videos found on {jetson_id} for this game timeframe (skipped)', 100)
             return results
+
+        # ============================================================
+        # GAME-LEVEL 1080p PRE-CHECK: If ALL angles already have 1080p
+        # files in S3, skip the entire game upfront. This avoids wasting
+        # time fetching chapters from S3 for already-processed games.
+        # ============================================================
+        if uball_game_id and upload_service:
+            try:
+                import boto3
+                from botocore.config import Config as BotoConfig
+                boto_config = BotoConfig(retries={'max_attempts': 2, 'mode': 'adaptive'})
+                s3_check = boto3.client('s3', config=boto_config, verify=False)
+                court_location = os.getenv('COURT_LOCATION', 'court-a')
+                uuid_parts = uball_game_id.split('-')[:4]
+                game_folder = '-'.join(uuid_parts)
+
+                unique_angles = {s.get('angleCode', '').upper() for s in overlapping_sessions}
+                all_exist = True
+                for angle in unique_angles:
+                    key_1080p = f"{court_location}/{game_date}/{game_folder}/{game_date}_{game_folder}_{angle}.mp4"
+                    try:
+                        s3_check.head_object(Bucket=upload_service.bucket_name, Key=key_1080p)
+                    except s3_check.exceptions.ClientError as e:
+                        error_code = e.response['Error']['Code']
+                        if error_code != '404':
+                            logger.warning(f"[SKIP-GAME] S3 error checking {angle} 1080p (code={error_code}): {e}")
+                        all_exist = False
+                        break
+
+                if all_exist and unique_angles:
+                    logger.info(f"[SKIP-GAME] All {len(unique_angles)} angles already have 1080p for game {firebase_game_id} — skipping entirely")
+                    results['success'] = True
+                    results['skipped'] = True
+                    results['skip_reason'] = 'all_angles_1080p_exist'
+                    for angle in unique_angles:
+                        results['processed_videos'].append({
+                            'angle': angle, 'status': 'skipped', 'skip_reason': '1080p_exists'
+                        })
+                    report_progress('completed', f'All {len(unique_angles)} angles already processed — skipped', 100)
+                    return results
+            except Exception as e:
+                logger.warning(f"[SKIP-GAME] Pre-check failed: {e} — proceeding with processing")
 
         report_progress('processing', f'Processing {len(overlapping_sessions)} video angles...', 15)
 

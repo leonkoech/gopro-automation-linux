@@ -35,7 +35,7 @@ class Config:
     AWS_BATCH_JOB_QUEUE = os.getenv('AWS_BATCH_JOB_QUEUE', 'gpu-transcode-queue')
     AWS_BATCH_JOB_QUEUE_LARGE = os.getenv('AWS_BATCH_JOB_QUEUE_LARGE', 'gpu-transcode-queue-large')
     AWS_BATCH_JOB_DEFINITION = os.getenv('AWS_BATCH_JOB_DEFINITION', 'ffmpeg-nvenc-transcode:17')
-    AWS_BATCH_JOB_DEFINITION_EXTRACT = os.getenv('AWS_BATCH_JOB_DEFINITION_EXTRACT', 'ffmpeg-extract-transcode:3')
+    AWS_BATCH_JOB_DEFINITION_EXTRACT = os.getenv('AWS_BATCH_JOB_DEFINITION_EXTRACT', 'ffmpeg-extract-transcode:11')
     AWS_BATCH_REGION = os.getenv('AWS_BATCH_REGION', 'us-east-1')
 
     # Court location
@@ -50,6 +50,15 @@ class Config:
     UBALL_BACKEND_URL = os.getenv('UBALL_BACKEND_URL')
     UBALL_AUTH_EMAIL = os.getenv('UBALL_AUTH_EMAIL')
     UBALL_AUTH_PASSWORD = os.getenv('UBALL_AUTH_PASSWORD')
+
+    # Angle filtering - comma-separated list of angles to process (e.g. "FL,FR")
+    # When set, only these angles are uploaded and processed; others are skipped.
+    # Default: None (all valid angles: FL, FR, NL, NR)
+    _angles_raw = os.getenv('ANGLES_TO_PROCESS', '').strip()
+    ANGLES_TO_PROCESS = (
+        frozenset(a.strip().upper() for a in _angles_raw.split(',') if a.strip())
+        if _angles_raw else None
+    )
 
     # Download configuration - optimized for GoPro USB connections
     DOWNLOAD_CHUNK_SIZE = 262144  # 256KB
