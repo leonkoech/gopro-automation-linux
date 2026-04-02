@@ -148,6 +148,7 @@ class MediaService:
     def delete_gopro_all_files(self, gopro_ip: str) -> Dict[str, Any]:
         """
         Delete ALL files from GoPro (use with caution!).
+        Tries bulk delete first, falls back to deleting files one by one.
 
         Args:
             gopro_ip: IP address of the GoPro
@@ -155,18 +156,57 @@ class MediaService:
         Returns:
             Dict with result
         """
+        # Try bulk delete first
         try:
             response = requests.get(
                 f'http://{gopro_ip}:8080/gopro/media/delete/all',
-                timeout=60
+                timeout=120
             )
             if response.status_code == 200:
                 return {
                     'success': True,
                     'message': 'All files deleted from GoPro'
                 }
-            else:
-                return {'success': False, 'error': f'Failed to delete all: {response.status_code}'}
+            print(f"Bulk delete returned {response.status_code}, falling back to individual delete")
+        except Exception as e:
+            print(f"Bulk delete failed ({e}), falling back to individual delete")
+
+        # Fallback: delete files one by one
+        try:
+            media_list = self.get_gopro_media_list(gopro_ip)
+            if not media_list.get('success'):
+                return {'success': False, 'error': f'Could not list files: {media_list.get("error")}'}
+
+            files = media_list.get('files', [])
+            if not files:
+                return {'success': True, 'message': 'No files to delete'}
+
+            deleted = 0
+            errors = []
+            for f in files:
+                path = f"{f['directory']}/{f['filename']}"
+                try:
+                    r = requests.get(
+                        f'http://{gopro_ip}:8080/gopro/media/delete/file?path={path}',
+                        timeout=30
+                    )
+                    if r.status_code == 200:
+                        deleted += 1
+                    else:
+                        errors.append(f"{path}: HTTP {r.status_code}")
+                except Exception as e:
+                    errors.append(f"{path}: {e}")
+
+            if errors:
+                return {
+                    'success': deleted > 0,
+                    'message': f'Deleted {deleted}/{len(files)} files',
+                    'errors': errors
+                }
+            return {
+                'success': True,
+                'message': f'Deleted {deleted} files from GoPro'
+            }
         except Exception as e:
             return {'success': False, 'error': str(e)}
 
