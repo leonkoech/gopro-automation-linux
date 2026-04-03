@@ -317,6 +317,15 @@ class VideoProcessor:
 
             current_time = chapter_end_time
 
+        # Include one extra chapter after the last needed one as buffer.
+        # The FFmpeg concat demuxer with HTTP presigned URLs can lose frames
+        # at chapter boundaries, so an extra trailing chapter ensures the
+        # full game duration is captured even if some data is lost in transit.
+        if end_chapter_idx is not None and end_chapter_idx + 1 < len(chapters):
+            next_chapter = chapters[end_chapter_idx + 1]
+            chapters_needed.append(next_chapter)
+            logger.info(f"  Added trailing buffer chapter (index {end_chapter_idx + 1}) for concat reliability")
+
         # Calculate offset relative to the first needed chapter (not recording start)
         # This is the seek position within the concatenated needed chapters
         offset_relative_to_chapters = offset_from_recording_start - first_chapter_start_time
