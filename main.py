@@ -2006,6 +2006,23 @@ def sync_game_to_uball():
                 uball_game_data['team1_score'] = score.get('home', score.get('team1'))
                 uball_game_data['team2_score'] = score.get('away', score.get('team2'))
 
+        # 4.5. Pass through roster and display names from Firebase game (check-in data)
+        roster_team1 = firebase_game.get('rosterTeam1')
+        roster_team2 = firebase_game.get('rosterTeam2')
+        if roster_team1:
+            uball_game_data['roster_team1'] = roster_team1
+            logger.info(f"[GameSync] Passing roster_team1 ({len(roster_team1)} players)")
+        if roster_team2:
+            uball_game_data['roster_team2'] = roster_team2
+            logger.info(f"[GameSync] Passing roster_team2 ({len(roster_team2)} players)")
+
+        left_display = left_team.get('displayName', '')
+        right_display = right_team.get('displayName', '')
+        if left_display:
+            uball_game_data['team1_display_name'] = left_display
+        if right_display:
+            uball_game_data['team2_display_name'] = right_display
+
         # 5. Create game in Uball Backend
         logger.info(f"[GameSync] Step 5: Creating game in Uball Backend...")
         logger.info(f"[GameSync] Payload: team1={team1_id}, team2={team2_id}, date={game_date}, video_name={uball_game_data.get('video_name')}")
