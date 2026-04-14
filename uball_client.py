@@ -358,6 +358,40 @@ class UballClient:
             logger.error(f"[UballClient] Create team error: {e}")
             return None
 
+    def list_plays(self, game_id: str) -> List[Dict[str, Any]]:
+        """
+        List all plays (cards) for a game in the annotation tool.
+
+        Args:
+            game_id: Uball game UUID
+
+        Returns:
+            List of play dicts (may be empty). Returns [] on auth/HTTP failure.
+        """
+        if not self._ensure_authenticated():
+            return []
+        try:
+            response = requests.get(
+                f"{self.backend_url}/api/plays/",
+                params={"game_id": game_id},
+                headers=self._get_headers(),
+                timeout=10,
+            )
+            if response.status_code == 200:
+                data = response.json()
+                if isinstance(data, list):
+                    return data
+                if isinstance(data, dict) and "plays" in data:
+                    return data.get("plays") or []
+            else:
+                logger.warning(
+                    f"[UballClient] list_plays {game_id} returned {response.status_code}: {response.text[:200]}"
+                )
+            return []
+        except Exception as e:
+            logger.error(f"[UballClient] list_plays failed: {e}")
+            return []
+
     def create_play(self, play_data: Dict[str, Any]) -> Dict[str, Any]:
         """
         Create a play in the annotation tool.

@@ -1505,6 +1505,18 @@ def process_game_videos(
         logger.info(f"  Start: {game_start}, End: {game_end}")
         logger.info(f"  Duration: {(game_end - game_start).total_seconds() / 60:.1f} minutes")
 
+        # Auto-create annotation-tool plays ("cards") from Firebase game logs.
+        # Idempotent via list_plays check inside create_plays_from_firebase_logs.
+        # Failures are logged but never block video processing.
+        if uball_client and uball_game_id and game.get('logs'):
+            try:
+                from plays_sync import create_plays_from_firebase_logs
+                plays_added = create_plays_from_firebase_logs(uball_client, uball_game_id, game)
+                logger.info(f"[AUTO-PLAYS] {plays_added} plays created for game {firebase_game_id}")
+                results['plays_created'] = plays_added
+            except Exception as e:
+                logger.warning(f"[AUTO-PLAYS] Failed to auto-create plays for {firebase_game_id}: {e}")
+
         report_progress('finding_sessions', 'Finding overlapping recording sessions...', 10)
 
         # 2. Find overlapping recording sessions
