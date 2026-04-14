@@ -4,6 +4,11 @@ on:
   schedule:
     - cron: '*/15 * * * *'
   workflow_dispatch:
+    inputs:
+      force_test_alert:
+        description: 'Force an alert email by monitoring a fake offline Jetson (for testing SMTP end-to-end)'
+        type: boolean
+        default: false
 
 concurrency:
   group: monitor-jetsons
@@ -20,7 +25,9 @@ jobs:
       - name: Connect Tailscale
         uses: tailscale/github-action@v3
         with:
-          authkey: ${{ secrets.TAILSCALE_AUTH_KEY }}
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci
           hostname: github-monitor-${{ github.run_id }}
 
       - name: Run health check
@@ -32,4 +39,5 @@ jobs:
           SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
           SMTP_FROM_EMAIL: ${{ secrets.SMTP_FROM_EMAIL }}
           ALERT_TO_EMAIL: ${{ secrets.ALERT_TO_EMAIL }}
+          JETSON_DEVICES: ${{ inputs.force_test_alert && '[{"name":"TEST — SMTP verification","tailscale_hostname":"does-not-exist","tailscale_ip":"100.0.0.1"}]' || '' }}
         run: python3 scripts/monitor/monitor_jetsons.py
