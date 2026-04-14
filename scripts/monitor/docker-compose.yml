@@ -1,0 +1,12 @@
+services:
+  monitor:
+    build: .
+    image: uball-jetson-monitor:local
+    env_file:
+      - .env
+    # Tailscale userspace networking requires NET_ADMIN for iptables rules.
+    cap_add:
+      - NET_ADMIN
+      - SYS_MODULE
+    # Cron-style one-shot: container exits after single check.
+    restart: "no"
