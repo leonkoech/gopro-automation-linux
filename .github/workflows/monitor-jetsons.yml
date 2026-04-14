@@ -2,7 +2,8 @@ name: Monitor Jetsons & GoPros
 
 on:
   schedule:
-    - cron: '*/15 * * * *'
+    # Off-peak minutes to dodge GitHub Actions top-of-hour cron congestion
+    - cron: '7,22,37,52 * * * *'
   workflow_dispatch:
     inputs:
       force_test_alert:
