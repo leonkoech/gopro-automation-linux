@@ -12,7 +12,9 @@ Environment variables:
     SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASSWORD, SMTP_FROM_EMAIL
     ALERT_TO_EMAIL          — recipient (default: courtside@uai.tech)
     EXPECTED_GOPROS_PER_JETSON (default: 2)
-    CHECK_TIMEOUT           — seconds (default: 15)
+    CHECK_TIMEOUT           — seconds per HTTP attempt (default: 20)
+    CHECK_RETRIES           — extra retries after first failure (default: 2)
+    CHECK_RETRY_BACKOFF_SEC — seconds between retries (default: 3)
     STALE_THRESHOLD_MIN     — minutes before a device is considered offline (default: 5)
 """
 
@@ -23,9 +25,9 @@ import logging
 import os
 import smtplib
 import ssl
-import sys
+import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from typing import Optional
@@ -59,7 +61,9 @@ SMTP_FROM_EMAIL = os.environ.get("SMTP_FROM_EMAIL", "Courtside@uai.tech")
 ALERT_TO_EMAIL = os.environ.get("ALERT_TO_EMAIL", "courtside@uai.tech")
 
 EXPECTED_GOPROS = int(os.environ.get("EXPECTED_GOPROS_PER_JETSON", "2"))
-CHECK_TIMEOUT = int(os.environ.get("CHECK_TIMEOUT", "15"))
+CHECK_TIMEOUT = int(os.environ.get("CHECK_TIMEOUT", "20"))
+CHECK_RETRIES = int(os.environ.get("CHECK_RETRIES", "2"))
+CHECK_RETRY_BACKOFF_SEC = float(os.environ.get("CHECK_RETRY_BACKOFF_SEC", "3"))
 STALE_THRESHOLD_MIN = int(os.environ.get("STALE_THRESHOLD_MIN", "5"))
 
 
@@ -107,38 +111,46 @@ def get_tailscale_devices() -> dict[str, dict]:
 
 # --- GoPro check via direct Tailscale IP ---
 
+def _fetch_json(url: str, attempts: int) -> tuple[Optional[dict], Optional[Exception]]:
+    """GET a JSON endpoint with retries. Returns (data, last_error)."""
+    last_exc: Optional[Exception] = None
+    for i in range(attempts):
+        try:
+            req = Request(url, headers={"Accept": "application/json"})
+            with urlopen(req, timeout=CHECK_TIMEOUT) as resp:
+                return json.loads(resp.read()), None
+        except (URLError, OSError, json.JSONDecodeError, TimeoutError) as exc:
+            last_exc = exc
+            if i < attempts - 1:
+                log.warning("Retry %d/%d for %s: %s", i + 1, attempts - 1, url, exc)
+                time.sleep(CHECK_RETRY_BACKOFF_SEC)
+    return None, last_exc
+
+
 def check_gopros(tailscale_ip: str) -> tuple[int, tuple[str, ...], Optional[float], Optional[str]]:
     """Query Jetson's /api/gopros and /api/system/info via Tailscale IP.
 
-    Returns (gopro_count, gopro_names, disk_free_gb, error).
+    Retries transient failures so a single slow/busy response doesn't trigger
+    a false alert. Returns (gopro_count, gopro_names, disk_free_gb, error).
+    When ``error`` is set, ``gopro_count`` and ``gopro_names`` are unknown —
+    callers must not treat them as "zero GoPros connected".
     """
     base = f"http://{tailscale_ip}:5000"
-    gopro_count = 0
-    gopro_names: tuple[str, ...] = ()
-    disk_free_gb: Optional[float] = None
-    error: Optional[str] = None
+    attempts = max(1, 1 + CHECK_RETRIES)
 
-    # GoPro status
-    try:
-        req = Request(f"{base}/api/gopros", headers={"Accept": "application/json"})
-        with urlopen(req, timeout=CHECK_TIMEOUT) as resp:
-            data = json.loads(resp.read())
-        gopros = data.get("gopros", [])
-        gopro_count = len(gopros)
-        gopro_names = tuple(g.get("name", g.get("id", "unknown")) for g in gopros)
-    except (URLError, OSError, json.JSONDecodeError, TimeoutError) as exc:
-        error = f"GoPro check failed: {exc}"
+    data, exc = _fetch_json(f"{base}/api/gopros", attempts)
+    if data is None:
+        return 0, (), None, f"GoPro check failed: {exc}"
 
-    # System info (disk space)
-    try:
-        req = Request(f"{base}/api/system/info", headers={"Accept": "application/json"})
-        with urlopen(req, timeout=CHECK_TIMEOUT) as resp:
-            data = json.loads(resp.read())
-        disk_free_gb = data.get("system", {}).get("disk_free_gb")
-    except (URLError, OSError, json.JSONDecodeError, TimeoutError):
-        pass  # Non-critical — disk check is bonus info
+    gopros = data.get("gopros", [])
+    gopro_count = len(gopros)
+    gopro_names = tuple(g.get("name", g.get("id", "unknown")) for g in gopros)
 
-    return gopro_count, gopro_names, disk_free_gb, error
+    # Disk space is non-critical — single attempt, swallow errors.
+    info, _ = _fetch_json(f"{base}/api/system/info", 1)
+    disk_free_gb = info.get("system", {}).get("disk_free_gb") if info else None
+
+    return gopro_count, gopro_names, disk_free_gb, None
 
 
 # --- Main check ---
@@ -233,7 +245,12 @@ def build_alert(statuses: list[JetsonStatus]) -> Optional[str]:
     body += "\nAll Jetson Status:\n"
     for s in statuses:
         status_str = "ONLINE" if s.tailscale_online else "OFFLINE"
-        gopro_info = f"{s.gopro_count} GoPros" if s.tailscale_online else "N/A"
+        if not s.tailscale_online:
+            gopro_info = "N/A"
+        elif s.gopro_error:
+            gopro_info = "GoPro check unreachable"
+        else:
+            gopro_info = f"{s.gopro_count} GoPros"
         disk_info = f"{s.disk_free_gb:.1f}GB free" if s.disk_free_gb else "N/A"
         body += f"  {s.name}: {status_str} | {gopro_info} | {disk_info}\n"
 
@@ -272,26 +289,35 @@ def main() -> None:
     statuses = check_all_jetsons()
 
     for s in statuses:
-        if s.tailscale_online:
+        if not s.tailscale_online:
+            log.warning("%s: OFFLINE — last seen %.0f min ago",
+                        s.name, s.last_seen_ago_min or -1)
+        elif s.gopro_error:
+            log.warning("%s: ONLINE but GoPro API unreachable — %s",
+                        s.name, s.gopro_error)
+        else:
             log.info(
                 "%s: ONLINE | %d GoPros (%s) | %s",
                 s.name, s.gopro_count,
                 ", ".join(s.gopro_names) or "none",
                 f"{s.disk_free_gb:.1f} GB free" if s.disk_free_gb else "disk N/A",
             )
-        else:
-            log.warning("%s: OFFLINE — last seen %.0f min ago",
-                        s.name, s.last_seen_ago_min or -1)
 
     alert_body = build_alert(statuses)
     if alert_body:
         offline = [s.name for s in statuses if not s.tailscale_online]
-        low_gopros = [s.name for s in statuses if s.tailscale_online and s.gopro_count < EXPECTED_GOPROS]
+        unreachable = [s.name for s in statuses if s.tailscale_online and s.gopro_error]
+        low_gopros = [
+            s.name for s in statuses
+            if s.tailscale_online and not s.gopro_error and s.gopro_count < EXPECTED_GOPROS
+        ]
 
         if offline:
             subject = f"UBALL Alert: {', '.join(offline)} OFFLINE"
         elif low_gopros:
             subject = f"UBALL Alert: GoPro disconnected on {', '.join(low_gopros)}"
+        elif unreachable:
+            subject = f"UBALL Alert: {', '.join(unreachable)} API unreachable"
         else:
             subject = "UBALL Alert: Jetson/GoPro Issue Detected"
 
