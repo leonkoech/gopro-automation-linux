@@ -190,7 +190,27 @@ class ChapterUploadService:
                         'local_path': local_path,
                         'bytes_downloaded': current_size
                     }
-                
+
+                # Hard-fail on HTTP error responses (4xx/5xx except 416).
+                # Without this, a 404 from the GoPro (file missing on the SD
+                # card) would have its tiny HTML error body appended to the
+                # local partial file in an infinite loop, because the
+                # "made progress" check below would reset consecutive_failures
+                # on every 30-byte error body. See the 2026-04-15 incident
+                # where two pipelines spun for ~36 hours on missing chapters.
+                if response.status_code >= 400 and response.status_code != 416:
+                    consecutive_failures += 1
+                    logger.warning(
+                        f"  GoPro returned HTTP {response.status_code} for {filename} "
+                        f"on attempt {total_attempts} "
+                        f"(consecutive failures: {consecutive_failures}/{MAX_DOWNLOAD_RETRIES})"
+                    )
+                    if consecutive_failures < MAX_DOWNLOAD_RETRIES:
+                        wait_time = min(2 ** min(consecutive_failures, 5), 30)
+                        logger.info(f"  Waiting {wait_time}s before retry...")
+                        time.sleep(wait_time)
+                    continue
+
                 if current_size > 0 and response.status_code != 206:
                     logger.warning(f"  Server returned {response.status_code} instead of 206, will append anyway")
                 
@@ -252,8 +272,13 @@ class ChapterUploadService:
                         'bytes_downloaded': final_size
                     }
                 elif expected_size > 0:
-                    # Progress was made if bytes_written > 0 — reset consecutive failures
-                    if bytes_written > 0:
+                    # Only count meaningful progress (>= 1 MB) toward resetting
+                    # the failure counter — small byte gains can come from HTTP
+                    # framing or error bodies after a non-206 resume and would
+                    # otherwise spin forever. Defense-in-depth in addition to
+                    # the 4xx/5xx hard-fail above.
+                    PROGRESS_RESET_THRESHOLD = 1024 * 1024  # 1 MB
+                    if bytes_written >= PROGRESS_RESET_THRESHOLD:
                         logger.info(f"  Incomplete but made progress ({bytes_written/1024/1024:.0f} MB) — resetting retry counter")
                         consecutive_failures = 0
                     else:
