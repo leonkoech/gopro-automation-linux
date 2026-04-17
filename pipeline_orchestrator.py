@@ -659,6 +659,7 @@ class PipelineOrchestrator:
                         'status': 'batch_submitted' if batch_jobs else 'completed',
                         'batch_jobs': [j.get('job_id') for j in batch_jobs],
                         'batch_jobs_info': batch_jobs,  # Full info for polling/registration
+                        'uball_game_id': result.get('uball_game_id'),
                         'angles_processed': {
                             v.get('angle'): {
                                 'status': 'batch_submitted' if batch_jobs else 'completed',
@@ -787,6 +788,10 @@ class PipelineOrchestrator:
                         })
                         logger.info(f"[Pipeline {pipeline_id}] Firebase updated with batch results: {games_newly_completed} games completed, {games_newly_failed} failed")
 
+                        # Annotator email: games are now registered in Uball
+                        # and ready for annotation.
+                        self._send_annotator_notification(pipeline_id)
+
                     except Exception as e:
                         logger.error(f"[Pipeline {pipeline_id}] Batch poller error: {e}")
 
@@ -859,6 +864,12 @@ class PipelineOrchestrator:
 
         logger.info(f"[Pipeline {pipeline_id}] Completed successfully")
 
+        # Annotator email: only fire here when there are no pending batch jobs.
+        # When batch jobs are in flight, the batch poller thread owns the send
+        # (games aren't actually registered in Uball until then).
+        if batch_jobs_count == 0:
+            self._send_annotator_notification(pipeline_id)
+
         # Keep pipeline in memory for 5 minutes so frontend can poll final status
         # This prevents race condition where pipeline completes before frontend polls
         def cleanup_after_delay():
@@ -885,6 +896,62 @@ class PipelineOrchestrator:
         except Exception as e:
             logger.warning(f"Failed to delete files from GoPro at {gopro_ip}: {e}")
             raise
+
+    def _send_annotator_notification(self, pipeline_id: str) -> None:
+        """Email the annotator with ready + failed games for this pipeline.
+
+        Idempotent: a per-pipeline flag prevents double-sends if the batch
+        poller and the synchronous completion path both hit this method.
+        Never raises — email failure must not crash the pipeline.
+        """
+        try:
+            from email_notifier import GameNotification, send_games_ready_email
+
+            with self._lock:
+                p = self._pipelines.get(pipeline_id)
+                if not p:
+                    return
+                if p.get('annotator_notified'):
+                    return
+                p['annotator_notified'] = True  # Claim the slot before sending
+                games = dict(p.get('games', {}))
+                jetson_name = p.get('jetson_name') or p.get('jetson_id') or ''
+                recording_start = p.get('recording_start') or ''
+
+            if not games:
+                return
+
+            recording_date = recording_start[:10] if recording_start else ''
+            if not recording_date:
+                recording_date = datetime.now().strftime('%Y-%m-%d')
+
+            ready: list = []
+            failed: list = []
+            for g in games.values():
+                notif = GameNotification(
+                    game_number=g.get('game_number', 0),
+                    team_a_name=g.get('team_a_name', '') or '',
+                    team_b_name=g.get('team_b_name', '') or '',
+                    uball_game_id=g.get('uball_game_id'),
+                    error=g.get('error'),
+                )
+                status = g.get('status', '')
+                if status == 'completed':
+                    ready.append(notif)
+                elif status == 'failed':
+                    failed.append(notif)
+                # 'pending'/'extracting'/'batch_submitted' → don't report yet
+
+            send_games_ready_email(
+                jetson_name=jetson_name,
+                recording_date=recording_date,
+                ready_games=ready,
+                failed_games=failed,
+            )
+        except Exception as exc:
+            logger.warning(
+                f"[Pipeline {pipeline_id}] Annotator email skipped: {exc}"
+            )
 
     def _firebase_sync_full_state(self, pipeline_id: str):
         """Sync complete sessions/games/bytes/game-counts state to Firebase."""
