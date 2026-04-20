@@ -102,6 +102,43 @@ def _make_session_state(session: Dict[str, Any]) -> SessionPipelineState:
     )
 
 
+def _apply_batch_result_to_games(
+    games: Dict[str, Dict[str, Any]],
+    batch_result: Dict[str, Any],
+) -> Dict[str, Dict[str, Any]]:
+    """Flip ``batch_submitted`` game statuses based on AWS Batch outcomes.
+
+    Pure function — operates on a shallow copy of ``games`` so callers retain
+    the original. If all of a game's batch jobs succeeded, status becomes
+    ``completed``; if any failed, status becomes ``failed``; otherwise the
+    status is left unchanged.
+    """
+    completed_ids = {
+        j['job_id']
+        for j in batch_result.get('completed_jobs', []) or []
+        if j.get('job_id')
+    }
+    failed_ids = {
+        j['job_id']
+        for j in batch_result.get('failed_jobs', []) or []
+        if j.get('job_id')
+    }
+    terminal_ids = completed_ids | failed_ids
+
+    updated: Dict[str, Dict[str, Any]] = {}
+    for gid, g in games.items():
+        g2 = dict(g)
+        if g2.get('status') == 'batch_submitted':
+            batch_ids = set(g2.get('batch_jobs', []) or [])
+            if batch_ids and batch_ids <= terminal_ids:
+                if batch_ids & failed_ids:
+                    g2['status'] = 'failed'
+                else:
+                    g2['status'] = 'completed'
+        updated[gid] = g2
+    return updated
+
+
 class PipelineStage(str, Enum):
     """Pipeline execution stages."""
     INITIALIZING = 'initializing'
@@ -735,6 +772,23 @@ class PipelineOrchestrator:
             if all_batch_jobs and self.uball_client:
                 from video_processing import poll_and_register_batch_jobs
 
+                # Capture an immutable snapshot of the data the annotator email
+                # needs BEFORE the 5-minute eviction timer runs down. AWS Batch
+                # can take 10+ minutes, so by the time the poller returns the
+                # in-memory pipeline may be gone (see _run_pipeline's
+                # cleanup_after_delay). Capturing here — while the pipeline is
+                # still alive — decouples the email from that race.
+                with self._lock:
+                    p0 = self._pipelines.get(pipeline_id)
+                    if p0 is not None:
+                        notification_snapshot = {
+                            'games': {gid: dict(g) for gid, g in p0.get('games', {}).items()},
+                            'jetson_name': p0.get('jetson_name') or p0.get('jetson_id') or '',
+                            'recording_start': p0.get('recording_start') or '',
+                        }
+                    else:
+                        notification_snapshot = None
+
                 def poll_and_register():
                     try:
                         result = poll_and_register_batch_jobs(
@@ -789,8 +843,15 @@ class PipelineOrchestrator:
                         logger.info(f"[Pipeline {pipeline_id}] Firebase updated with batch results: {games_newly_completed} games completed, {games_newly_failed} failed")
 
                         # Annotator email: games are now registered in Uball
-                        # and ready for annotation.
-                        self._send_annotator_notification(pipeline_id)
+                        # and ready for annotation. Pass the pre-captured
+                        # snapshot + batch result so the email fires even if
+                        # the in-memory pipeline was evicted while we waited
+                        # on AWS Batch.
+                        self._send_annotator_notification(
+                            pipeline_id,
+                            snapshot=notification_snapshot,
+                            batch_result=result,
+                        )
 
                     except Exception as e:
                         logger.error(f"[Pipeline {pipeline_id}] Batch poller error: {e}")
@@ -897,26 +958,51 @@ class PipelineOrchestrator:
             logger.warning(f"Failed to delete files from GoPro at {gopro_ip}: {e}")
             raise
 
-    def _send_annotator_notification(self, pipeline_id: str) -> None:
+    def _send_annotator_notification(
+        self,
+        pipeline_id: str,
+        snapshot: Optional[Dict[str, Any]] = None,
+        batch_result: Optional[Dict[str, Any]] = None,
+    ) -> None:
         """Email the annotator with ready + failed games for this pipeline.
 
-        Idempotent: a per-pipeline flag prevents double-sends if the batch
-        poller and the synchronous completion path both hit this method.
-        Never raises — email failure must not crash the pipeline.
+        Two call paths:
+
+        1. No-batch (synchronous completion): ``snapshot`` is None. We read
+           current game state from ``self._pipelines[pipeline_id]``.
+        2. Batch poller (asynchronous): ``snapshot`` is a pre-captured dict of
+           the pipeline's games + metadata, taken before the poller started
+           blocking on AWS. This path survives the 5-minute in-memory
+           eviction — the poller often returns AFTER eviction, in which case
+           ``self._pipelines[pipeline_id]`` is gone. ``batch_result`` carries
+           the poller's completed/failed job info so we can flip
+           ``batch_submitted`` game statuses to ``completed`` / ``failed``.
+
+        Never raises — email failure must not crash the pipeline. The two
+        call paths are mutually exclusive (batch present vs. absent) so no
+        idempotency guard is needed.
         """
         try:
             from email_notifier import GameNotification, send_games_ready_email
 
-            with self._lock:
-                p = self._pipelines.get(pipeline_id)
-                if not p:
-                    return
-                if p.get('annotator_notified'):
-                    return
-                p['annotator_notified'] = True  # Claim the slot before sending
-                games = dict(p.get('games', {}))
-                jetson_name = p.get('jetson_name') or p.get('jetson_id') or ''
-                recording_start = p.get('recording_start') or ''
+            if snapshot is not None:
+                games = {gid: dict(g) for gid, g in snapshot.get('games', {}).items()}
+                jetson_name = snapshot.get('jetson_name', '')
+                recording_start = snapshot.get('recording_start', '')
+                if batch_result is not None:
+                    games = _apply_batch_result_to_games(games, batch_result)
+            else:
+                with self._lock:
+                    p = self._pipelines.get(pipeline_id)
+                    if not p:
+                        logger.warning(
+                            f"[Pipeline {pipeline_id}] Annotator email skipped: "
+                            "pipeline evicted from memory and no snapshot provided"
+                        )
+                        return
+                    games = dict(p.get('games', {}))
+                    jetson_name = p.get('jetson_name') or p.get('jetson_id') or ''
+                    recording_start = p.get('recording_start') or ''
 
             if not games:
                 return
