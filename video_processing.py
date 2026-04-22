@@ -289,54 +289,266 @@ class VideoProcessor:
         recording_start: datetime,
         chapters: List[Dict[str, Any]]
     ) -> Dict[str, Any]:
-        """
-        Calculate FFmpeg extraction parameters.
+        """Calculate FFmpeg extraction parameters using per-chapter creation_time.
 
-        Args:
-            game_start: When the game started
-            game_end: When the game ended
-            recording_start: When the recording session started
-            chapters: List of chapter files with durations
+        Maps the game window to chapter(s) using each chapter's wall-clock
+        ``creation_time`` (from MP4 metadata via ffprobe) plus its playback
+        ``duration_seconds``. This is gap-aware: when a recording session
+        contains multiple GoPro recordings separated by stop/start gaps (false
+        starts, battery swaps, SD-card reshoots), the math still resolves the
+        right chapter and offset instead of treating all chapters as
+        contiguous from ``recording_start``.
 
-        Returns:
-            Dict with:
-                - offset_seconds: Seek position RELATIVE to first needed chapter
-                - duration_seconds: Length of game clip
-                - chapters_needed: List of chapter files needed
-                - start_chapter_index: Index of first chapter
-                - end_chapter_index: Index of last chapter
+        Falls back to the legacy contiguous-chapter math only when one or more
+        chapters are missing ``creation_time`` — that branch is lossy when
+        there are gaps and only exists so on-disk / pre-ffprobe callers keep
+        working.
+
+        Returns a dict with ``offset_seconds`` (seek position into the concat
+        stream built from ``chapters_needed``), ``duration_seconds``,
+        ``chapters_needed`` (includes a trailing buffer chapter when one
+        exists), and index / count metadata for logging.
         """
-        # Calculate offset from recording start to game start
+        from datetime import timezone as _tz
+
+        # Tz-normalize inputs (callers usually pass UTC, but be defensive)
+        if game_start.tzinfo is None:
+            game_start = game_start.replace(tzinfo=_tz.utc)
+        if game_end.tzinfo is None:
+            game_end = game_end.replace(tzinfo=_tz.utc)
+        if recording_start.tzinfo is None:
+            recording_start = recording_start.replace(tzinfo=_tz.utc)
+
+        # Parse creation_time per chapter. If *any* chapter is missing it,
+        # we cannot build a wall-clock timeline — fall back to legacy math.
+        parsed: List[Optional[Dict[str, Any]]] = []
+        for i, ch in enumerate(chapters):
+            ct_str = ch.get('creation_time')
+            dur = float(ch.get('duration_seconds') or 0)
+            if not ct_str or dur <= 0:
+                parsed.append(None)
+                continue
+            try:
+                ct = datetime.fromisoformat(ct_str.replace('Z', '+00:00'))
+            except (ValueError, TypeError):
+                parsed.append(None)
+                continue
+            if ct.tzinfo is None:
+                ct = ct.replace(tzinfo=_tz.utc)
+            parsed.append({
+                'idx': i,
+                'chapter': ch,
+                'creation_time': ct,
+                'duration': dur,
+            })
+
+        if any(p is None for p in parsed):
+            missing = sum(1 for p in parsed if p is None)
+            logger.warning(
+                f"calculate_extraction_params: {missing}/{len(parsed)} "
+                f"chapters missing creation_time/duration — using legacy "
+                f"contiguous math. Offsets will be wrong if there are "
+                f"inter-recording gaps."
+            )
+            return self._calculate_extraction_params_legacy(
+                game_start, game_end, recording_start, chapters
+            )
+
+        # GoPro stamps *every* chapter in a recording with the recording's
+        # start time — so chapters 2..N of one recording share creation_time
+        # with chapter 1. Compute each chapter's real wall-clock start by
+        # walking in filename order and accumulating durations inside a
+        # shared-creation_time run. A change in creation_time marks a new
+        # recording (camera was stopped & restarted — possible gap).
+        #
+        # Sort by (creation_time, filename) BEFORE the accumulation walk so
+        # we handle callers that pass chapters in arbitrary order correctly.
+        # Filename is a safe tiebreaker: GoPro's GX01NNNN / GX02NNNN / ...
+        # naming means alphabetic filename order == chapter order inside a
+        # recording. A tolerance of 2s on creation_time equality guards
+        # against sub-second ffprobe drift between consecutive chapters of
+        # the same recording (rare but observed).
+        parsed.sort(key=lambda p: (p['creation_time'], p['chapter'].get('filename', '')))
+
+        creation_time_tolerance = timedelta(seconds=2)
+        prev_end: Optional[datetime] = None
+        prev_ct: Optional[datetime] = None
+        for p in parsed:
+            if (prev_ct is not None and prev_end is not None
+                    and abs(p['creation_time'] - prev_ct) <= creation_time_tolerance):
+                # Continuation of the same recording — resume from prior end.
+                p['start'] = prev_end
+            else:
+                # New recording — anchor to its stamped creation_time.
+                p['start'] = p['creation_time']
+            p['end'] = p['start'] + timedelta(seconds=p['duration'])
+            prev_ct = p['creation_time']
+            prev_end = p['end']
+
+        # Re-sort by the computed wall-clock start for overlap detection.
+        # (Identical to above when input was ordered; different when it
+        # wasn't — we trust the accumulation-derived timeline.)
+        parsed.sort(key=lambda p: p['start'])
+
+        duration = max(0.0, (game_end - game_start).total_seconds())
+
+        # Select chapters overlapping the game window:
+        #   chapter.start < game_end AND chapter.end > game_start
+        needed = [p for p in parsed if p['start'] < game_end and p['end'] > game_start]
+
+        # Nothing overlaps — log available range so caller can diagnose.
+        if not needed:
+            available = (
+                f"{parsed[0]['start'].isoformat()} → {parsed[-1]['end'].isoformat()}"
+                if parsed else "(no chapters)"
+            )
+            logger.warning(
+                f"No chapter overlaps game window {game_start.isoformat()} "
+                f"→ {game_end.isoformat()}. Available: {available}"
+            )
+            return {
+                'offset_seconds': 0.0,
+                'duration_seconds': duration,
+                'offset_str': self._format_duration(0),
+                'duration_str': self._format_duration(duration),
+                'chapters_needed': [],
+                'start_chapter_index': None,
+                'end_chapter_index': None,
+                'total_chapters': len(chapters),
+                'chapters_to_process': 0,
+                'offset_from_recording_start': None,
+                'first_chapter_start_time': None,
+            }
+
+        # Warn loudly on inter-chapter gaps — the concat stream will jump
+        # over them and the emitted clip will skip that wall-clock span.
+        gap_warn_seconds = 2.0
+        for a, b in zip(needed, needed[1:]):
+            gap = (b['start'] - a['end']).total_seconds()
+            if gap > gap_warn_seconds:
+                logger.warning(
+                    f"  GAP: {a['chapter'].get('filename')} ends "
+                    f"{a['end'].isoformat()}, "
+                    f"{b['chapter'].get('filename')} starts "
+                    f"{b['start'].isoformat()} (Δ={gap:.1f}s) — extracted "
+                    f"clip will jump over this span"
+                )
+
+        first = needed[0]
+        last = needed[-1]
+
+        # Offset = seconds into the first needed chapter where the game begins.
+        # If the game started before any chapter (shouldn't happen — overlap
+        # check would have excluded it — but guard for tz quirks), clamp to 0.
+        if game_start <= first['start']:
+            offset_into_first = 0.0
+            if game_start < first['start']:
+                miss = (first['start'] - game_start).total_seconds()
+                logger.warning(
+                    f"  Game started {miss:.1f}s before first chapter "
+                    f"{first['chapter'].get('filename')} — clip will miss "
+                    f"the opening seconds"
+                )
+        else:
+            offset_into_first = (game_start - first['start']).total_seconds()
+
+        # Trailing buffer chapter: the chapter whose wall-clock start is at
+        # or immediately after the last needed chapter's end. Guards against
+        # frame loss at chapter boundaries in the HTTP concat stream. Only
+        # include if it's a true continuation (<=2s gap) — a chapter from a
+        # later recording offers no boundary buffer and just wastes bytes
+        # over the HTTP concat.
+        chapters_needed = [p['chapter'] for p in needed]
+        needed_idxs = {n['idx'] for n in needed}
+        continuation_gap = timedelta(seconds=2)
+        for p in parsed:
+            if p['start'] >= last['end'] and p['idx'] not in needed_idxs:
+                gap = p['start'] - last['end']
+                if gap <= continuation_gap:
+                    chapters_needed.append(p['chapter'])
+                    logger.info(
+                        f"  Added trailing buffer chapter "
+                        f"{p['chapter'].get('filename')} for concat reliability"
+                    )
+                else:
+                    logger.info(
+                        f"  Skipping trailing buffer — next chapter "
+                        f"{p['chapter'].get('filename')} starts "
+                        f"{gap.total_seconds():.0f}s after last needed "
+                        f"chapter (different recording)"
+                    )
+                break
+
+        logger.info(
+            f"  Game window: {game_start.isoformat()} → {game_end.isoformat()} "
+            f"(duration {self._format_duration(duration)})"
+        )
+        logger.info(
+            f"  First needed chapter: {first['chapter'].get('filename')} "
+            f"@ {first['start'].isoformat()}, offset into chapter: "
+            f"{self._format_duration(offset_into_first)}"
+        )
+        logger.info(
+            f"  Chapters in concat: {len(chapters_needed)} "
+            f"({len(needed)} overlap + "
+            f"{len(chapters_needed) - len(needed)} trailing buffer)"
+        )
+
+        return {
+            'offset_seconds': offset_into_first,
+            'duration_seconds': duration,
+            'offset_str': self._format_duration(offset_into_first),
+            'duration_str': self._format_duration(duration),
+            'chapters_needed': chapters_needed,
+            'start_chapter_index': first['idx'],
+            'end_chapter_index': last['idx'],
+            'total_chapters': len(chapters),
+            'chapters_to_process': len(chapters_needed),
+            # Legacy debug field: raw wall-clock delta from session start to
+            # game start. Don't consume this downstream — use `offset_seconds`
+            # which is the real concat-stream seek position. Set to None in
+            # the new path so any consumer that still reads it fails loudly
+            # instead of silently using the wrong value.
+            'offset_from_recording_start': None,
+            'first_chapter_start_time': None,
+        }
+
+    def _calculate_extraction_params_legacy(
+        self,
+        game_start: datetime,
+        game_end: datetime,
+        recording_start: datetime,
+        chapters: List[Dict[str, Any]]
+    ) -> Dict[str, Any]:
+        """Legacy contiguous-chapter offset math.
+
+        Used only as a fallback when one or more chapters have no
+        ``creation_time``. Assumes all chapters are contiguous in wall-clock
+        time starting from ``recording_start``, which is wrong whenever the
+        camera stopped and restarted during the session. Kept for on-disk
+        callers (``get_session_chapters``) that may not carry MP4 metadata.
+        """
         offset_from_recording_start = (game_start - recording_start).total_seconds()
         if offset_from_recording_start < 0:
-            # Game started before recording - adjust
             offset_from_recording_start = 0
             game_start = recording_start
 
-        # Calculate game duration
         duration = (game_end - game_start).total_seconds()
 
-        # Find which chapters we need and calculate offset relative to first needed chapter
-        current_time = 0
+        current_time = 0.0
         start_chapter_idx = None
         end_chapter_idx = None
-        chapters_needed = []
-        first_chapter_start_time = 0  # When the first needed chapter starts in recording time
+        chapters_needed: List[Dict[str, Any]] = []
+        first_chapter_start_time = 0.0
 
         for i, chapter in enumerate(chapters):
             chapter_duration = chapter.get('duration_seconds') or 0
             if not chapter_duration or chapter_duration <= 0:
-                # Estimate ~15 min per 4GB chapter
-                chapter_duration = 900  # 15 minutes
-
+                chapter_duration = 900  # 15-min estimate per 4 GB
             chapter_end_time = current_time + chapter_duration
 
-            # Check if this chapter contains any part of our game
             game_start_in_recording = offset_from_recording_start
             game_end_in_recording = offset_from_recording_start + duration
-
-            # Chapter overlaps with game if:
-            # chapter_start < game_end AND chapter_end > game_start
             if current_time < game_end_in_recording and chapter_end_time > game_start_in_recording:
                 if start_chapter_idx is None:
                     start_chapter_idx = i
@@ -346,27 +558,19 @@ class VideoProcessor:
 
             current_time = chapter_end_time
 
-        # Include one extra chapter after the last needed one as buffer.
-        # The FFmpeg concat demuxer with HTTP presigned URLs can lose frames
-        # at chapter boundaries, so an extra trailing chapter ensures the
-        # full game duration is captured even if some data is lost in transit.
         if end_chapter_idx is not None and end_chapter_idx + 1 < len(chapters):
-            next_chapter = chapters[end_chapter_idx + 1]
-            chapters_needed.append(next_chapter)
-            logger.info(f"  Added trailing buffer chapter (index {end_chapter_idx + 1}) for concat reliability")
+            chapters_needed.append(chapters[end_chapter_idx + 1])
+            logger.info(
+                "  [legacy] Added trailing buffer chapter (index %d)",
+                end_chapter_idx + 1
+            )
 
-        # Calculate offset relative to the first needed chapter (not recording start)
-        # This is the seek position within the concatenated needed chapters
-        offset_relative_to_chapters = offset_from_recording_start - first_chapter_start_time
-        if offset_relative_to_chapters < 0:
-            offset_relative_to_chapters = 0
-
-        logger.info(f"  Offset from recording start: {self._format_duration(offset_from_recording_start)}")
-        logger.info(f"  First needed chapter starts at: {self._format_duration(first_chapter_start_time)}")
-        logger.info(f"  Offset relative to chapters: {self._format_duration(offset_relative_to_chapters)}")
+        offset_relative_to_chapters = max(
+            0.0, offset_from_recording_start - first_chapter_start_time
+        )
 
         return {
-            'offset_seconds': offset_relative_to_chapters,  # FIXED: Use relative offset
+            'offset_seconds': offset_relative_to_chapters,
             'duration_seconds': duration,
             'offset_str': self._format_duration(offset_relative_to_chapters),
             'duration_str': self._format_duration(duration),
@@ -375,8 +579,8 @@ class VideoProcessor:
             'end_chapter_index': end_chapter_idx,
             'total_chapters': len(chapters),
             'chapters_to_process': len(chapters_needed),
-            'offset_from_recording_start': offset_from_recording_start,  # Keep for reference
-            'first_chapter_start_time': first_chapter_start_time  # For debugging
+            'offset_from_recording_start': offset_from_recording_start,
+            'first_chapter_start_time': first_chapter_start_time,
         }
 
     def extract_game_clip(
