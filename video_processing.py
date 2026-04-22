@@ -33,6 +33,35 @@ from logging_service import get_logger
 logger = get_logger('gopro.video_processing')
 
 
+def _session_dedup_rank(session: Dict[str, Any]) -> int:
+    """Rank a recording-session doc for per-angle de-duplication.
+
+    Higher score = more likely to be a completed recording with usable data.
+    Ghost sessions (created when operator taps Start twice: status='recording',
+    no chapterFiles, no s3Prefix, no endedAt) score 0 and always lose to any
+    session that has real data, even when the ghost has a newer startedAt.
+
+    Score components (additive, so ties between fully-populated sessions all
+    land at the same rank and fall through to startedAt comparison):
+      * status ∈ {uploaded, stopped}  → +100
+      * s3Prefix present              → +50
+      * chapterFiles or totalChapters → +25
+      * endedAt present               → +10
+
+    A healthy uploaded session scores 185; a fresh ghost scores 0.
+    """
+    rank = 0
+    if session.get('status') in ('uploaded', 'stopped'):
+        rank += 100
+    if session.get('s3Prefix'):
+        rank += 50
+    if session.get('chapterFiles') or int(session.get('totalChapters') or 0) > 0:
+        rank += 25
+    if session.get('endedAt'):
+        rank += 10
+    return rank
+
+
 class VideoProcessor:
     """Handles video extraction and processing for game clips."""
 
@@ -1531,8 +1560,26 @@ def process_game_videos(
         for session in all_sessions:
             session_start_str = session.get('startedAt')
             session_end_str = session.get('endedAt')
+            status = session.get('status', '')
+            has_data = bool(session.get('chapterFiles')) or int(session.get('totalChapters') or 0) > 0
 
             if not session_start_str:
+                continue
+
+            # Skip terminally-bad statuses — these sessions will never have usable data.
+            if status in ('cancelled', 'failed'):
+                continue
+
+            # Skip ghost sessions: a second "Start" press created a Firebase doc but the
+            # GoPro never actually recorded anything, leaving status='recording' + no
+            # endedAt + no chapterFiles forever. If we let these through, the "latest
+            # startedAt wins" de-dup below picks them over real completed sessions and
+            # every game fails with "No videos were processed".
+            if not session_end_str and not has_data:
+                logger.info(
+                    f"[ProcessGame] skipping ghost session {session.get('id')} "
+                    f"(status={status!r}, no endedAt, no chapterFiles)"
+                )
                 continue
 
             s_start = datetime.fromisoformat(session_start_str.replace('Z', '+00:00'))
@@ -1557,20 +1604,25 @@ def process_game_videos(
                 skipped_angles = [s.get('angleCode') for s in filtered_out]
                 logger.info(f"[ProcessGame] ANGLES_TO_PROCESS={allowed}: filtered out {skipped_angles} ({before_count} -> {len(overlapping_sessions)} sessions)")
 
-        # De-duplicate sessions per angle: keep only the most recent session for
-        # each angle.  This prevents old sessions from previous nights (which overlap
-        # due to wide endedAt timestamps) from being used when a newer session exists.
+        # De-duplicate sessions per angle: keep the BEST session per angle — where
+        # "best" means (data-presence rank, then latest startedAt). A ghost session
+        # created by a second Start press (status='recording', no chapters, no
+        # s3Prefix, no endedAt) has rank 0 and will always lose to a real completed
+        # session — even when its startedAt is newer. Legit "newer session replaces
+        # older" behavior is preserved because same-rank ties still fall through to
+        # parsed_start comparison.
         if overlapping_sessions:
             best_per_angle = {}
             for s in overlapping_sessions:
                 angle = s.get('angleCode', 'UNKNOWN')
                 existing = best_per_angle.get(angle)
-                if existing is None or s['parsed_start'] > existing['parsed_start']:
+                s_key = (_session_dedup_rank(s), s['parsed_start'])
+                if existing is None or s_key > (_session_dedup_rank(existing), existing['parsed_start']):
                     best_per_angle[angle] = s
             before_dedup = len(overlapping_sessions)
             overlapping_sessions = list(best_per_angle.values())
             if len(overlapping_sessions) < before_dedup:
-                logger.info(f"[ProcessGame] De-duplicated sessions by angle: {before_dedup} -> {len(overlapping_sessions)} (kept most recent per angle)")
+                logger.info(f"[ProcessGame] De-duplicated sessions by angle: {before_dedup} -> {len(overlapping_sessions)} (kept best-ranked per angle)")
 
         # Sort sessions to process FL/FR first (priority angles), then NL/NR
         # This ensures the main game angles are processed before supplementary angles
