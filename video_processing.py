@@ -289,25 +289,38 @@ class VideoProcessor:
         recording_start: datetime,
         chapters: List[Dict[str, Any]]
     ) -> Dict[str, Any]:
-        """Calculate FFmpeg extraction parameters using per-chapter creation_time.
+        """Calculate FFmpeg extraction parameters with cross-camera sync.
 
-        Maps the game window to chapter(s) using each chapter's wall-clock
-        ``creation_time`` (from MP4 metadata via ffprobe) plus its playback
-        ``duration_seconds``. This is gap-aware: when a recording session
-        contains multiple GoPro recordings separated by stop/start gaps (false
-        starts, battery swaps, SD-card reshoots), the math still resolves the
-        right chapter and offset instead of treating all chapters as
-        contiguous from ``recording_start``.
+        Builds a wall-clock timeline for the session's chapters and resolves
+        ``game_start`` → (chapter, offset) on it.
 
-        Falls back to the legacy contiguous-chapter math only when one or more
-        chapters are missing ``creation_time`` — that branch is lossy when
-        there are gaps and only exists so on-disk / pre-ffprobe callers keep
-        working.
+        **Anchoring** — the first chapter's wall-clock start is anchored to
+        ``recording_start`` (== ``session.startedAt`` from Firebase, which is
+        the Jetson's NTP-synced timestamp for when the pipeline commanded the
+        camera to begin recording). This matters because GoPro cameras have
+        independent internal clocks that can drift between cameras by several
+        seconds. If we anchored instead to the first chapter's
+        ``creation_time`` (the camera's own clock), that drift would leak into
+        every extracted clip and the FR/FL angles would be out of sync. Jetsons
+        share a common NTP reference, so anchoring to ``recording_start``
+        eliminates cross-camera drift.
+
+        **Gaps** — inside a recording (chapters sharing ``creation_time`` within
+        2s) chapter N+1's start = chapter N's end, so cumulative duration does
+        the work. Across recordings inside the same session (e.g. camera was
+        stopped and restarted after a false start), the inter-recording gap is
+        computed from the camera-clock delta between the two recordings'
+        ``creation_time``s minus the first recording's total duration — that
+        delta is internally consistent for the one camera and gives an accurate
+        wall-clock gap size.
+
+        Falls back to legacy contiguous math only when any chapter is missing
+        ``creation_time`` or ``duration_seconds``.
 
         Returns a dict with ``offset_seconds`` (seek position into the concat
         stream built from ``chapters_needed``), ``duration_seconds``,
-        ``chapters_needed`` (includes a trailing buffer chapter when one
-        exists), and index / count metadata for logging.
+        ``chapters_needed`` (includes a trailing buffer chapter when the next
+        chapter is a true continuation), and index/count metadata.
         """
         from datetime import timezone as _tz
 
@@ -370,18 +383,63 @@ class VideoProcessor:
         # the same recording (rare but observed).
         parsed.sort(key=lambda p: (p['creation_time'], p['chapter'].get('filename', '')))
 
+        # Surface cross-camera clock skew for ops visibility. GoPros' internal
+        # clocks can drift a few seconds between units; Jetson session.startedAt
+        # is the NTP-synced reference we anchor against below.
+        first_ct = parsed[0]['creation_time']
+        clock_skew = (first_ct - recording_start).total_seconds()
+        if abs(clock_skew) > 60:
+            logger.warning(
+                f"  First chapter creation_time {first_ct.isoformat()} differs "
+                f"from session.startedAt {recording_start.isoformat()} by "
+                f"{clock_skew:+.1f}s — unusually large. Either the camera took "
+                f"a long time to start recording or session.startedAt is stale. "
+                f"Anchoring wall-clock timeline to session.startedAt anyway "
+                f"for cross-camera sync."
+            )
+        elif abs(clock_skew) > 2:
+            logger.info(
+                f"  Camera clock skew vs Jetson: {clock_skew:+.1f}s; "
+                f"anchoring to session.startedAt eliminates cross-camera drift"
+            )
+
+        # Walk chapters and build the wall-clock timeline:
+        #   - First chapter: anchor to recording_start (Jetson NTP-synced).
+        #   - Same-recording continuation: start = prev chapter's end.
+        #   - New recording within the session: start = prev chapter's end +
+        #     camera-clock gap. The gap is computed from the camera's own
+        #     clock delta (creation_time[new] - creation_time[prev_group] -
+        #     sum of prev group's chapter durations), which is internally
+        #     consistent for the one camera even when it drifts vs Jetson.
         creation_time_tolerance = timedelta(seconds=2)
         prev_end: Optional[datetime] = None
         prev_ct: Optional[datetime] = None
+        prev_group_start_ct: Optional[datetime] = None
+        prev_group_cum_duration: float = 0.0
+        is_first = True
         for p in parsed:
-            if (prev_ct is not None and prev_end is not None
+            if is_first:
+                p['start'] = recording_start
+                is_first = False
+                prev_group_start_ct = p['creation_time']
+                prev_group_cum_duration = 0.0
+            elif (prev_ct is not None
                     and abs(p['creation_time'] - prev_ct) <= creation_time_tolerance):
-                # Continuation of the same recording — resume from prior end.
+                # Same-recording continuation
                 p['start'] = prev_end
             else:
-                # New recording — anchor to its stamped creation_time.
-                p['start'] = p['creation_time']
+                # New recording inside the same session — size the gap from
+                # the camera's own clock delta.
+                camera_gap = (
+                    (p['creation_time'] - prev_group_start_ct).total_seconds()
+                    - prev_group_cum_duration
+                )
+                camera_gap = max(0.0, camera_gap)
+                p['start'] = prev_end + timedelta(seconds=camera_gap)
+                prev_group_start_ct = p['creation_time']
+                prev_group_cum_duration = 0.0
             p['end'] = p['start'] + timedelta(seconds=p['duration'])
+            prev_group_cum_duration += p['duration']
             prev_ct = p['creation_time']
             prev_end = p['end']
 

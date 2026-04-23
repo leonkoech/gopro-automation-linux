@@ -66,12 +66,14 @@ def _chapter(filename: str, creation_time: str, duration_seconds: float) -> dict
 
 
 def test_offset_within_single_chapter(vp):
-    """Game entirely inside one chapter: offset = game_start - chapter.start."""
+    """Game entirely inside one chapter: offset = game_start - recording_start
+    (first chapter is anchored to recording_start, not creation_time, so
+    cross-camera clock drift doesn't leak into the offset)."""
     chapters = [_chapter('GX010090.MP4', '2026-04-21T21:23:37Z', 4868.9)]
     params = vp.calculate_extraction_params(
         game_start=_dt('2026-04-21T21:32:16Z'),
         game_end=_dt('2026-04-21T22:22:16Z'),
-        recording_start=_dt('2026-04-21T20:17:58Z'),
+        recording_start=_dt('2026-04-21T21:23:37Z'),
         chapters=chapters,
     )
     assert params['offset_seconds'] == pytest.approx(519, abs=1)
@@ -95,10 +97,11 @@ def test_game_starts_exactly_at_chapter_boundary(vp):
 
 
 def test_game_spans_two_contiguous_chapters(vp):
-    """Game crosses a chapter boundary; both chapters returned."""
+    """Game crosses a chapter boundary; both chapters returned. Chapters share
+    creation_time (one recording) so ch2 starts at ch1.end in wall-clock."""
     chapters = [
-        _chapter('GX010090.MP4', '2026-04-21T21:23:37Z', 4868.9),  # 21:23:37–22:44:46
-        _chapter('GX020090.MP4', '2026-04-21T22:44:46Z', 4868.9),  # 22:44:46–00:05:55
+        _chapter('GX010090.MP4', '2026-04-21T21:23:37Z', 4868.9),  # shared ct
+        _chapter('GX020090.MP4', '2026-04-21T21:23:37Z', 4868.9),  # shared ct
     ]
     params = vp.calculate_extraction_params(
         game_start=_dt('2026-04-21T22:30:00Z'),
@@ -251,49 +254,59 @@ FR_TONIGHT_RAW = [
 ]
 
 
-def test_tonight_game1_titans_picks_ch9_with_519s_offset(vp):
-    """Titans vs Black Team C (2026-04-21T21:32:16Z) must land in GX010090
-    with offset ~519s — not in any stale chapter."""
+def test_tonight_game1_titans_picks_ch9_with_507s_offset(vp):
+    """Titans vs Black Team C (21:32:16Z): lands in GX010090.
+
+    Offset is ~507s (not 519s as under PR #30). The shift is the 11s camera
+    clock skew: FR camera's creation_time 21:23:37 is 11s before the Jetson's
+    session.startedAt 20:17:58 + accumulated gaps (20:18:09 end of ch8) +
+    camera-clock gap (3939.8s) → 21:23:48.95. Anchoring to session.startedAt
+    means ch9 wall-clock start is 21:23:48.95, so the offset for a game at
+    21:32:16 is 507s in real wall-clock, not 519s in camera-clock.
+    """
     params = vp.calculate_extraction_params(
         game_start=_dt('2026-04-21T21:32:16Z'),
         game_end=_dt('2026-04-21T22:22:00Z'),
-        recording_start=_dt('2026-04-21T20:17:58Z'),
+        recording_start=_dt('2026-04-21T20:17:58.948787Z'),
         chapters=FR_TONIGHT_RAW,
     )
     names = [c['filename'] for c in params['chapters_needed']]
     assert names[0] == 'GX010090.MP4'
-    assert params['offset_seconds'] == pytest.approx(519, abs=2)
+    assert params['offset_seconds'] == pytest.approx(507, abs=2)
 
 
-def test_tonight_game6_blessed_picks_ch13_with_133s_offset(vp):
-    """Blessed & Highly Favored vs Akatsuki (02:45:05Z → 03:35:12Z) must land
-    in GX050090 with offset ~133s. Old buggy math failed this game because
-    offset (23,227s) exceeded total filtered-chapter duration."""
+def test_tonight_game6_blessed_picks_ch13_with_121s_offset(vp):
+    """Blessed & Highly Favored vs Akatsuki (02:45:05Z → 03:35:12Z): lands in
+    GX050090. Under the old contiguous math (pre-PR #30) this failed entirely
+    ('No videos were processed'). Under PR #31 with session.startedAt
+    anchoring, ch7's wall-clock start is 02:43:04.15, so the offset for a
+    game at 02:45:05 is ~121s.
+    """
     params = vp.calculate_extraction_params(
         game_start=_dt('2026-04-22T02:45:05Z'),
         game_end=_dt('2026-04-22T03:35:12Z'),
-        recording_start=_dt('2026-04-21T20:17:58Z'),
+        recording_start=_dt('2026-04-21T20:17:58.948787Z'),
         chapters=FR_TONIGHT_RAW,
     )
     names = [c['filename'] for c in params['chapters_needed']]
     assert names[0] == 'GX050090.MP4'
-    assert params['offset_seconds'] == pytest.approx(133, abs=2)
+    assert params['offset_seconds'] == pytest.approx(121, abs=2)
     # Game fits within ch13 — no additional overlap chapter needed
     assert params['chapters_to_process'] <= 2  # ch13 + optional trailing buffer (none here)
 
 
 def test_tonight_game3_ortega_spans_chapters_correctly(vp):
-    """Ortega vs Miracle Leaf (00:38:56Z → ~01:25Z) starts inside GX030090
-    at offset ~1981s and might spill into GX040090."""
+    """Ortega vs Miracle Leaf (00:38:56Z → ~01:25Z): starts inside GX030090
+    at offset ~1969s under session-anchored math."""
     params = vp.calculate_extraction_params(
         game_start=_dt('2026-04-22T00:38:56Z'),
         game_end=_dt('2026-04-22T01:25:00Z'),
-        recording_start=_dt('2026-04-21T20:17:58Z'),
+        recording_start=_dt('2026-04-21T20:17:58.948787Z'),
         chapters=FR_TONIGHT_RAW,
     )
     names = [c['filename'] for c in params['chapters_needed']]
     assert names[0] == 'GX030090.MP4'
-    assert params['offset_seconds'] == pytest.approx(1981, abs=2)
+    assert params['offset_seconds'] == pytest.approx(1969, abs=2)
 
 
 # --- Shared creation_time within a recording ------------------------------
@@ -415,6 +428,101 @@ def test_sub_second_creation_time_drift_treated_as_continuation(vp):
     # for a phantom gap
     assert params['chapters_needed'][0]['filename'] == 'c2.MP4'
     assert params['offset_seconds'] == pytest.approx(120, abs=2)
+
+
+# --- Cross-camera sync (the Apr 22/23 regression) -------------------------
+
+
+def test_cross_camera_sync_despite_clock_drift(vp):
+    """Two cameras recording the same event at the same Jetson-commanded moment
+    but with different internal-clock offsets MUST resolve to the same game
+    wall-clock time on both angles. Under PR #30 this test failed — FR extracted
+    5s ahead of FL because each anchored to its own camera's creation_time."""
+    # Both Jetsons commanded 'start' at 22:24:44.3 (shared NTP reference).
+    # FR camera clock is 4.3s behind wall-clock; FL camera clock is 0.7s ahead.
+    recording_start = _dt('2026-04-22T22:24:44.305Z')
+
+    # FR chapters (shared creation_time 22:24:40, camera 4.3s behind Jetson)
+    fr_chapters = [
+        _chapter('GX010091.MP4', '2026-04-22T22:24:40Z', 4868.9),
+        _chapter('GX020091.MP4', '2026-04-22T22:24:40Z', 4868.9),
+    ]
+    # FL chapters (shared creation_time 22:24:45, camera 0.7s ahead of Jetson)
+    fl_chapters = [
+        _chapter('GX010123.MP4', '2026-04-22T22:24:45Z', 3075.1),
+        _chapter('GX020123.MP4', '2026-04-22T22:24:45Z', 2818.8),
+        _chapter('GX030123.MP4', '2026-04-22T22:24:45Z', 2626.6),
+    ]
+
+    # Game starts 23:33:42.505 (wall-clock) — Black Team C vs 305 Turnovers
+    # from the Apr 22/23 incident.
+    game_start = _dt('2026-04-22T23:33:42.505Z')
+    game_end = _dt('2026-04-23T00:20:09.156Z')
+
+    fr_params = vp.calculate_extraction_params(game_start, game_end, recording_start, fr_chapters)
+    fl_params = vp.calculate_extraction_params(game_start, game_end, recording_start, fl_chapters)
+
+    # The frame each angle extracts must correspond to the same wall-clock
+    # moment. Compute extracted wall-clock per angle = first-needed-chapter
+    # wall-clock start + offset_seconds. Both must equal game_start.
+    def extracted_walltime(params, chapters, rs):
+        # Replicate the wall-clock computation the implementation did.
+        first = params['chapters_needed'][0]
+        # Find first in the input list to get its index-ordered wall-clock start
+        idx = chapters.index(first)
+        # All these test chapters share creation_time → ch[i].start = rs + sum(ch[0..i-1].duration)
+        cum = sum(c['duration_seconds'] for c in chapters[:idx])
+        return rs + timedelta(seconds=cum + params['offset_seconds'])
+
+    fr_extracted = extracted_walltime(fr_params, fr_chapters, recording_start)
+    fl_extracted = extracted_walltime(fl_params, fl_chapters, recording_start)
+
+    # Both must extract within 0.5s of the game's actual wall-clock start
+    assert abs((fr_extracted - game_start).total_seconds()) < 0.5, \
+        f"FR extracted at {fr_extracted.isoformat()}, expected {game_start.isoformat()}"
+    assert abs((fl_extracted - game_start).total_seconds()) < 0.5, \
+        f"FL extracted at {fl_extracted.isoformat()}, expected {game_start.isoformat()}"
+    # Cross-camera sync — the bug this PR fixes — must be sub-second
+    assert abs((fr_extracted - fl_extracted).total_seconds()) < 0.5
+
+
+def test_single_recording_session_anchors_to_session_startedat(vp):
+    """With a single-recording session, first chapter's wall-clock start MUST
+    equal recording_start regardless of the camera's creation_time reading.
+    This is the core fix for the Apr 22/23 cross-camera drift bug."""
+    # Camera clock is 4.3s behind Jetson clock (realistic drift)
+    chapters = [
+        _chapter('GX010091.MP4', '2026-04-22T22:24:40Z', 4868.9),
+        _chapter('GX020091.MP4', '2026-04-22T22:24:40Z', 4868.9),
+    ]
+    params = vp.calculate_extraction_params(
+        game_start=_dt('2026-04-22T22:32:39.122Z'),  # ~8 min into session
+        game_end=_dt('2026-04-22T23:24:03.378Z'),
+        recording_start=_dt('2026-04-22T22:24:44.305Z'),
+        chapters=chapters,
+    )
+    # Expected offset = game_start − recording_start = 474.8s (not 479s as
+    # under PR #30 which used creation_time-anchored ch1.start of 22:24:40)
+    assert params['offset_seconds'] == pytest.approx(474.8, abs=0.5)
+
+
+def test_large_clock_skew_logs_warning_but_still_anchors_to_session(vp, caplog):
+    """If camera creation_time is >60s off from session.startedAt, log a
+    warning but still anchor to session.startedAt so cross-camera sync holds."""
+    chapters = [_chapter('c.MP4', '2026-04-22T22:30:00Z', 600)]  # 5min 15s ahead
+    with caplog.at_level(logging.WARNING):
+        params = vp.calculate_extraction_params(
+            game_start=_dt('2026-04-22T22:32:00Z'),
+            game_end=_dt('2026-04-22T22:35:00Z'),
+            recording_start=_dt('2026-04-22T22:24:45Z'),
+            chapters=chapters,
+        )
+    assert any('unusually large' in r.message.lower() for r in caplog.records)
+    # Offset still based on session.startedAt anchor
+    assert params['offset_seconds'] == pytest.approx(435, abs=1)  # 22:32 − 22:24:45
+
+
+# --- Regression field check -----------------------------------------------
 
 
 def test_returns_none_for_legacy_fields_in_new_path(vp):
