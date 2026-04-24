@@ -31,6 +31,19 @@ jobs:
           tags: tag:ci
           hostname: github-monitor-${{ github.run_id }}
 
+      # Restore the alert-dedup state from the previous run so we don't email
+      # every 20 minutes for the same ongoing issue. The key uses run_id so
+      # the post-run save step can always write a fresh cache entry; the
+      # restore-keys prefix pulls the most recent cache regardless of run_id.
+      - name: Restore alert dedup state
+        id: alert-state-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: .monitor-alert-state.json
+          key: monitor-alert-state-${{ github.run_id }}
+          restore-keys: |
+            monitor-alert-state-
+
       - name: Run health check
         env:
           TAILSCALE_API_KEY: ${{ secrets.TAILSCALE_API_KEY }}
@@ -41,4 +54,17 @@ jobs:
           SMTP_FROM_EMAIL: ${{ secrets.SMTP_FROM_EMAIL }}
           ALERT_TO_EMAIL: ${{ secrets.ALERT_TO_EMAIL }}
           JETSON_DEVICES: ${{ inputs.force_test_alert && '[{"name":"TEST — SMTP verification","tailscale_hostname":"does-not-exist","tailscale_ip":"100.0.0.1"}]' || '' }}
+          # Manual test runs should always send, even if the same signature
+          # was already emailed today.
+          FORCE_ALERT: ${{ inputs.force_test_alert && 'true' || '' }}
         run: python3 scripts/monitor/monitor_jetsons.py
+
+      # Save the (possibly updated) dedup state so the next cron run can see
+      # what was already alerted. `if: always()` ensures we persist state even
+      # if the health check step itself fails — next run still dedups cleanly.
+      - name: Save alert dedup state
+        if: always() && hashFiles('.monitor-alert-state.json') != ''
+        uses: actions/cache/save@v4
+        with:
+          path: .monitor-alert-state.json
+          key: monitor-alert-state-${{ github.run_id }}

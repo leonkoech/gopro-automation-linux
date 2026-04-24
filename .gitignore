@@ -10,3 +10,6 @@ tmpclaude*
 
 uball-gopro-fleet-firebase-adminsdk.json
 id_rsa
+
+# Alert dedup state written by scripts/monitor/monitor_jetsons.py
+.monitor-alert-state.json

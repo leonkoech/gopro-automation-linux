@@ -66,6 +66,12 @@ CHECK_RETRIES = int(os.environ.get("CHECK_RETRIES", "2"))
 CHECK_RETRY_BACKOFF_SEC = float(os.environ.get("CHECK_RETRY_BACKOFF_SEC", "3"))
 STALE_THRESHOLD_MIN = int(os.environ.get("STALE_THRESHOLD_MIN", "5"))
 
+# Alert dedup — suppresses repeat emails for the same ongoing issue.
+# State is persisted between cron runs (e.g. via GitHub Actions cache) so the
+# same problem only emails once per UTC day; the next day it re-alerts once.
+ALERT_STATE_PATH = os.environ.get("ALERT_STATE_PATH", ".monitor-alert-state.json")
+FORCE_ALERT = os.environ.get("FORCE_ALERT", "").strip().lower() in ("1", "true", "yes")
+
 
 # --- Data structures ---
 
@@ -257,6 +263,64 @@ def build_alert(statuses: list[JetsonStatus]) -> Optional[str]:
     return body
 
 
+def compute_alert_signature(statuses: list[JetsonStatus]) -> str:
+    """Stable signature of current issues — used to dedup repeat alerts.
+
+    Two runs that surface the same set of problems on the same devices produce
+    the same signature, so we can suppress the second email. If the problem
+    set changes (e.g. a second Jetson goes offline), the signature changes
+    and we re-alert immediately.
+    """
+    parts: list[str] = []
+    for s in sorted(statuses, key=lambda x: x.name):
+        if not s.tailscale_online:
+            parts.append(f"{s.name}:offline")
+            continue
+        if s.gopro_error:
+            parts.append(f"{s.name}:gopro_api_unreachable")
+        elif s.gopro_count < EXPECTED_GOPROS:
+            parts.append(f"{s.name}:gopros={s.gopro_count}")
+        if s.disk_free_gb is not None and s.disk_free_gb < 5.0:
+            parts.append(f"{s.name}:low_disk")
+    return "|".join(parts)
+
+
+def load_alert_state() -> dict:
+    """Load previous alert state; returns {} if missing or unreadable."""
+    try:
+        with open(ALERT_STATE_PATH) as f:
+            data = json.load(f)
+            return data if isinstance(data, dict) else {}
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
+
+
+def save_alert_state(state: dict) -> None:
+    """Persist alert state so the next cron run can dedup against it."""
+    try:
+        with open(ALERT_STATE_PATH, "w") as f:
+            json.dump(state, f)
+    except OSError as exc:
+        log.warning("Failed to write alert state to %s: %s", ALERT_STATE_PATH, exc)
+
+
+def should_send_alert(signature: str, today_utc: str) -> bool:
+    """Suppress repeat alerts with the same signature on the same UTC day.
+
+    Alert is sent when:
+      - FORCE_ALERT env var is truthy (for manual testing), OR
+      - no prior state exists (first alert after recovery), OR
+      - the issue signature changed (problem set escalated), OR
+      - the UTC date rolled over (send one reminder the next day).
+    """
+    if FORCE_ALERT:
+        return True
+    state = load_alert_state()
+    return not (
+        state.get("signature") == signature and state.get("date") == today_utc
+    )
+
+
 def send_email(subject: str, body: str) -> None:
     """Send alert email via SMTP."""
     if not SMTP_USER or not SMTP_PASSWORD:
@@ -304,27 +368,53 @@ def main() -> None:
             )
 
     alert_body = build_alert(statuses)
-    if alert_body:
-        offline = [s.name for s in statuses if not s.tailscale_online]
-        unreachable = [s.name for s in statuses if s.tailscale_online and s.gopro_error]
-        low_gopros = [
-            s.name for s in statuses
-            if s.tailscale_online and not s.gopro_error and s.gopro_count < EXPECTED_GOPROS
-        ]
+    now = datetime.now(timezone.utc)
+    today_utc = now.strftime("%Y-%m-%d")
 
-        if offline:
-            subject = f"UBALL Alert: {', '.join(offline)} OFFLINE"
-        elif low_gopros:
-            subject = f"UBALL Alert: GoPro disconnected on {', '.join(low_gopros)}"
-        elif unreachable:
-            subject = f"UBALL Alert: {', '.join(unreachable)} API unreachable"
-        else:
-            subject = "UBALL Alert: Jetson/GoPro Issue Detected"
-
-        log.warning("Issues detected — sending alert")
-        send_email(subject, alert_body)
-    else:
+    if not alert_body:
+        # All healthy — clear dedup state so the next issue alerts immediately.
+        if os.path.exists(ALERT_STATE_PATH):
+            try:
+                os.remove(ALERT_STATE_PATH)
+            except OSError as exc:
+                log.warning("Failed to clear alert state: %s", exc)
         log.info("All systems healthy — no alert needed")
+        return
+
+    offline = [s.name for s in statuses if not s.tailscale_online]
+    unreachable = [s.name for s in statuses if s.tailscale_online and s.gopro_error]
+    low_gopros = [
+        s.name for s in statuses
+        if s.tailscale_online and not s.gopro_error and s.gopro_count < EXPECTED_GOPROS
+    ]
+
+    if offline:
+        subject = f"UBALL Alert: {', '.join(offline)} OFFLINE"
+    elif low_gopros:
+        subject = f"UBALL Alert: GoPro disconnected on {', '.join(low_gopros)}"
+    elif unreachable:
+        subject = f"UBALL Alert: {', '.join(unreachable)} API unreachable"
+    else:
+        subject = "UBALL Alert: Jetson/GoPro Issue Detected"
+
+    signature = compute_alert_signature(statuses)
+    if not should_send_alert(signature, today_utc):
+        log.info(
+            "Issues detected but alert suppressed — same signature already "
+            "emailed today (signature=%r, date=%s). Will re-alert tomorrow "
+            "if still present.",
+            signature, today_utc,
+        )
+        return
+
+    log.warning("Issues detected — sending alert")
+    send_email(subject, alert_body)
+    save_alert_state({
+        "signature": signature,
+        "date": today_utc,
+        "last_sent_at": now.isoformat(),
+        "subject": subject,
+    })
 
 
 if __name__ == "__main__":
