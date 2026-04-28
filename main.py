@@ -2738,6 +2738,257 @@ def register_completed_batch_jobs():
         }), 500
 
 
+def _cv_build_game_video_keys(game: dict, *, default_location: str):
+    """Build a CVBatchDispatcher.GameVideoKeys from a Firebase game doc.
+
+    Assumes the transcode pipeline's S3 key convention:
+        {location}/{YYYY-MM-DD}/{uuid4}/{YYYY-MM-DD}_{uuid4}_{angle}.mp4
+    where {uuid4} is the first 4 hyphen-separated segments of the Supabase UUID.
+    """
+    from cv_batch_dispatch import CVBatchDispatcher, GameVideoKeys
+
+    uball_game_id = game.get('uballGameId')
+    firebase_game_id = game.get('id')
+    if not uball_game_id or not firebase_game_id:
+        raise ValueError(f"game missing uballGameId or id: fb={firebase_game_id} ub={uball_game_id}")
+
+    created_at = game.get('createdAt') or ''
+    date = created_at.split('T')[0] if 'T' in created_at else ''
+    if not date:
+        raise ValueError(f"game {firebase_game_id} missing parseable createdAt")
+
+    location = game.get('location') or default_location
+    uuid4 = CVBatchDispatcher.truncate_uuid(uball_game_id)
+
+    angle_keys = {
+        angle: f"{location}/{date}/{uuid4}/{date}_{uuid4}_{angle}.mp4"
+        for angle in ('FL', 'FR', 'NL', 'NR')
+    }
+    return GameVideoKeys(
+        game_uuid=uball_game_id,
+        game_uuid4=uuid4,
+        firebase_game_id=firebase_game_id,
+        location=location,
+        date=date,
+        angle_keys=angle_keys,
+    )
+
+
+def _cv_missing_angles(s3_client, bucket: str, game_keys) -> list:
+    """Return list of angle codes whose 1080p file is missing from S3."""
+    missing = []
+    for angle, key in game_keys.angle_keys.items():
+        try:
+            s3_client.head_object(Bucket=bucket, Key=key)
+        except Exception:
+            missing.append(angle)
+    return missing
+
+
+@app.route('/api/cv/dispatch-pending', methods=['POST'])
+def cv_dispatch_pending():
+    """Scan Firebase for completed games with all 4 angles in S3 and no CV
+    plays yet; submit 2 cv-fusion + 1 cv-merge Batch job per candidate.
+
+    Mirrors the pattern of `register_completed_batch_jobs` — a cron-safe
+    idempotent scanner. Call every 5 minutes from the same scheduler that
+    already hits `/api/batch/register-completed`.
+
+    Idempotency is enforced at 3 layers:
+      1. Skip if `cv_dispatched_at` is already stamped on the Firebase game.
+      2. Skip if any `plays.source='cv'` already exist in UBall (belt + braces).
+      3. The cv-merge container also checks `cv_emitted_at` before writing.
+
+    Request body (all optional):
+      {
+        "limit": 10,               // max games to dispatch per tick
+        "lookback_days": 7,        // only consider games ended in this window
+        "dry_run": false,          // plan the submissions but skip submit_job
+        "emit_target": "logs",     // 'logs' (prod) or 'cv_logs_staging' (shadow)
+        "firebase_game_id": null   // target a specific game (overrides scan)
+      }
+
+    Response:
+      {
+        "dispatched_count": N,
+        "dispatched": [...],
+        "skipped_already_dispatched": N,
+        "skipped_not_synced": N,
+        "waiting_on_angles": N,
+        "errors": [...]
+      }
+    """
+    try:
+        import cv_metrics
+        from cv_batch_dispatch import CVBatchDispatcher
+
+        req = request.get_json(silent=True) or {}
+        limit = int(req.get('limit', 10))
+        lookback_days = int(req.get('lookback_days', 7))
+        dry_run = bool(req.get('dry_run', False))
+        emit_target = req.get('emit_target') or os.getenv('CV_EMIT_TARGET', 'logs')
+        specific_firebase_game_id = req.get('firebase_game_id')
+
+        if emit_target not in ('logs', 'cv_logs_staging'):
+            return jsonify({'success': False,
+                            'error': f"emit_target must be 'logs' or 'cv_logs_staging', got {emit_target!r}"}), 400
+
+        fb = get_firebase_service()
+        dispatcher = CVBatchDispatcher(emit_target=emit_target)
+
+        # Shared S3 client for the HEAD-check pre-flight.
+        import boto3
+        from botocore.config import Config as BotoConfig
+        boto_config = BotoConfig(retries={'max_attempts': 2, 'mode': 'adaptive'},
+                                 max_pool_connections=1)
+        s3 = boto3.client('s3', region_name=dispatcher.region,
+                          config=boto_config, verify=False)
+
+        # -----------------------------------------------------------------
+        # Candidate set
+        # -----------------------------------------------------------------
+        if specific_firebase_game_id:
+            single = fb.get_game(specific_firebase_game_id)
+            if not single:
+                return jsonify({'success': False,
+                                'error': f"game {specific_firebase_game_id} not found"}), 404
+            single.setdefault('id', specific_firebase_game_id)
+            candidates = [single]
+            logger.info(f"[CVDispatch] targeting specific game: {specific_firebase_game_id}")
+        else:
+            games = fb.list_games(limit=200, status='completed')
+            cutoff_iso = (datetime.utcnow() - timedelta(days=lookback_days)).isoformat()
+            candidates = [g for g in games if (g.get('endedAt') or '') >= cutoff_iso]
+            logger.info(f"[CVDispatch] scanning {len(candidates)} completed games "
+                        f"in last {lookback_days} days (total fetched: {len(games)})")
+
+        # -----------------------------------------------------------------
+        # Per-game dispatch
+        # -----------------------------------------------------------------
+        dispatched = []
+        skipped_dispatched = 0
+        skipped_not_synced = 0
+        waiting_on_angles = 0
+        submission_errors = []
+
+        dispatch_count = 0
+        _cv_dispatch_started_at = time.time()
+        for game in candidates:
+            if dispatch_count >= limit and not specific_firebase_game_id:
+                break
+
+            firebase_game_id = game.get('id', '<missing-id>')
+            uball_game_id = game.get('uballGameId')
+            if not uball_game_id:
+                skipped_not_synced += 1
+                continue
+
+            if game.get('cv_dispatched_at') and not specific_firebase_game_id:
+                skipped_dispatched += 1
+                continue
+
+            # Build the 4 expected S3 keys
+            try:
+                game_keys = _cv_build_game_video_keys(game, default_location=UPLOAD_LOCATION or 'court-a')
+            except Exception as e:
+                logger.warning(f"[CVDispatch] skipping {firebase_game_id}: {e}")
+                submission_errors.append({'firebase_game_id': firebase_game_id, 'error': str(e)})
+                continue
+
+            # Pre-flight: all 4 angles must be in S3
+            missing = _cv_missing_angles(s3, dispatcher.inputs_bucket, game_keys)
+            if missing:
+                logger.info(f"[CVDispatch] {firebase_game_id}: waiting on {missing}")
+                waiting_on_angles += 1
+                continue
+
+            # Submit (or simulate in dry-run)
+            if dry_run:
+                dispatched.append({
+                    'firebase_game_id': firebase_game_id,
+                    'uball_game_id': uball_game_id,
+                    'dry_run': True,
+                    'would_submit_fusion_a_side': 'A',
+                    'would_submit_fusion_b_side': 'B',
+                    'would_submit_merge_depends_on': ['<fusion-a-jobid>', '<fusion-b-jobid>'],
+                })
+                dispatch_count += 1
+                continue
+
+            try:
+                result = dispatcher.submit_game(game_keys, cv_emit_target=emit_target)
+            except Exception as e:
+                logger.error(f"[CVDispatch] submit failed for {firebase_game_id}: {e}")
+                submission_errors.append({'firebase_game_id': firebase_game_id,
+                                          'error': str(e)})
+                continue
+
+            # Stamp Firebase so we don't re-submit on the next tick
+            try:
+                now_iso = datetime.utcnow().isoformat() + 'Z'
+                fb.db.collection('basketball-games').document(firebase_game_id).update({
+                    'cv_dispatched_at': now_iso,
+                    'cv_fusion_a_job_id': result['fusion_a']['jobId'],
+                    'cv_fusion_b_job_id': result['fusion_b']['jobId'],
+                    'cv_merge_job_id': result['merge']['jobId'],
+                    'cv_emit_target': emit_target,
+                })
+            except Exception as e:
+                # Submission succeeded but stamp failed — log and continue. The
+                # merge container's own cv_emitted_at guard will still prevent
+                # double-writes, but the next dispatch tick might resubmit.
+                logger.warning(f"[CVDispatch] stamp failed for {firebase_game_id} "
+                               f"after successful submit: {e}")
+
+            dispatched.append({
+                'firebase_game_id': firebase_game_id,
+                'uball_game_id': uball_game_id,
+                'fusion_a_job_id': result['fusion_a']['jobId'],
+                'fusion_b_job_id': result['fusion_b']['jobId'],
+                'merge_job_id': result['merge']['jobId'],
+            })
+            dispatch_count += 1
+
+        # --- CloudWatch metric emission (errors swallowed by cv_metrics) ---
+        if not dry_run:
+            cv_metrics.emit('CVDispatchSubmitted', len(dispatched),
+                            dimensions={'Stage': 'dispatch'})
+            cv_metrics.emit('CVDispatchSkippedAlreadyProcessed', skipped_dispatched,
+                            dimensions={'Stage': 'dispatch'})
+            cv_metrics.emit('CVDispatchWaitingForAngles', waiting_on_angles,
+                            dimensions={'Stage': 'dispatch'})
+            cv_metrics.emit('CVDispatchSkippedNotSynced', skipped_not_synced,
+                            dimensions={'Stage': 'dispatch'})
+            cv_metrics.emit('CVDispatchErrors', len(submission_errors),
+                            dimensions={'Stage': 'dispatch'})
+            cv_metrics.emit('CVDispatchDurationSeconds',
+                            time.time() - _cv_dispatch_started_at,
+                            unit='Seconds', dimensions={'Stage': 'dispatch'})
+
+        return jsonify({
+            'success': True,
+            'dispatched_count': len(dispatched),
+            'dispatched': dispatched,
+            'skipped_already_dispatched': skipped_dispatched,
+            'skipped_not_synced': skipped_not_synced,
+            'waiting_on_angles': waiting_on_angles,
+            'errors': submission_errors,
+            'dry_run': dry_run,
+            'emit_target': emit_target,
+        })
+
+    except Exception as e:
+        logger.error(f"[CVDispatch] unhandled error: {e}")
+        import traceback
+        traceback.print_exc()
+        try:
+            import cv_metrics
+            cv_metrics.emit('CVDispatchUnhandledError', 1, dimensions={'Stage': 'dispatch'})
+        except Exception:
+            pass
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
 @app.route('/api/games/register-video', methods=['POST'])
 def register_video_in_uball():
     """

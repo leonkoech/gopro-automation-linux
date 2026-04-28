@@ -1,0 +1,53 @@
+{
+  "jobDefinitionName": "cv-merge",
+  "type": "container",
+  "platformCapabilities": ["EC2"],
+  "propagateTags": true,
+  "retryStrategy": {
+    "attempts": 2,
+    "evaluateOnExit": [
+      { "action": "RETRY", "onStatusReason": "Host EC2*" },
+      { "action": "RETRY", "onReason": "Task failed to start" },
+      { "action": "EXIT",  "onExitCode": "1" }
+    ]
+  },
+  "timeout": { "attemptDurationSeconds": 600 },
+  "containerProperties": {
+    "image": "PLACEHOLDER_ECR_IMAGE_URI",
+    "command": [],
+    "vcpus": 2,
+    "memory": 4096,
+    "jobRoleArn": "PLACEHOLDER_CV_BATCH_JOB_ROLE_ARN",
+    "executionRoleArn": "PLACEHOLDER_CV_BATCH_EXECUTION_ROLE_ARN",
+    "resourceRequirements": [
+      { "type": "VCPU",   "value": "2" },
+      { "type": "MEMORY", "value": "4096" }
+    ],
+    "environment": [
+      { "name": "AWS_REGION",              "value": "us-east-1" },
+      { "name": "MODEL_VERSION",           "value": "v1" },
+      { "name": "CV_EMIT_TARGET",          "value": "logs" },
+      { "name": "TEMPORAL_WINDOW",         "value": "1.0" },
+      { "name": "LOG_LEVEL",               "value": "INFO" },
+      { "name": "FIREBASE_CREDENTIALS_PATH", "value": "/app/uball-gopro-fleet-firebase-adminsdk.json" }
+    ],
+    "secrets": [
+      { "name": "UBALL_BACKEND_URL",   "valueFrom": "PLACEHOLDER_UBALL_BACKEND_URL_SECRET_ARN" },
+      { "name": "UBALL_AUTH_EMAIL",    "valueFrom": "PLACEHOLDER_UBALL_AUTH_EMAIL_SECRET_ARN" },
+      { "name": "UBALL_AUTH_PASSWORD", "valueFrom": "PLACEHOLDER_UBALL_AUTH_PASSWORD_SECRET_ARN" }
+    ],
+    "logConfiguration": {
+      "logDriver": "awslogs",
+      "options": {
+        "awslogs-group":         "/aws/batch/cv-merge",
+        "awslogs-region":        "us-east-1",
+        "awslogs-stream-prefix": "cv-merge",
+        "awslogs-create-group":  "true"
+      }
+    }
+  },
+  "tags": {
+    "service":  "cv-shot-detection",
+    "pipeline": "v1"
+  }
+}
