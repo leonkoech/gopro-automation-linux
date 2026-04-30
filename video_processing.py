@@ -1792,6 +1792,27 @@ def process_game_videos(
         game_end = datetime.fromisoformat(ended_at.replace('Z', '+00:00'))
         game_date = created_at[:10]  # YYYY-MM-DD
 
+        # Cap absurd game windows. The pipeline reads Firebase ``endedAt`` as
+        # the game end. If the scorekeeper forgets to hit "End Game" and only
+        # closes the timer the next day (observed Apr 28/29: a 45-min game
+        # got an ``endedAt`` 20 hours after ``createdAt``), the unbounded
+        # window forces the extractor to look for chapters that don't exist
+        # and silently produces no output. A real basketball game is at most
+        # ~80 minutes including timeouts; 90 min is a safe ceiling that
+        # protects against the bad-end-time case without ever clipping a
+        # legitimate game short.
+        MAX_GAME_DURATION = timedelta(minutes=90)
+        if game_end - game_start > MAX_GAME_DURATION:
+            original_end = game_end
+            game_end = game_start + MAX_GAME_DURATION
+            logger.warning(
+                f"  Game window {game_start.isoformat()} → "
+                f"{original_end.isoformat()} is "
+                f"{(original_end - game_start).total_seconds()/3600:.1f}h — "
+                f"exceeds 90-min cap. Likely scorekeeper forgot to hit End "
+                f"Game. Capping to {game_end.isoformat()}."
+            )
+
         logger.info(f"Processing game {firebase_game_id}")
         logger.info(f"  Start: {game_start}, End: {game_end}")
         logger.info(f"  Duration: {(game_end - game_start).total_seconds() / 60:.1f} minutes")
