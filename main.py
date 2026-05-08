@@ -1304,43 +1304,38 @@ def _start_auto_pipeline_internal(auto_delete_sd: bool = True, from_background: 
             limit=50
         )
 
-        # Include sessions that are stopped — either needing upload or already uploaded
-        # Sessions with s3Prefix already set will skip upload in the pipeline
-        # Filter by age: only include sessions from the last N hours to prevent
-        # orphan sessions from expanding the game detection timerange and pulling
-        # in wrong games from different nights.  TEMPORARY: 96h to allow Mar 28
-        # reprocessing.  Revert to 12h after reprocessing is done.
+        # Include sessions that are stopped — either needing upload or already uploaded.
+        # Sessions with s3Prefix already set will skip upload in the pipeline.
+        #
+        # Two defensive filters (see pipeline_session_filter.py for full rules):
+        #   * Age cutoff (12h): old orphan sessions widen the game-detection
+        #     timerange and pull in wrong games from different nights.
+        #   * Empty sessions (0 chapters, no s3Prefix): failed recordings that
+        #     would otherwise anchor the pipeline's recording_start to the
+        #     wrong day.
         from datetime import datetime, timedelta, timezone
-        age_cutoff = datetime.now(timezone.utc) - timedelta(hours=96)
+        from pipeline_session_filter import (
+            DEFAULT_AGE_HOURS,
+            filter_pipeline_sessions,
+            format_skip_log,
+        )
 
-        sessions = []
-        stale_sessions = []
-        for s in all_sessions:
-            if s.get('status') != 'stopped':
-                continue
-            started_at = s.get('startedAt')
-            if started_at:
-                try:
-                    if isinstance(started_at, str):
-                        session_time = datetime.fromisoformat(started_at.replace('Z', '+00:00'))
-                    elif hasattr(started_at, 'timestamp'):
-                        session_time = started_at if started_at.tzinfo else started_at.replace(tzinfo=timezone.utc)
-                    else:
-                        session_time = age_cutoff  # Can't parse, include it
-                    if session_time >= age_cutoff:
-                        sessions.append(s)
-                    else:
-                        stale_sessions.append(s)
-                except (ValueError, TypeError):
-                    sessions.append(s)  # Can't parse, include it
-            else:
-                sessions.append(s)  # No startedAt, include it
+        age_cutoff = datetime.now(timezone.utc) - timedelta(hours=DEFAULT_AGE_HOURS)
+        filtered = filter_pipeline_sessions(all_sessions, age_cutoff)
+        sessions = filtered.sessions
+        stale_sessions = filtered.stale_sessions
+        empty_sessions = filtered.empty_sessions
 
         if stale_sessions:
-            stale_angles = [f"{s.get('angleCode', '?')}({s.get('id', '?')[:8]})" for s in stale_sessions]
-            logger.info(f"[Pipeline] Skipping {len(stale_sessions)} stale sessions (>12h old): {stale_angles}")
+            logger.info(format_skip_log(f"stale (>{DEFAULT_AGE_HOURS}h old)", stale_sessions))
+        if empty_sessions:
+            logger.info(format_skip_log("empty (0 chapters, no s3Prefix)", empty_sessions))
 
-        logger.info(f"[Pipeline] Found {len(sessions)} unprocessed sessions (out of {len(all_sessions)} total, {len(stale_sessions)} stale skipped)")
+        logger.info(
+            f"[Pipeline] Found {len(sessions)} unprocessed sessions "
+            f"(out of {len(all_sessions)} total, {len(stale_sessions)} stale skipped, "
+            f"{len(empty_sessions)} empty skipped)"
+        )
 
         if not sessions:
             if from_background:
