@@ -1,0 +1,65 @@
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Sid": "ResultsRead",
+            "Effect": "Allow",
+            "Action": [
+                "s3:GetObject",
+                "s3:HeadObject",
+                "s3:ListBucket"
+            ],
+            "Resource": [
+                "arn:aws:s3:::uball-cv-results",
+                "arn:aws:s3:::uball-cv-results/cv-results/*"
+            ]
+        },
+        {
+            "Sid": "InputsRead",
+            "Effect": "Allow",
+            "Action": [
+                "s3:GetObject",
+                "s3:HeadObject",
+                "s3:ListBucket"
+            ],
+            "Resource": [
+                "arn:aws:s3:::uball-videos-production",
+                "arn:aws:s3:::uball-videos-production/court-*"
+            ]
+        },
+        {
+            "Sid": "SecretsAccess",
+            "Effect": "Allow",
+            "Action": [
+                "secretsmanager:GetSecretValue",
+                "secretsmanager:DescribeSecret"
+            ],
+            "Resource": [
+                "arn:aws:secretsmanager:us-east-1:840102831548:secret:uball/firebase-admin-cv-merge-*"
+            ]
+        },
+        {
+            "Sid": "Metrics",
+            "Effect": "Allow",
+            "Action": [
+                "cloudwatch:PutMetricData"
+            ],
+            "Resource": "*",
+            "Condition": {
+                "StringEquals": {
+                    "cloudwatch:namespace": "UBall/CV"
+                }
+            }
+        },
+        {
+            "Sid": "Logs",
+            "Effect": "Allow",
+            "Action": [
+                "logs:CreateLogStream",
+                "logs:PutLogEvents",
+                "logs:CreateLogGroup"
+            ],
+            "Resource": "*"
+        }
+    ]
+}
