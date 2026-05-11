@@ -18,7 +18,7 @@ Jetson  →  S3 raw chapters  →  ffmpeg-nvenc transcode (existing AWS Batch)
    →  5-min cron  →  POST /api/cv/dispatch-pending  (Flask on Jetson)
    →  2 × cv-fusion GPU jobs  (Side A = FR+NR, Side B = FL+NL)
    →  cv-merge CPU job  (depends on both fusion jobs succeeding)
-   →  Firebase basketball-games.logs[]  (actionType: "cv_shot")
+   →  Firebase basketball-games.logs[]  (actionType: "score_added"|"shot_missed", payload.source="cv")
    →  plays_sync pushes UBall plays with source="cv"
 ```
 
@@ -167,8 +167,10 @@ curl -s -X POST "http://localhost:5000/api/cv/dispatch-pending" \
 
 ## 6. Forensics — "a shot I expected isn't in the cards"
 
-1. Find the game's Firebase doc and look at `logs[]`. CV shots have
-   `actionType: "cv_shot"`. Their `payload.source = "cv"` and
+1. Find the game's Firebase doc and look at `logs[]`. CV-emitted entries
+   carry `payload.source = "cv"` — `actionType` is `score_added` for
+   made shots and `shot_missed` for misses (same shape an operator
+   writes, per [UBA-217](https://linear.app/uball/issue/UBA-217)).
    `payload.confidence` tells you if it was a low-confidence drop.
 2. The underlying per-side detection JSONs live in S3 at
    `s3://uball-cv-results/{location}/{date}/{game_uuid4}/side-A/detection_results.json`

@@ -51,6 +51,23 @@ def _op_miss(seconds: float, team: str = "left") -> dict:
 
 def _cv_shot(seconds: float, team: str, outcome: str = "made",
              confidence: float = 0.9) -> dict:
+    """UBA-217 production shape — score_added/shot_missed with source=cv."""
+    return {
+        "actionType": "score_added" if outcome == "made" else "shot_missed",
+        "timestamp": _ts(seconds),
+        "team": team,
+        "payload": {
+            "points": 2,
+            "source": "cv",
+            "confidence": confidence,
+        },
+    }
+
+
+def _cv_shot_legacy(seconds: float, team: str, outcome: str = "made",
+                    confidence: float = 0.9) -> dict:
+    """Pre-UBA-217 shape — kept under test to lock the back-compat path
+    so an in-flight shadow run remains readable after a deploy."""
     return {
         "actionType": "cv_shot",
         "timestamp": _ts(seconds),
@@ -130,16 +147,57 @@ class TestExtractCvShots:
         shots = cs.extract_cv_shots(game)
         assert shots[0].outcome == "missed"
 
-    def test_invalid_outcome_dropped(self):
-        game = _game(cv_logs=[_cv_shot(5.0, "left", "undetermined", 0.5)])
+    def test_invalid_outcome_dropped_legacy(self):
+        """Legacy `cv_shot` actionType — invalid outcome in payload is dropped."""
+        game = _game(cv_logs=[_cv_shot_legacy(5.0, "left", "undetermined", 0.5)])
         assert cs.extract_cv_shots(game) == []
 
     def test_reads_alternate_array(self):
-        """After Phase 7 cutover, CV shots land in `logs` rather than
-        `cv_logs_staging`. The CLI's --cv-source flag handles this."""
+        """After the Phase 7 cutover (UBA-229), CV shots land in `logs[]`
+        rather than `cv_logs_staging`. The CLI's --cv-source flag handles
+        this. In `logs[]`, CV shots are distinguished from operator shots
+        via `payload.source == "cv"`."""
         game = _game(logs=[_cv_shot(5.0, "left")])
         assert cs.extract_cv_shots(game, source_array="logs"), \
             "should read from `logs` when source_array overridden"
+
+    def test_back_compat_legacy_cv_shot_actionType(self):
+        """An in-flight shadow window started before this PR may have
+        cv_logs_staging entries with the old `actionType: "cv_shot"`
+        shape. Those must still be readable so the accuracy report
+        spans both shapes cleanly."""
+        game = _game(cv_logs=[
+            _cv_shot_legacy(10.0, "left", "made",   0.91),
+            _cv_shot_legacy(20.0, "right", "missed", 0.62),
+        ])
+        shots = cs.extract_cv_shots(game)
+        assert [s.outcome for s in shots] == ["made", "missed"]
+        assert shots[0].confidence == pytest.approx(0.91)
+
+    def test_score_added_without_source_cv_is_not_a_cv_shot(self):
+        """An operator-entered `score_added` accidentally synced into
+        `cv_logs_staging` (or anywhere extract_cv_shots reads) must NOT
+        be counted as a CV detection — that would inflate TP."""
+        game = _game(cv_logs=[{
+            "actionType": "score_added",
+            "timestamp": _ts(10.0),
+            "team": "left",
+            "payload": {"points": 2},   # no `source: "cv"` field
+        }])
+        assert cs.extract_cv_shots(game) == []
+
+    def test_operator_logs_skip_payload_source_cv(self):
+        """Post-cutover, `logs[]` contains BOTH operator and CV entries.
+        extract_operator_shots must filter out the CV ones via
+        payload.source so we don't double-count them as ground truth."""
+        game = _game(logs=[
+            _op_score(10.0, "left"),                       # operator made
+            _cv_shot(10.5, "left", "made"),                 # CV made (source=cv)
+            _op_miss(20.0, "right"),                        # operator miss
+        ])
+        op_shots = cs.extract_operator_shots(game)
+        assert len(op_shots) == 2
+        assert {s.outcome for s in op_shots} == {"made", "missed"}
 
 
 # ============================================================================

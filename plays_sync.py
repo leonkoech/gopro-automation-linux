@@ -86,21 +86,24 @@ def create_plays_from_firebase_logs(
                 classification = "FT_MAKE"
             else:
                 continue
+        elif action == "shot_missed":
+            # UBA-237: V1 introduces missed shots via the CV pipeline.
+            # Same payload shape as score_added (`payload.points` chooses
+            # the distance bucket); V1 always sets 2.
+            points = payload.get("points", 2)
+            if points == 2:
+                classification = "2PT_MISS"
+            elif points == 3:
+                classification = "3PT_MISS"
+            elif points == 1:
+                classification = "FT_MISS"
+            else:
+                logger.warning(f"[PlaysSync] shot_missed log has invalid points: {payload}")
+                continue
         elif action == "foul_added":
             classification = "FOUL"
         elif action == "game_started":
             classification = "TIPOFF"
-        elif action == "cv_shot":
-            # CV V1 output: made/missed without distance classification.
-            # Written by the merge container in the CV pipeline.
-            outcome = payload.get("outcome")
-            if outcome == "made":
-                classification = "FG_MAKE"
-            elif outcome == "missed":
-                classification = "FG_MISS"
-            else:
-                logger.warning(f"[PlaysSync] cv_shot log missing/invalid outcome: {payload}")
-                continue
         else:
             continue
 
@@ -123,7 +126,8 @@ def create_plays_from_firebase_logs(
         end_ts = ts + 3.0
 
         label = SHOT_LABELS.get(classification, classification)
-        if action == "cv_shot":
+        is_cv = payload.get("source") == "cv"
+        if is_cv:
             note = f"{team_name} — {label} (CV)"
         else:
             note = f"{team_name} — {label}"
@@ -141,9 +145,11 @@ def create_plays_from_firebase_logs(
 
         # Carry CV provenance + confidence through to the backend (optional fields
         # on PlayCreate; safely dropped by the backend if the columns are absent
-        # prior to the 007 migration being applied).
-        if action == "cv_shot":
-            play_data["source"] = payload.get("source", "cv")
+        # prior to the 007 migration being applied). Triggered by
+        # `payload.source == "cv"` rather than the actionType so an operator-
+        # entered shot is never mis-stamped.
+        if is_cv:
+            play_data["source"] = "cv"
             confidence = payload.get("confidence")
             if confidence is not None:
                 play_data["confidence"] = float(confidence)

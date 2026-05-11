@@ -48,11 +48,18 @@ def _human_play(ts_seconds: float, team: str = "left",
 
 def _cv_log(ts_seconds: float, team: str = "left",
             outcome: str = "made", confidence: float = 0.9) -> dict:
+    """UBA-217 production shape — `score_added`/`shot_missed` with
+    `payload.source == "cv"`. extract_cv_shots distinguishes from
+    operator entries via the source field."""
     return {
-        "actionType": "cv_shot",
+        "actionType": "score_added" if outcome == "made" else "shot_missed",
         "timestamp": _ts(ts_seconds),
         "team": team,
-        "payload": {"outcome": outcome, "confidence": confidence},
+        "payload": {
+            "points": 2,
+            "source": "cv",
+            "confidence": confidence,
+        },
     }
 
 

@@ -29,21 +29,45 @@ def build_cv_shot_log(
 ) -> Dict[str, Any]:
     """Build one Firebase `logs[]` entry for a CV-detected shot.
 
-    Shape matches `GameLog` in `gopro-automation-wb/src/types/game.ts` plus
-    the new `actionType: "cv_shot"` variant consumed by `plays_sync.py`.
+    Per [UBA-217](https://linear.app/uball/issue/UBA-217), emits the same
+    `actionType` values an operator would use:
+      * made   → `score_added`  (handled by the existing `plays_sync.py`
+                                branch — classifies as `2PT_MAKE`)
+      * missed → `shot_missed`  (handled by the [UBA-237](
+                                https://linear.app/uball/issue/UBA-237)
+                                branch — classifies as `2PT_MISS`)
+
+    V1 always emits `payload.points = 2` because the YOLOv11n V1 model
+    is distance-blind; V2 will split 2/3pt when the model emits a
+    distance estimate.
+
+    CV provenance lives under `payload.{source,confidence,cv_run_id,
+    model_version,side}` — plays_sync reads these to stamp the
+    resulting Supabase `plays` row.
     """
     game_start = datetime.fromisoformat(str(game_start_iso).replace("Z", "+00:00"))
     shot_time = game_start + timedelta(seconds=shot.timestamp_seconds)
     period = "2nd" if (halftime_ts is not None and shot.timestamp_seconds >= halftime_ts) else "1st"
 
+    if shot.outcome == "made":
+        action_type = "score_added"
+    elif shot.outcome == "missed":
+        action_type = "shot_missed"
+    else:
+        raise ValueError(f"unknown shot outcome: {shot.outcome!r}")
+
     return {
-        "actionType": "cv_shot",
+        "actionType": action_type,
         "timestamp": shot_time.isoformat(),
         "loggedBy": logged_by,
-        "team": team_label,            # "left" or "right"
+        "team": team_label,            # "left" or "right" (hoop side)
         "teamName": team_name or "",
         "payload": {
-            "outcome": shot.outcome,   # "made" or "missed"
+            # V1 default: every shot is 2pt. V2 will set 3 here when the
+            # fusion model emits a 3pt classification.
+            "points": 2,
+            # CV provenance — read by plays_sync to stamp source/confidence
+            # on the resulting Supabase play row.
             "source": "cv",
             "confidence": round(shot.confidence, 4),
             "cv_run_id": cv_run_id,
