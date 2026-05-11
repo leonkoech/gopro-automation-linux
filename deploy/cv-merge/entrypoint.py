@@ -19,7 +19,16 @@ ENV (required):
   SIDE_A_RESULT_S3_KEY       S3 key of Side A detection_results.json
   SIDE_B_RESULT_S3_KEY       S3 key of Side B detection_results.json
   RESULTS_BUCKET             S3 bucket holding the detection JSONs
-  FIREBASE_CREDENTIALS_PATH  Path to Firebase Admin SDK JSON (mounted)
+
+Firebase admin credentials (one of):
+  FIREBASE_ADMIN_SECRET_ID   Secrets Manager ID for the Firebase Admin SDK JSON
+                             (default: uball/firebase-admin-cv-merge — Phase 4 / UBA-219).
+                             Fetched at startup, written to /tmp/firebase-admin.json.
+                             Skipped if LOCAL_MODE / DRY_RUN AND
+                             FIREBASE_CREDENTIALS_PATH already points at a valid file.
+  FIREBASE_CREDENTIALS_PATH  Path to a Firebase Admin SDK JSON file (legacy fallback
+                             for local dev; production loads from Secrets Manager
+                             via FIREBASE_ADMIN_SECRET_ID).
 
   (UBall sync is only attempted when CV_EMIT_TARGET=logs — shadow mode skips it)
   UBALL_BACKEND_URL
@@ -73,6 +82,85 @@ def _env_bool(key: str, default: bool = False) -> bool:
     if raw is None:
         return default
     return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+# -----------------------------------------------------------------------------
+# Firebase credentials — Secrets Manager fetch (Phase 4 / UBA-219)
+# -----------------------------------------------------------------------------
+_FIREBASE_CRED_LOCAL_PATH = "/tmp/firebase-admin.json"
+_FIREBASE_PLACEHOLDER_MARKER = "PLACEHOLDER"
+
+
+def _hydrate_firebase_creds_from_secrets_manager() -> None:
+    """Fetch the Firebase Admin SDK JSON from Secrets Manager, write it to
+    /tmp/firebase-admin.json, and set FIREBASE_CREDENTIALS_PATH to that path.
+
+    Triggered when:
+      * Not in LOCAL_MODE / DRY_RUN, OR
+      * FIREBASE_CREDENTIALS_PATH is not already pointing at an existing file.
+
+    Idempotent: if the env var already points at a valid file, this is a
+    no-op (lets local dev keep working with a host-mounted JSON file).
+
+    Fail-fast guard: if the SecretString is still the bootstrap placeholder
+    (contains "PLACEHOLDER"), raises immediately so the operator gets a
+    clear error rather than a Firebase auth-time error.
+    """
+    is_local = _env_bool("LOCAL_MODE") or _env_bool("DRY_RUN")
+    existing = _env("FIREBASE_CREDENTIALS_PATH")
+    if is_local and existing and Path(existing).exists():
+        log.info(
+            "LOCAL_MODE/DRY_RUN with existing FIREBASE_CREDENTIALS_PATH=%s — "
+            "skipping Secrets Manager fetch",
+            existing,
+        )
+        return
+
+    secret_id = _env("FIREBASE_ADMIN_SECRET_ID", "uball/firebase-admin-cv-merge")
+    region = _env("AWS_REGION", "us-east-1")
+
+    import boto3
+    client = boto3.client("secretsmanager", region_name=region)
+    log.info("fetching Firebase admin creds from Secrets Manager (%s)", secret_id)
+    resp = client.get_secret_value(SecretId=secret_id)
+    secret_string = resp.get("SecretString", "")
+
+    if not secret_string or _FIREBASE_PLACEHOLDER_MARKER in secret_string:
+        raise RuntimeError(
+            f"Firebase admin secret {secret_id!r} still has placeholder value — "
+            "operator must populate it via "
+            "`aws secretsmanager put-secret-value --secret-id "
+            f"{secret_id} --secret-string file://path/to/firebase-admin.json` "
+            "(see scripts/cv_infra/secrets/README.md)."
+        )
+
+    # Sanity-check it parses as JSON and looks like a service-account.
+    try:
+        parsed = json.loads(secret_string)
+    except json.JSONDecodeError as e:
+        raise RuntimeError(
+            f"Firebase admin secret {secret_id!r} is not valid JSON: {e}"
+        ) from e
+    if not isinstance(parsed, dict) or parsed.get("type") != "service_account":
+        raise RuntimeError(
+            f"Firebase admin secret {secret_id!r} does not look like a service "
+            "account JSON (missing or wrong 'type' field)."
+        )
+
+    dest = Path(_FIREBASE_CRED_LOCAL_PATH)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_text(secret_string)
+    # Restrict perms — only the running user (Lambda/Batch task) can read.
+    try:
+        dest.chmod(0o600)
+    except OSError as e:  # filesystem may not support chmod (e.g. some mounts)
+        log.warning("could not chmod %s to 0o600 (%s) — continuing", dest, e)
+
+    os.environ["FIREBASE_CREDENTIALS_PATH"] = str(dest)
+    log.info(
+        "Firebase admin creds hydrated to %s (FIREBASE_CREDENTIALS_PATH set)",
+        dest,
+    )
 
 
 # -----------------------------------------------------------------------------
@@ -188,6 +276,12 @@ def main() -> int:
         }
         log.info("dry_run: synthesized minimal game doc (no Firebase call)")
     else:
+        # Phase 4 / UBA-219: pull the Firebase admin SDK JSON from Secrets
+        # Manager and stage it on disk before FirebaseService imports / inits.
+        # firebase_service.py reads FIREBASE_CREDENTIALS_PATH which this
+        # function rewrites to /tmp/firebase-admin.json.
+        _hydrate_firebase_creds_from_secrets_manager()
+
         from firebase_service import FirebaseService
         fb = FirebaseService()
         game = fb.get_game(game_id)
