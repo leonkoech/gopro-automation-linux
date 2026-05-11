@@ -6,6 +6,9 @@ pipeline. Phase 4 / [UBA-219](https://linear.app/uball/issue/UBA-219).
 | Secret name | Used by | Bootstrap | Linear |
 | --- | --- | --- | --- |
 | `uball/firebase-admin-cv-merge` | `uball-cv-merge` container — Firebase Admin SDK JSON for emitting `cv_shot` logs | `bootstrap-firebase-secret.sh` | [UBA-219](https://linear.app/uball/issue/UBA-219) |
+| `uball/cv/backend-url` | `uball-cv-merge` — UBall backend base URL | `bootstrap-uball-backend-secrets.sh` | [UBA-201](https://linear.app/uball/issue/UBA-201) follow-up |
+| `uball/cv/auth-email` | `uball-cv-merge` — UBall service-account email | `bootstrap-uball-backend-secrets.sh` | [UBA-201](https://linear.app/uball/issue/UBA-201) follow-up |
+| `uball/cv/auth-password` | `uball-cv-merge` — UBall service-account password | `bootstrap-uball-backend-secrets.sh` | [UBA-201](https://linear.app/uball/issue/UBA-201) follow-up |
 
 ## Why a separate folder under `cv_infra/`
 
@@ -78,12 +81,49 @@ To rotate the Firebase service-account key:
 3. (Optional, recommended) revoke the old key in the Firebase console.
 4. No image rebuild needed — the next Batch run picks up the new value.
 
-### Forward-looking — backend secrets
+## `uball/cv/{backend-url,auth-email,auth-password}` — UBall backend creds
 
-The merge job def also expects three UBall-backend secrets:
+### What they hold
 
-- `UBALL_BACKEND_URL`
-- `UBALL_AUTH_EMAIL`
-- `UBALL_AUTH_PASSWORD`
+Credentials for the merge container's `UballClient` to authenticate against the UBall backend when calling `plays_sync.create_plays_from_firebase_logs` after Firebase log emission. The Batch job def injects each into the container as an env var via the ECS `secrets` block — the container code reads `UBALL_BACKEND_URL` / `UBALL_AUTH_EMAIL` / `UBALL_AUTH_PASSWORD` from the environment with no SDK fetch needed.
 
-Those are out of scope for this folder right now — they need a separate IAM scope expansion (the current `uball-cv-merge-execution` policy permits only `uball/firebase-admin-cv-merge-*`). If/when those move into Secrets Manager too, add bootstrap scripts here and expand the IAM resource list. Tracked separately from UBA-219.
+### Why three separate secrets instead of one JSON
+
+- ECS's `secrets` block injects one secret per env var. A single JSON-typed secret would work via `valueFrom: <arn>:<json-key>::` syntax, but three flat secrets are easier to rotate independently and read in the AWS console.
+- Permission scoping is per-secret prefix anyway (`uball/cv/backend-*`, `uball/cv/auth-*`).
+
+### Bootstrap
+
+```
+# Apply — creates all 3 with placeholder values if missing:
+./scripts/cv_infra/secrets/bootstrap-uball-backend-secrets.sh
+
+# Print ARNs in env-var form (handy for piping into the register script):
+./scripts/cv_infra/secrets/bootstrap-uball-backend-secrets.sh --print-arns
+
+# Audit — exit code 4 if any of the 3 is missing or still placeholder:
+./scripts/cv_infra/secrets/bootstrap-uball-backend-secrets.sh --check
+```
+
+### Operator: fill the 3 values
+
+```
+aws secretsmanager put-secret-value --secret-id uball/cv/backend-url   --secret-string 'https://api.uball.example.com'      --region us-east-1
+aws secretsmanager put-secret-value --secret-id uball/cv/auth-email    --secret-string '<service-account-email>'             --region us-east-1
+aws secretsmanager put-secret-value --secret-id uball/cv/auth-password --secret-string '<service-account-password>'          --region us-east-1
+```
+
+Don't paste through chat / screenshots. After filling, `bootstrap-uball-backend-secrets.sh --check` returns exit 0.
+
+### Wire into the Batch job def
+
+```
+eval "$(./scripts/cv_infra/secrets/bootstrap-uball-backend-secrets.sh --print-arns)"
+./scripts/cv_infra/register-batch-job-defs.sh --merge-only
+```
+
+The registration script substitutes the 3 ARNs into the `PLACEHOLDER_*_SECRET_ARN` markers in `deploy/batch-job-defs/cv-merge-job-def.json` and registers a new immutable Batch revision.
+
+### IAM
+
+The merge role `uball-cv-merge-execution` (Phase 0 / [UBA-201](https://linear.app/uball/issue/UBA-201)) had its `SecretsAccess` resource list extended to cover these three by this PR. The canonical JSON for the policy lives in [scripts/cv_infra/iam-policies/cv-merge-inline.json](../iam-policies/cv-merge-inline.json) (PR #38) — after that PR + this one both merge, that file will reflect the live AWS state. Audit with `./scripts/cv_infra/iam-policies/apply-policies.sh --diff`.
