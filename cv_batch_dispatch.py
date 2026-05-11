@@ -18,7 +18,9 @@ Environment Variables:
     CV_FUSION_JOB_DEFINITION    default: cv-fusion
     CV_MERGE_JOB_DEFINITION     default: cv-merge
     CV_FUSION_JOB_QUEUE         default: cv-shot-detection-queue
-    CV_MERGE_JOB_QUEUE          default: cv-merge-queue
+    CV_MERGE_JOB_QUEUE          default: cv-shot-detection-queue (V1 routes
+                                merge to the GPU queue too — see __init__
+                                comment for the follow-up plan)
     CV_MODELS_BUCKET            default: uball-cv-models
     CV_RESULTS_BUCKET           default: uball-cv-results
     CV_MODEL_VERSION            default: v1
@@ -95,7 +97,12 @@ class CVBatchDispatcher:
         self.fusion_job_definition = fusion_job_definition or os.getenv("CV_FUSION_JOB_DEFINITION", "cv-fusion")
         self.merge_job_definition = merge_job_definition or os.getenv("CV_MERGE_JOB_DEFINITION", "cv-merge")
         self.fusion_queue = fusion_queue or os.getenv("CV_FUSION_JOB_QUEUE", "cv-shot-detection-queue")
-        self.merge_queue = merge_queue or os.getenv("CV_MERGE_JOB_QUEUE", "cv-merge-queue")
+        # V1 routes the (CPU-only) merge job to the same GPU queue as fusion —
+        # we pay for a few minutes of g4dn idle CPU rather than provisioning
+        # a separate CPU-only compute env + queue. Follow-up: stand up
+        # `cv-merge-queue` on a CPU CE once V1 traffic patterns are stable
+        # (tracked alongside Phase 0 cleanups).
+        self.merge_queue = merge_queue or os.getenv("CV_MERGE_JOB_QUEUE", "cv-shot-detection-queue")
         self.model_version = model_version or os.getenv("CV_MODEL_VERSION", "v1")
         self.emit_target = emit_target or os.getenv("CV_EMIT_TARGET", "logs")
 
