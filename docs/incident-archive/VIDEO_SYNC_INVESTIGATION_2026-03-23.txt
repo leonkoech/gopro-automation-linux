@@ -1,0 +1,291 @@
+================================================================================
+VIDEO OUT-OF-SYNC INVESTIGATION REPORT
+March 23, 2026
+Session: March 20 evening (3 games)
+================================================================================
+
+VERDICT: ALL 6 EXTRACTED VIDEOS CONTAIN WRONG FOOTAGE (March 19 old data)
+ROOT CAUSE: GoPro SD cards were NOT formatted — old chapters from March 19 mixed in
+
+================================================================================
+1. SESSION OVERVIEW
+================================================================================
+
+FL Camera (Jetson-2, Backbone 1):
+  Session ID:    C4gHDoA2vgJ5LC9knHIQ
+  Started (UTC): 2026-03-21T00:33:42Z  (= March 20, 8:33 PM EDT)
+  Ended (UTC):   2026-03-21T03:53:49Z  (= March 20, 11:53 PM EDT)
+  Duration:      3h 20m 07s
+  Total Chapters: 11  (6 OLD from Mar 19 + 5 CURRENT from Mar 20)
+  Total Size:    105.3 GB (98 GB raw)
+  S3 Prefix:     raw-chapters/enxd43260ddac87_FL_20260320_203342/
+
+FR Camera (Jetson-1, Backbone 2):
+  Session ID:    kBYW7yZssMkue8T58xHK
+  Started (UTC): 2026-03-21T00:33:40Z  (= March 20, 8:33 PM EDT)
+  Ended (UTC):   2026-03-21T03:53:51Z  (= March 20, 11:53 PM EDT)
+  Duration:      3h 20m 11s
+  Total Chapters: 7   (4 OLD from Mar 19 + 3 CURRENT from Mar 20)
+  Total Size:    56.0 GB (52 GB raw)
+  S3 Prefix:     raw-chapters/enxd43260dc857e_FR_20260320_203340/
+
+NOTE ON TIMESTAMPS:
+  All timestamps in Firebase and the pipeline are stored in UTC (ISO 8601 with Z suffix).
+  GoPro creation_time metadata is also UTC.
+  Local time is EDT (UTC-4) during March in Miami.
+  So "2026-03-21T00:33:42Z" = "March 20 at 8:33 PM local time"
+
+================================================================================
+2. CHAPTER METADATA — FL CAMERA (Jetson-2)
+================================================================================
+
+#    Filename              Duration(s)  Cumul Start  Cumul End    Creation Time (UTC)         DATE
+---- --------------------- ------------ ------------ ------------ --------------------------- --------
+1    GX010096.MP4              80.147        0.000       80.147   2026-03-19T22:36:24Z        MAR 19 *** OLD
+2    GX010097.MP4           3,011.008       80.147    3,091.155   2026-03-19T23:49:49Z        MAR 19 *** OLD
+3    GX020097.MP4           2,690.688    3,091.155    5,781.843   2026-03-19T23:49:49Z        MAR 19 *** OLD
+4    GX030097.MP4           2,562.560    5,781.843    8,344.403   2026-03-19T23:49:49Z        MAR 19 *** OLD
+5    GX040097.MP4           2,690.688    8,344.403   11,035.091   2026-03-19T23:49:49Z        MAR 19 *** OLD
+6    GX050097.MP4           2,625.156   11,035.091   13,660.247   2026-03-19T23:49:49Z        MAR 19 *** OLD
+                            --------- OLD FOOTAGE BOUNDARY (13,660s = 3h 47m) ---------
+7    GX010098.MP4           2,946.944   13,660.247   16,607.191   2026-03-21T00:33:42Z        MAR 21  CURRENT
+8    GX020098.MP4           2,882.880   16,607.191   19,490.071   2026-03-21T00:33:42Z        MAR 21  CURRENT
+9    GX030098.MP4           2,754.752   19,490.071   22,244.823   2026-03-21T00:33:42Z        MAR 21  CURRENT
+10   GX040098.MP4           3,011.008   22,244.823   25,255.831   2026-03-21T00:33:42Z        MAR 21  CURRENT
+11   GX050098.MP4             283.051   25,255.831   25,538.881   2026-03-21T00:33:42Z        MAR 21  CURRENT
+
+FL Summary:
+  OLD footage (Ch 1-6):     13,660.247s = 3h 47m 40s  (from March 19 evening)
+  CURRENT footage (Ch 7-11): 11,878.634s = 3h 17m 59s  (from March 20 evening — the actual session)
+  TOTAL concat duration:    25,538.881s = 7h 05m 39s
+
+================================================================================
+3. CHAPTER METADATA — FR CAMERA (Jetson-1)
+================================================================================
+
+#    Filename              Duration(s)  Cumul Start  Cumul End    Creation Time (UTC)         DATE
+---- --------------------- ------------ ------------ ------------ --------------------------- --------
+1    GX010064.MP4              80.013        0.000       80.013   2026-03-19T22:36:21Z        MAR 19 *** OLD
+2    GX010065.MP4           4,868.864       80.013    4,948.877   2026-03-19T23:49:50Z        MAR 19 *** OLD
+3    GX020065.MP4           4,804.800    4,948.877    9,753.677   2026-03-19T23:49:50Z        MAR 19 *** OLD
+4    GX030065.MP4           3,904.901    9,753.677   13,658.578   2026-03-19T23:49:50Z        MAR 19 *** OLD
+                            --------- OLD FOOTAGE BOUNDARY (13,659s = 3h 47m) ---------
+5    GX010066.MP4           4,868.864   13,658.578   18,527.442   2026-03-21T00:33:36Z        MAR 21  CURRENT
+6    GX020066.MP4           4,868.864   18,527.442   23,396.306   2026-03-21T00:33:36Z        MAR 21  CURRENT
+7    GX030066.MP4           2,144.448   23,396.306   25,540.754   2026-03-21T00:33:36Z        MAR 21  CURRENT
+
+FR Summary:
+  OLD footage (Ch 1-4):     13,658.578s = 3h 47m 39s  (from March 19 evening)
+  CURRENT footage (Ch 5-7): 11,882.176s = 3h 18m 02s  (from March 20 evening — the actual session)
+  TOTAL concat duration:    25,540.754s = 7h 05m 41s
+
+================================================================================
+4. GAME TIMESTAMPS (from Firebase basketball-games collection)
+================================================================================
+
+All times in UTC. Games played on the evening of March 20 EDT.
+
+Game 1: 305 TURNOVERS vs SIGUE S.
+  Firebase ID:  bJ4avNnoqBFIlW8jW8m4
+  S3 Folder:    5d8ae710-0c8d-4c41-b932
+  Created (UTC): 2026-03-21T00:43:29.146Z  (= 8:43 PM EDT Mar 20)
+  Ended (UTC):   2026-03-21T01:37:46.402Z  (= 9:37 PM EDT Mar 20)
+  Duration:      54m 17s (3,257.256s)
+  Score:         305 T.O. 52 — SIGUE S. 39
+  Final Period:  2nd
+
+Game 2: RIM JOB vs MID A. B.
+  Firebase ID:  LhUAYGKK5TtWq7GYmQrW
+  S3 Folder:    f6c7ef88-e9e4-4216-aae2
+  Created (UTC): 2026-03-21T01:46:11.647Z  (= 9:46 PM EDT Mar 20)
+  Ended (UTC):   2026-03-21T02:39:00.587Z  (= 10:39 PM EDT Mar 20)
+  Duration:      52m 49s (3,168.940s)
+  Score:         RIM JOB 53 — MID A. B. 71
+  Final Period:  2nd
+
+Game 3: LOS SAZONEROS vs LOCKSMITH
+  Firebase ID:  kJUK2zjn7Gmqj9FHLdTR
+  S3 Folder:    5d91dd42-b267-4f73-acf6
+  Created (UTC): 2026-03-21T02:52:10.013Z  (= 10:52 PM EDT Mar 20)
+  Ended (UTC):   2026-03-21T03:50:23.187Z  (= 11:50 PM EDT Mar 20)
+  Duration:      58m 13s (3,493.174s)
+  Score:         LOS SAZO. 65 — LOCKSMITH 69
+  Final Period:  2nd
+
+================================================================================
+5. OFFSET CALCULATION — WHAT THE PIPELINE COMPUTED
+================================================================================
+
+The pipeline calculates: offset = game_start - session_start
+
+Session start (FL): 2026-03-21T00:33:42Z
+Session start (FR): 2026-03-21T00:33:40Z
+
+                            Expected Offset    Expected Offset
+Game                        from FL start      from FR start
+---------------------------  ---------------    ---------------
+1. 305 TURNOVERS             587.0s             589.0s
+2. RIM JOB                 4,349.0s           4,351.0s
+3. LOS SAZONEROS           8,308.0s           8,310.0s
+
+CRITICAL PROBLEM:
+  All offsets are < 13,660s (the boundary where current footage begins).
+  This means ALL game extractions land in the OLD March 19 footage!
+
+  The current session footage starts at:
+    FL: cumulative offset 13,660.247s (chapter 7, GX010098)
+    FR: cumulative offset 13,658.578s (chapter 5, GX010066)
+
+  Correct offsets (if old chapters were excluded):
+    Game 1: 587s from start of GX010098 / 589s from start of GX010066
+    Game 2: 4,349s from start of GX010098 / 4,351s from start of GX010066
+    Game 3: 8,308s from start of GX010098 / 8,310s from start of GX010066
+
+================================================================================
+6. ACTUAL BATCH JOB PARAMETERS (what was sent to AWS Batch)
+================================================================================
+
+All 6 jobs used job definition: ffmpeg-extract-transcode:11
+All 6 jobs: SUCCEEDED (but extracted WRONG footage)
+
+--- Game 1: 305 TURNOVERS (5d8ae710-0c8d-4c41-b932) ---
+
+  FL Job (c0a20b61):
+    Chapters used: GX010097 + GX020097  *** BOTH OLD (March 19)
+    Offset: 506.55s into concat of those chapters
+    Duration: 3,257s + 30s buffer = 3,287s
+    SHOULD HAVE USED: GX010098 (+ maybe GX020098)
+
+  FR Job (46351728):
+    Chapters used: GX010065  *** OLD (March 19)
+    Offset: 508.74s into that chapter
+    Duration: 3,257s + 30s buffer = 3,287s
+    SHOULD HAVE USED: GX010066
+
+--- Game 2: RIM JOB (f6c7ef88-e9e4-4216-aae2) ---
+
+  FL Job (e27c6ac7):
+    Chapters used: GX020097 + GX030097  *** BOTH OLD (March 19)
+    Offset: 1,258.05s into concat
+    Duration: 3,169s + 30s buffer = 3,199s
+    SHOULD HAVE USED: GX010098 + GX020098
+
+  FR Job (c3a172da):
+    Chapters used: GX010065 + GX020065  *** BOTH OLD (March 19)
+    Offset: 4,271.24s into concat
+    Duration: 3,169s + 30s buffer = 3,199s
+    SHOULD HAVE USED: GX010066 + GX020066
+
+--- Game 3: LOS SAZONEROS (5d91dd42-b267-4f73-acf6) ---
+
+  FL Job (2496a8ac):
+    Chapters used: GX030097 + GX040097 + GX050097  *** ALL OLD (March 19)
+    Offset: 2,525.72s into concat
+    Duration: 3,493s + 30s buffer = 3,523s
+    SHOULD HAVE USED: GX020098 + GX030098 (+ maybe GX040098)
+
+  FR Job (8629b03b):
+    Chapters used: GX020065 + GX030065  *** BOTH OLD (March 19)
+    Offset: 3,360.74s into concat
+    Duration: 3,493s + 30s buffer = 3,523s
+    SHOULD HAVE USED: GX020066 + GX030066
+
+================================================================================
+7. EXTRACTED VIDEO METADATA (what's actually in S3 right now)
+================================================================================
+
+Game 1 - 305 TURNOVERS:
+  FL: 4.14 GB, 3,287.3s (54.8 min) — contains March 19 old footage
+  FR: 3.42 GB, 3,287.3s (54.8 min) — contains March 19 old footage
+
+Game 2 - RIM JOB:
+  FL: 4.50 GB, 3,199.0s (53.3 min) — contains March 19 old footage
+  FR: 3.83 GB, 3,199.0s (53.3 min) — contains March 19 old footage
+
+Game 3 - LOS SAZONEROS:
+  FL: 4.72 GB, 3,523.2s (58.7 min) — contains March 19 old footage
+  FR: 4.07 GB, 3,523.2s (58.7 min) — contains March 19 old footage
+
+Note: Durations match expected game durations (with 30s buffer), confirming the
+duration calculation is correct. Only the OFFSET/CHAPTER SELECTION is wrong.
+
+================================================================================
+8. UTC CONSISTENCY CHECK
+================================================================================
+
+Component                    Timezone Used    Format                    Correct?
+---------------------------  ---------------  -------------------------  --------
+Firebase session.startedAt   UTC              ISO 8601 with Z suffix    YES
+Firebase session.endedAt     UTC              ISO 8601 with Z suffix    YES
+Firebase game.createdAt      UTC              ISO 8601 with Z suffix    YES
+Firebase game.endedAt        UTC              ISO 8601 with Z suffix    YES
+GoPro chapter creation_time  UTC              ISO 8601 with Z suffix    YES
+Pipeline offset calculation  UTC (seconds)    Computed from UTC times   YES
+Batch job OFFSET_SECONDS     N/A (seconds)    Float seconds             YES
+S3 object timestamps         UTC              ISO 8601                  YES
+Segment session naming       LOCAL (EDT)      YYYYMMDD_HHMMSS          DIFFERENT*
+
+* The segmentSession name uses local time (20260320_203342 = Mar 20 8:33 PM EDT)
+  while the actual UTC startedAt is 2026-03-21T00:33:42Z (Mar 21 00:33 UTC).
+  This is cosmetic only — not used in calculations. But worth noting.
+
+CONCLUSION: All timestamps that matter for extraction are consistently UTC.
+The bug is NOT a timezone issue.
+
+================================================================================
+9. ROOT CAUSE ANALYSIS
+================================================================================
+
+TWO ERRORS contributed to this failure:
+
+ERROR 1 — HUMAN ERROR (Primary Cause):
+  The GoPro SD cards were NOT formatted/cleared between the March 19 and
+  March 20 recording sessions. When the pipeline scraped the SD cards on
+  March 20, it found chapters from BOTH sessions:
+    - FL: 6 old chapters (GX010096 + GX01-05/0097) from March 19
+    - FL: 5 new chapters (GX01-05/0098) from March 20
+    - FR: 4 old chapters (GX010064 + GX01-03/0065) from March 19
+    - FR: 3 new chapters (GX01-03/0066) from March 20
+
+  The old footage totals ~13,660 seconds (3h 47m) per camera.
+
+ERROR 2 — PIPELINE ERROR (Software Bug):
+  The pipeline does NOT filter chapters by creation_time. It blindly includes
+  ALL chapter files found on the SD card in the session's chapterFiles array.
+
+  When calculating extraction parameters, it treats the entire set of chapters
+  as one continuous recording starting from session.startedAt. Since the old
+  chapters come first (lower GoPro file numbers), ALL game offsets land within
+  the old footage region.
+
+  The pipeline SHOULD:
+  a) Filter chapters by comparing creation_time to session.startedAt
+  b) Only include chapters whose creation_time is within a reasonable window
+     of the session start (e.g., same day or within 1 hour)
+  c) OR: Use chapter creation_time to build a proper timeline instead of
+     assuming chapters are contiguous from recording start
+
+================================================================================
+10. WHAT NEEDS TO HAPPEN
+================================================================================
+
+IMMEDIATE (to fix these 3 games):
+  1. Re-run batch extraction using ONLY current session chapters:
+     - FL: chapters 7-11 (GX010098 through GX050098)
+     - FR: chapters 5-7 (GX010066 through GX030066)
+  2. Use the original offsets (587s, 4349s, 8308s for FL) since they're
+     correct relative to the current session footage
+
+PIPELINE FIX (to prevent recurrence):
+  1. Add chapter creation_time filtering in the chapter discovery phase
+  2. Compare each chapter's creation_time against session.startedAt
+  3. Only include chapters from the current recording session
+  4. Log a warning when old chapters are detected
+
+OPERATIONAL FIX:
+  1. Always format GoPro SD cards before each recording session
+  2. Add a pre-recording check that warns if old files are found on the SD card
+
+================================================================================
+END OF REPORT
+================================================================================
