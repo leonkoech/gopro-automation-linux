@@ -1,0 +1,7 @@
+# Lambda runtime dependencies for uball-cv-dispatch.
+#
+# boto3 is provided by the Lambda Python runtime; we still pin a floor
+# version so unit tests on a fresh venv pull a recent SDK with the
+# AWS Batch + S3 APIs we depend on.
+boto3>=1.34.0
+botocore>=1.34.0
