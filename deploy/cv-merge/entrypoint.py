@@ -255,10 +255,10 @@ def main() -> int:
 
     # ---- imports that need sys.path set up ----
     from cv_merge import (
-        attribute_team,
         build_cv_shot_log,
         emit_cv_logs,
         find_halftime_seconds,
+        hoop_side_for_shot,
         is_cv_already_emitted,
         merge,
     )
@@ -314,15 +314,16 @@ def main() -> int:
     if not game_start_iso:
         raise RuntimeError(f"basketball-games/{game_id} missing createdAt")
 
+    # V1 simplified attribution (UBA-214 update 2026-04-23):
+    # the Firebase log `team` field is the hoop side ("left"/"right");
+    # plays_sync.py downstream maps it to game.leftTeam / game.rightTeam.
+    # We prefer the per-shot `hoop_side` if the fusion run stamped it
+    # (UBA-238, Uball_dual_angle_fusion PR #2), otherwise derive from
+    # `side` (A=right, B=left).
     new_logs = []
     made = missed = 0
     for shot in merged:
-        team_label = attribute_team(
-            side=shot.side,
-            timestamp_seconds=shot.timestamp_seconds,
-            starting_side_team1=starting_side,
-            halftime_ts=halftime_ts,
-        )
+        team_label = hoop_side_for_shot(side=shot.side, shot_source=shot.source_shot)
         team_name = left_team_name if team_label == "left" else right_team_name
         new_logs.append(build_cv_shot_log(
             shot=shot,
