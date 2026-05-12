@@ -1749,6 +1749,90 @@ def get_game(game_id):
         }), 500
 
 
+def _ref_score_pick_int(value):
+    """Return value as int if it's a real int/float, else None. Skips bools."""
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return int(value)
+    return None
+
+
+def _ref_score_ended_at(value):
+    """Pass through string timestamps, otherwise stringify datetime-likes."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value
+    if isinstance(value, datetime):
+        return value.isoformat()
+    to_dt = getattr(value, 'to_datetime', None)
+    if callable(to_dt):
+        try:
+            return to_dt().isoformat()
+        except Exception:
+            return None
+    return None
+
+
+@app.route('/api/games/<game_id>/score', methods=['GET'])
+def get_game_score(game_id):
+    """
+    Authoritative final score for a Firebase game, consumed by the
+    annotation backend's /api/v1/games/{game_id}/reference-score proxy
+    so EditorPage can render a reference next to the annotator-entered
+    totals (UBA-260).
+
+    Auth: when GOPRO_INTERNAL_TOKEN is set, X-Internal-Token must match.
+    """
+    expected_token = os.environ.get('GOPRO_INTERNAL_TOKEN')
+    if expected_token:
+        if request.headers.get('X-Internal-Token') != expected_token:
+            return jsonify({'error': 'unauthorized'}), 401
+
+    if not firebase_service:
+        return jsonify({'error': 'firebase unavailable'}), 503
+
+    try:
+        game = firebase_service.get_game(game_id)
+    except Exception as e:
+        logger.error(f"[Games] reference-score firebase error for {game_id}: {e}")
+        return jsonify({'error': 'firebase error'}), 503
+
+    if not game:
+        return jsonify({'error': 'game not found'}), 404
+
+    left_team = game.get('leftTeam') or {}
+    right_team = game.get('rightTeam') or {}
+
+    home_score = _ref_score_pick_int(left_team.get('finalScore'))
+    away_score = _ref_score_pick_int(right_team.get('finalScore'))
+
+    # Legacy fallback: score.home / score.away — matches the sync logic
+    # at main.py:1920-1924.
+    if home_score is None or away_score is None:
+        legacy = game.get('score')
+        if isinstance(legacy, dict):
+            if home_score is None:
+                home_score = _ref_score_pick_int(legacy.get('home'))
+            if away_score is None:
+                away_score = _ref_score_pick_int(legacy.get('away'))
+
+    return jsonify({
+        'game_id': game.get('id', game_id),
+        'home': {
+            'name': left_team.get('name'),
+            'final_score': home_score,
+        },
+        'away': {
+            'name': right_team.get('name'),
+            'final_score': away_score,
+        },
+        'ended_at': _ref_score_ended_at(game.get('endedAt') or game.get('ended_at')),
+        'source': 'firebase',
+    })
+
+
 from plays_sync import create_plays_from_firebase_logs
 
 

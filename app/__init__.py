@@ -29,7 +29,20 @@ def create_app(config_class=None):
     app.config.from_object(config_class)
 
     # Enable CORS
+    annotation_origins = [
+        origin.strip()
+        for origin in os.environ.get(
+            "ANNOTATION_BACKEND_ORIGINS",
+            "http://localhost:8000",
+        ).split(",")
+        if origin.strip()
+    ]
     CORS(app, resources={
+        r"/api/games/*/score": {
+            "origins": annotation_origins,
+            "methods": ["GET", "OPTIONS"],
+            "allow_headers": ["Content-Type", "X-Internal-Token"],
+        },
         r"/*": {
             "origins": "*",
             "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
