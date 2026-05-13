@@ -24,12 +24,12 @@
       { "type": "MEMORY", "value": "4096" }
     ],
     "environment": [
-      { "name": "AWS_REGION",              "value": "us-east-1" },
-      { "name": "MODEL_VERSION",           "value": "v1" },
-      { "name": "CV_EMIT_TARGET",          "value": "logs" },
-      { "name": "TEMPORAL_WINDOW",         "value": "1.0" },
-      { "name": "LOG_LEVEL",               "value": "INFO" },
-      { "name": "FIREBASE_CREDENTIALS_PATH", "value": "/app/uball-gopro-fleet-firebase-adminsdk.json" }
+      { "name": "AWS_REGION",                "value": "us-east-1" },
+      { "name": "MODEL_VERSION",             "value": "v1" },
+      { "name": "CV_EMIT_TARGET",            "value": "logs" },
+      { "name": "TEMPORAL_WINDOW",           "value": "1.0" },
+      { "name": "LOG_LEVEL",                 "value": "INFO" },
+      { "name": "FIREBASE_ADMIN_SECRET_ID",  "value": "uball/firebase-admin-cv-merge" }
     ],
     "secrets": [
       { "name": "UBALL_BACKEND_URL",   "valueFrom": "PLACEHOLDER_UBALL_BACKEND_URL_SECRET_ARN" },
