@@ -86,21 +86,24 @@ def create_plays_from_firebase_logs(
                 classification = "FT_MAKE"
             else:
                 continue
+        elif action == "shot_missed":
+            # UBA-237: V1 introduces missed shots via the CV pipeline.
+            # Same payload shape as score_added (`payload.points` chooses
+            # the distance bucket); V1 always sets 2.
+            points = payload.get("points", 2)
+            if points == 2:
+                classification = "2PT_MISS"
+            elif points == 3:
+                classification = "3PT_MISS"
+            elif points == 1:
+                classification = "FT_MISS"
+            else:
+                logger.warning(f"[PlaysSync] shot_missed log has invalid points: {payload}")
+                continue
         elif action == "foul_added":
             classification = "FOUL"
         elif action == "game_started":
             classification = "TIPOFF"
-        elif action == "cv_shot":
-            # CV V1 output: made/missed without distance classification.
-            # Written by the merge container in the CV pipeline.
-            outcome = payload.get("outcome")
-            if outcome == "made":
-                classification = "FG_MAKE"
-            elif outcome == "missed":
-                classification = "FG_MISS"
-            else:
-                logger.warning(f"[PlaysSync] cv_shot log missing/invalid outcome: {payload}")
-                continue
         else:
             continue
 
@@ -122,10 +125,21 @@ def create_plays_from_firebase_logs(
         start_ts = max(0.0, ts - 5.0)
         end_ts = ts + 3.0
 
-        label = SHOT_LABELS.get(classification, classification)
-        if action == "cv_shot":
-            note = f"{team_name} — {label} (CV)"
+        is_cv = payload.get("source") == "cv"
+        if is_cv:
+            # V1 CV pipeline is distance-blind: we always assign the 2PT_MAKE/2PT_MISS
+            # bucket as a backend default, but the human-readable note must NOT claim
+            # "2-Pointer" since the model can't actually tell 2 vs 3.  V2 will emit
+            # a distance estimate and we'll restore the bucket-specific label.
+            if classification.endswith("_MAKE"):
+                cv_label = "Made"
+            elif classification.endswith("_MISS"):
+                cv_label = "Missed"
+            else:
+                cv_label = SHOT_LABELS.get(classification, classification)
+            note = f"{team_name} — {cv_label} (CV)"
         else:
+            label = SHOT_LABELS.get(classification, classification)
             note = f"{team_name} — {label}"
 
         play_data: Dict[str, Any] = {
@@ -141,9 +155,11 @@ def create_plays_from_firebase_logs(
 
         # Carry CV provenance + confidence through to the backend (optional fields
         # on PlayCreate; safely dropped by the backend if the columns are absent
-        # prior to the 007 migration being applied).
-        if action == "cv_shot":
-            play_data["source"] = payload.get("source", "cv")
+        # prior to the 007 migration being applied). Triggered by
+        # `payload.source == "cv"` rather than the actionType so an operator-
+        # entered shot is never mis-stamped.
+        if is_cv:
+            play_data["source"] = "cv"
             confidence = payload.get("confidence")
             if confidence is not None:
                 play_data["confidence"] = float(confidence)

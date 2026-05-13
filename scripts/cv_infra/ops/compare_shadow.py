@@ -77,14 +77,28 @@ class GameReport:
 
 
 # ---------------------------------------------------------------- extraction
-# Operator-entered shots live in basketball-games.logs[] with
-# actionType "score_added" (made shots only — missed shots are not
-# routinely tracked by operators). plays_sync.py is the canonical
-# reference for the actionType set. CV shadow shots live in
-# basketball-games.cv_logs_staging[] with actionType "cv_shot".
-_OPERATOR_MADE_ACTIONS = {"score_added"}
-_OPERATOR_MISSED_ACTIONS = {"shot_missed"}  # tolerated if present
-_CV_ACTIONS = {"cv_shot"}
+# Per UBA-217, CV writes the same actionTypes as the operator
+# (`score_added` for made shots; `shot_missed` for missed shots);
+# the difference is `payload.source == "cv"`. Earlier emitter revisions
+# wrote `actionType: "cv_shot"` with `payload.outcome` — kept as a
+# back-compat path below so a doc with both shapes can still be
+# compared cleanly.
+_MADE_ACTIONS = {"score_added"}
+_MISSED_ACTIONS = {"shot_missed"}
+_SHOT_ACTIONS = _MADE_ACTIONS | _MISSED_ACTIONS
+
+# Back-compat aliases (early external callers imported these).
+_OPERATOR_MADE_ACTIONS = _MADE_ACTIONS
+_OPERATOR_MISSED_ACTIONS = _MISSED_ACTIONS
+_CV_ACTIONS = {"cv_shot"}  # legacy actionType — still accepted on read
+
+
+def _action_to_outcome(action: Optional[str]) -> Optional[str]:
+    if action in _MADE_ACTIONS:
+        return "made"
+    if action in _MISSED_ACTIONS:
+        return "missed"
+    return None
 
 
 def _seconds_since_game_start(log: Dict[str, Any],
@@ -106,15 +120,20 @@ def _seconds_since_game_start(log: Dict[str, Any],
 
 
 def extract_operator_shots(game: Dict[str, Any]) -> List[Shot]:
+    """Yield operator-entered shots from `basketball-games.logs[]`.
+
+    Skips entries with `payload.source == "cv"` so a post-cutover game
+    (where CV shots ALSO land in `logs[]`) doesn't double-count CV
+    detections as operator entries.
+    """
     out: List[Shot] = []
     game_start = game.get("createdAt")
     for log in game.get("logs", []) or []:
-        action = log.get("actionType")
-        if action in _OPERATOR_MADE_ACTIONS:
-            outcome = "made"
-        elif action in _OPERATOR_MISSED_ACTIONS:
-            outcome = "missed"
-        else:
+        outcome = _action_to_outcome(log.get("actionType"))
+        if outcome is None:
+            continue
+        payload = log.get("payload") or {}
+        if payload.get("source") == "cv":
             continue
         ts = _seconds_since_game_start(log, game_start)
         if ts is None:
@@ -129,14 +148,32 @@ def extract_operator_shots(game: Dict[str, Any]) -> List[Shot]:
 
 def extract_cv_shots(game: Dict[str, Any], *,
                      source_array: str = "cv_logs_staging") -> List[Shot]:
+    """Yield CV-emitted shots from `game[source_array]`.
+
+    Two emission shapes are accepted:
+      * UBA-217 production shape — `actionType: "score_added"` or
+        `"shot_missed"` with `payload.source == "cv"`. Outcome comes
+        from the actionType.
+      * Legacy back-compat — `actionType: "cv_shot"` with
+        `payload.outcome ∈ {"made", "missed"}`. Older shadow runs
+        emitted this shape; still readable so an in-progress shadow
+        window remains comparable after a deploy.
+    """
     out: List[Shot] = []
     game_start = game.get("createdAt")
     for log in game.get(source_array, []) or []:
-        if log.get("actionType") not in _CV_ACTIONS:
-            continue
         payload = log.get("payload") or {}
-        outcome = payload.get("outcome")
-        if outcome not in ("made", "missed"):
+        action = log.get("actionType")
+        outcome = _action_to_outcome(action)
+        if outcome is not None and payload.get("source") == "cv":
+            # Production path.
+            pass
+        elif action == "cv_shot":
+            # Legacy back-compat.
+            outcome = payload.get("outcome")
+            if outcome not in ("made", "missed"):
+                continue
+        else:
             continue
         ts = _seconds_since_game_start(log, game_start)
         if ts is None:
