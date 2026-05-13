@@ -1,0 +1,17 @@
+__pycache__/
+**/__pycache__/
+**/*.pyc
+.DS_Store
+.git/
+.gitignore
+.env
+.claude/
+
+# Exclude everything from the build context except the files the Dockerfile
+# explicitly COPYs. Large dirs like docs/, scripts/, tests/ stay out.
+docs/
+scripts/
+tests/
+input/
+results/
+offsets/

@@ -1,0 +1,14 @@
+# Pinned deps for uball-cv-merge. Installed in the Dockerfile.
+# CPU-only; no torch, no ultralytics.
+
+boto3==1.35.55
+botocore==1.35.55
+
+firebase-admin==6.5.0
+google-cloud-firestore==2.18.0
+
+requests==2.32.3
+
+# Stdlib-only for everything else — merge + team_attribution + emitter
+# are pure-Python and the in-repo helpers (firebase_service, uball_client,
+# plays_sync, logging_service) are copied directly into the image.

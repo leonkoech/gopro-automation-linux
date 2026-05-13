@@ -1,0 +1,111 @@
+{
+  "widgets": [
+    {
+      "type": "metric",
+      "x": 0, "y": 0, "width": 12, "height": 6,
+      "properties": {
+        "title": "CV jobs — success vs failure",
+        "view": "timeSeries",
+        "stat": "Sum",
+        "period": 300,
+        "region": "us-east-1",
+        "stacked": false,
+        "metrics": [
+          [ "UBall/CV", "CVJobSuccess", "Stage", "fusion", { "label": "fusion-success" } ],
+          [ ".",       "CVJobFailure", "Stage", "fusion", { "label": "fusion-failure", "color": "#d62728" } ],
+          [ ".",       "CVJobSuccess", "Stage", "merge",  { "label": "merge-success" } ],
+          [ ".",       "CVJobFailure", "Stage", "merge",  { "label": "merge-failure", "color": "#d62728" } ]
+        ],
+        "yAxis": { "left": { "min": 0 } }
+      }
+    },
+    {
+      "type": "metric",
+      "x": 12, "y": 0, "width": 12, "height": 6,
+      "properties": {
+        "title": "Dispatch tick outcomes",
+        "view": "timeSeries",
+        "stat": "Sum",
+        "period": 300,
+        "region": "us-east-1",
+        "stacked": true,
+        "metrics": [
+          [ "UBall/CV", "CVDispatchSubmitted",            "Stage", "dispatch" ],
+          [ ".",        "CVDispatchSkippedAlreadyProcessed", "Stage", "dispatch" ],
+          [ ".",        "CVDispatchWaitingForAngles",     "Stage", "dispatch" ],
+          [ ".",        "CVDispatchSkippedNotSynced",     "Stage", "dispatch" ],
+          [ ".",        "CVDispatchErrors",               "Stage", "dispatch" ]
+        ]
+      }
+    },
+    {
+      "type": "metric",
+      "x": 0, "y": 6, "width": 12, "height": 6,
+      "properties": {
+        "title": "Fusion job duration (minutes)",
+        "view": "timeSeries",
+        "stat": "Average",
+        "period": 300,
+        "region": "us-east-1",
+        "metrics": [
+          [ "UBall/CV", "CVJobDurationSeconds", "Stage", "fusion", "Side", "A", { "id": "m1", "visible": false } ],
+          [ ".",        ".",                     "Stage", "fusion", "Side", "B", { "id": "m2", "visible": false } ],
+          [ ".",        ".",                     "Stage", "merge", { "id": "m3", "visible": false } ],
+          [ { "expression": "m1/60", "label": "fusion-A (min)", "id": "e1" } ],
+          [ { "expression": "m2/60", "label": "fusion-B (min)", "id": "e2" } ],
+          [ { "expression": "m3/60", "label": "merge (min)",    "id": "e3" } ]
+        ],
+        "yAxis": { "left": { "min": 0, "label": "minutes" } }
+      }
+    },
+    {
+      "type": "metric",
+      "x": 12, "y": 6, "width": 12, "height": 6,
+      "properties": {
+        "title": "Shots detected per game (per side)",
+        "view": "timeSeries",
+        "stat": "Sum",
+        "period": 3600,
+        "region": "us-east-1",
+        "metrics": [
+          [ "UBall/CV", "ShotsDetectedPerGame", "Stage", "fusion", "Side", "A" ],
+          [ ".",        ".",                    "Stage", "fusion", "Side", "B" ],
+          [ ".",        "CVMergeShotsTotal",    "Stage", "merge",              { "label": "merged total" } ]
+        ]
+      }
+    },
+    {
+      "type": "metric",
+      "x": 0, "y": 12, "width": 12, "height": 6,
+      "properties": {
+        "title": "Mean fusion confidence",
+        "view": "timeSeries",
+        "stat": "Average",
+        "period": 3600,
+        "region": "us-east-1",
+        "metrics": [
+          [ "UBall/CV", "MeanConfidence",      "Stage", "fusion", "Side", "A" ],
+          [ ".",        ".",                   "Stage", "fusion", "Side", "B" ],
+          [ ".",        "CVMergeMeanConfidence", "Stage", "merge" ]
+        ],
+        "yAxis": { "left": { "min": 0, "max": 1 } }
+      }
+    },
+    {
+      "type": "metric",
+      "x": 12, "y": 12, "width": 12, "height": 6,
+      "properties": {
+        "title": "Made vs missed (merge output)",
+        "view": "timeSeries",
+        "stat": "Sum",
+        "period": 3600,
+        "region": "us-east-1",
+        "stacked": true,
+        "metrics": [
+          [ "UBall/CV", "CVMergeShotsMade",   "Stage", "merge" ],
+          [ ".",        "CVMergeShotsMissed", "Stage", "merge" ]
+        ]
+      }
+    }
+  ]
+}

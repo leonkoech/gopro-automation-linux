@@ -1,0 +1,48 @@
+[
+  {
+    "AlarmName": "UBall-CV-JobFailure",
+    "AlarmDescription": "Fires when any cv-fusion or cv-merge Batch job reports a failure within a 1-hour window. Investigate via /aws/batch/cv-fusion or /aws/batch/cv-merge CloudWatch log groups.",
+    "MetricName": "CVJobFailure",
+    "Namespace": "UBall/CV",
+    "Statistic": "Sum",
+    "Period": 300,
+    "EvaluationPeriods": 12,
+    "DatapointsToAlarm": 1,
+    "Threshold": 1.0,
+    "ComparisonOperator": "GreaterThanOrEqualToThreshold",
+    "TreatMissingData": "notBreaching",
+    "AlarmActions": ["PLACEHOLDER_SNS_TOPIC_ARN"],
+    "OKActions":    ["PLACEHOLDER_SNS_TOPIC_ARN"],
+    "Dimensions": []
+  },
+  {
+    "AlarmName": "UBall-CV-DispatchUnhandledError",
+    "AlarmDescription": "Fires when the Flask /api/cv/dispatch-pending endpoint raises an unhandled exception. Usually indicates boto3/IAM/network issues on the Jetson.",
+    "MetricName": "CVDispatchUnhandledError",
+    "Namespace": "UBall/CV",
+    "Statistic": "Sum",
+    "Period": 300,
+    "EvaluationPeriods": 2,
+    "DatapointsToAlarm": 1,
+    "Threshold": 1.0,
+    "ComparisonOperator": "GreaterThanOrEqualToThreshold",
+    "TreatMissingData": "notBreaching",
+    "AlarmActions": ["PLACEHOLDER_SNS_TOPIC_ARN"],
+    "Dimensions": [{"Name": "Stage", "Value": "dispatch"}]
+  },
+  {
+    "AlarmName": "UBall-CV-NeedsReviewStreak",
+    "AlarmDescription": "Fires when the merge job emits needs_review=1 three or more times in a single day. Usually means operators aren't setting startingSideTeam1 at check-in.",
+    "MetricName": "CVMergeNeedsReview",
+    "Namespace": "UBall/CV",
+    "Statistic": "Sum",
+    "Period": 86400,
+    "EvaluationPeriods": 1,
+    "DatapointsToAlarm": 1,
+    "Threshold": 3.0,
+    "ComparisonOperator": "GreaterThanOrEqualToThreshold",
+    "TreatMissingData": "notBreaching",
+    "AlarmActions": ["PLACEHOLDER_SNS_TOPIC_ARN"],
+    "Dimensions": [{"Name": "Stage", "Value": "merge"}]
+  }
+]

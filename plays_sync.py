@@ -19,6 +19,7 @@ SHOT_LABELS: Dict[str, str] = {
     "2PT_MAKE": "2-Pointer Made",  "2PT_MISS": "2-Pointer Missed",
     "3PT_MAKE": "3-Pointer Made",  "3PT_MISS": "3-Pointer Missed",
     "FT_MAKE":  "Free Throw Made", "FT_MISS":  "Free Throw Missed",
+    "FG_MAKE":  "Field Goal Made", "FG_MISS":  "Field Goal Missed",
     "FOUL":     "Foul",            "TIPOFF":   "Tipoff",
 }
 
@@ -89,6 +90,17 @@ def create_plays_from_firebase_logs(
             classification = "FOUL"
         elif action == "game_started":
             classification = "TIPOFF"
+        elif action == "cv_shot":
+            # CV V1 output: made/missed without distance classification.
+            # Written by the merge container in the CV pipeline.
+            outcome = payload.get("outcome")
+            if outcome == "made":
+                classification = "FG_MAKE"
+            elif outcome == "missed":
+                classification = "FG_MISS"
+            else:
+                logger.warning(f"[PlaysSync] cv_shot log missing/invalid outcome: {payload}")
+                continue
         else:
             continue
 
@@ -110,7 +122,11 @@ def create_plays_from_firebase_logs(
         start_ts = max(0.0, ts - 5.0)
         end_ts = ts + 3.0
 
-        note = f"{team_name} — {SHOT_LABELS.get(classification, classification)}"
+        label = SHOT_LABELS.get(classification, classification)
+        if action == "cv_shot":
+            note = f"{team_name} — {label} (CV)"
+        else:
+            note = f"{team_name} — {label}"
 
         play_data: Dict[str, Any] = {
             "game_id": uball_game_id,
@@ -122,6 +138,15 @@ def create_plays_from_firebase_logs(
         }
         if team:
             play_data["team"] = team
+
+        # Carry CV provenance + confidence through to the backend (optional fields
+        # on PlayCreate; safely dropped by the backend if the columns are absent
+        # prior to the 007 migration being applied).
+        if action == "cv_shot":
+            play_data["source"] = payload.get("source", "cv")
+            confidence = payload.get("confidence")
+            if confidence is not None:
+                play_data["confidence"] = float(confidence)
 
         try:
             client.create_play(play_data)

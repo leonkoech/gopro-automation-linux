@@ -1,0 +1,87 @@
+name: Build & push uball-cv-merge
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'deploy/cv-merge/**'
+      - 'cv_merge/**'
+      - 'cv_metrics.py'
+      - 'cv_batch_dispatch.py'
+      - '.github/workflows/cv-merge-image.yml'
+  workflow_dispatch:
+    inputs:
+      tag_as_v1:
+        description: 'Also tag the resulting image as :v1 (live Batch pointer)'
+        type: boolean
+        default: true
+
+concurrency:
+  group: cv-merge-image
+  cancel-in-progress: false
+
+permissions:
+  id-token: write   # OIDC for AWS
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPO: uball-cv-merge
+  ACCOUNT_ID: '840102831548'
+
+jobs:
+  build-and-push:
+    name: buildx + ECR push
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ env.ACCOUNT_ID }}:role/uball-gha-ecr-push
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Compute tags
+        id: tags
+        run: |
+          SHA=$(git rev-parse --short HEAD)
+          REPO_URI="${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPO }}"
+          TAGS="$REPO_URI:$SHA"
+          if [[ "${{ github.event_name }}" == "push" ]] || \
+             [[ "${{ github.event.inputs.tag_as_v1 }}" == "true" ]]; then
+            TAGS="$TAGS,$REPO_URI:v1"
+          fi
+          {
+            echo "sha=$SHA"
+            echo "repo_uri=$REPO_URI"
+            echo "tags=$TAGS"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build & push (linux/amd64)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/cv-merge/Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.tags.outputs.tags }}
+          provenance: false
+          cache-from: type=gha,scope=cv-merge
+          cache-to: type=gha,mode=max,scope=cv-merge
+
+      - name: Verify image landed in ECR
+        run: |
+          aws ecr describe-images \
+            --repository-name "${{ env.ECR_REPO }}" \
+            --image-ids imageTag=${{ steps.tags.outputs.sha }} \
+            --region "${{ env.AWS_REGION }}"
