@@ -7,11 +7,12 @@ policies lived only in AWS state with no repo provenance. The
 `cloudwatch:namespace == UballCV` bug found during Phase 2.2 work
 prompted dumping them, fixing them, and committing them here.
 
-| Role | Inline policy | File | Trusted principal | Used by |
-| --- | --- | --- | --- | --- |
-| `uball-cv-dispatch-lambda` | `cv-dispatch-inline` | `cv-dispatch-inline.json` | `lambda.amazonaws.com` | `uball-cv-dispatch` Lambda (PR #37) |
-| `uball-cv-batch-execution` | `cv-fusion-inline` | `cv-fusion-inline.json` | `ecs-tasks.amazonaws.com` | `cv-fusion` Batch job |
-| `uball-cv-merge-execution` | `cv-merge-inline` | `cv-merge-inline.json` | `ecs-tasks.amazonaws.com` | `cv-merge` Batch job |
+| Role | Inline policy | Trust file | Permission file | Trusted principal | Used by |
+| --- | --- | --- | --- | --- | --- |
+| `uball-cv-dispatch-lambda` | `cv-dispatch-inline` | (Phase 0, not in repo) | `cv-dispatch-inline.json` | `lambda.amazonaws.com` | `uball-cv-dispatch` Lambda (PR #37) |
+| `uball-cv-batch-execution` | `cv-fusion-inline` | (Phase 0, not in repo) | `cv-fusion-inline.json` | `ecs-tasks.amazonaws.com` | `cv-fusion` Batch job |
+| `uball-cv-merge-execution` | `cv-merge-inline` | (Phase 0, not in repo) | `cv-merge-inline.json` | `ecs-tasks.amazonaws.com` | `cv-merge` Batch job |
+| `uball-gha-ecr-push` | `gha-ecr-push-inline` | `gha-ecr-push-trust.json` | `gha-ecr-push-inline.json` | GitHub Actions OIDC | `cv-fusion-image.yml` / `cv-merge-image.yml` GHA workflows |
 
 ## What changed in this PR
 
@@ -32,6 +33,41 @@ so the data pipeline keeps working, but dashboards lose data).
 The fix was already applied to AWS via `apply-policies.sh` before this
 PR was opened — see PR description for `aws iam get-role-policy`
 verification output.
+
+## `uball-gha-ecr-push` — first-time setup
+
+This role + its OIDC provider don't exist yet in the account. Run the
+bootstrap script (idempotent — safe to re-run):
+
+```
+# What it would do, without touching AWS:
+./scripts/cv_infra/iam-policies/bootstrap-gha-oidc.sh --dry-run
+
+# Apply: creates OIDC provider (one-time, account-wide) + the role +
+# attaches the inline policy.
+./scripts/cv_infra/iam-policies/bootstrap-gha-oidc.sh
+
+# Audit live AWS against the repo files; exits non-zero on drift:
+./scripts/cv_infra/iam-policies/bootstrap-gha-oidc.sh --check
+```
+
+The trust policy restricts assumption to:
+
+- `repo:leonkoech/gopro-automation-linux:ref:refs/heads/main`
+- `repo:leonkoech/gopro-automation-linux:environment:production`
+- `repo:rohitmk523/Uball_dual_angle_fusion:ref:refs/heads/main`
+- `repo:rohitmk523/Uball_dual_angle_fusion:environment:production`
+
+So GitHub Actions runs from feature branches will be **rejected** at
+the STS layer. That's intentional — production credentials must only
+be reachable from the protected `main` branch. To allow a feature
+branch to trial the workflow, add a temporary `repo:<owner>/<repo>:ref:refs/heads/<branch>` line to
+`gha-ecr-push-trust.json` and re-apply.
+
+The permission policy grants only what's needed for `docker push` to
+the two CV ECR repos — `ecr:GetAuthorizationToken` (account-scoped)
+plus the layer-upload + image-put set scoped to
+`uball-cv-fusion` and `uball-cv-merge`.
 
 ## Apply changes
 
