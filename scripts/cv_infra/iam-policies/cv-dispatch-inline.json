@@ -1,0 +1,61 @@
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Sid": "BatchSubmit",
+            "Effect": "Allow",
+            "Action": [
+                "batch:SubmitJob"
+            ],
+            "Resource": [
+                "arn:aws:batch:us-east-1:840102831548:job-queue/cv-shot-detection-queue",
+                "arn:aws:batch:us-east-1:840102831548:job-definition/cv-*"
+            ]
+        },
+        {
+            "Sid": "BatchDescribe",
+            "Effect": "Allow",
+            "Action": [
+                "batch:DescribeJobs",
+                "batch:ListJobs"
+            ],
+            "Resource": "*"
+        },
+        {
+            "Sid": "InputsCheck",
+            "Effect": "Allow",
+            "Action": [
+                "s3:HeadObject",
+                "s3:GetObject",
+                "s3:ListBucket"
+            ],
+            "Resource": [
+                "arn:aws:s3:::uball-videos-production",
+                "arn:aws:s3:::uball-videos-production/court-*"
+            ]
+        },
+        {
+            "Sid": "Metrics",
+            "Effect": "Allow",
+            "Action": [
+                "cloudwatch:PutMetricData"
+            ],
+            "Resource": "*",
+            "Condition": {
+                "StringEquals": {
+                    "cloudwatch:namespace": "UBall/CV"
+                }
+            }
+        },
+        {
+            "Sid": "Logs",
+            "Effect": "Allow",
+            "Action": [
+                "logs:CreateLogStream",
+                "logs:PutLogEvents",
+                "logs:CreateLogGroup"
+            ],
+            "Resource": "*"
+        }
+    ]
+}
