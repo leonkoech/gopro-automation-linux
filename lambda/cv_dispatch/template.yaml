@@ -1,0 +1,166 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  uball-cv-dispatch — EventBridge-triggered Lambda that submits AWS Batch
+  jobs (2x cv-fusion + 1x cv-merge with dependsOn) when all 4 transcoded
+  1080p angles for a game land in S3.
+
+  Pre-deploy step (one time, see deploy.sh): enable EventBridge
+  notifications on the inputs bucket via
+  `aws s3api put-bucket-notification-configuration` with
+  `EventBridgeConfiguration: {}`. SAM cannot do that for an existing
+  bucket that lives outside this stack.
+
+Parameters:
+  InputsBucket:
+    Type: String
+    Default: uball-videos-production
+    Description: S3 bucket holding the transcoded 1080p angle videos.
+
+  DispatchLambdaRoleArn:
+    Type: String
+    Default: arn:aws:iam::840102831548:role/uball-cv-dispatch-lambda
+    Description: >
+      IAM role provisioned in Phase 0 (UBA-201) with batch:SubmitJob,
+      batch:DescribeJobs / ListJobs, s3:HeadObject on court-*,
+      and cloudwatch:PutMetricData (namespace constraint — see README).
+
+  DebounceSeconds:
+    Type: Number
+    Default: 60
+    Description: >
+      Seconds to sleep after confirming all 4 angles are present, so
+      near-simultaneous puts collapse to a single dispatch. Set to 0 in
+      test environments to skip the sleep.
+
+  FusionJobQueue:
+    Type: String
+    Default: cv-shot-detection-queue
+
+  FusionJobDefinition:
+    Type: String
+    Default: cv-fusion
+
+  MergeJobDefinition:
+    Type: String
+    Default: cv-merge
+
+  LogRetentionDays:
+    Type: Number
+    Default: 14
+
+Globals:
+  Function:
+    Runtime: python3.11
+    Architectures: [x86_64]
+    MemorySize: 512
+    Timeout: 300   # 5 min — most of this is the DebounceSeconds sleep
+    Tracing: Active
+
+Resources:
+  CvDispatchFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      # Makefile bundles cv_batch_dispatch.py + cv_metrics.py from the
+      # repo root alongside handler.py without permanently duplicating
+      # them in lambda/cv_dispatch/. See lambda/cv_dispatch/Makefile.
+      BuildMethod: makefile
+    Properties:
+      FunctionName: uball-cv-dispatch
+      Description: Submits CV Batch jobs when all 4 angles of a game land in S3.
+      CodeUri: .
+      Handler: handler.handler
+      Role: !Ref DispatchLambdaRoleArn
+
+      Environment:
+        Variables:
+          INPUTS_BUCKET:            !Ref InputsBucket
+          DEBOUNCE_SECONDS:         !Ref DebounceSeconds
+          CV_FUSION_JOB_QUEUE:      !Ref FusionJobQueue
+          CV_MERGE_JOB_QUEUE:       !Ref FusionJobQueue   # V1 reuses GPU queue (see cv_batch_dispatch.py)
+          CV_FUSION_JOB_DEFINITION: !Ref FusionJobDefinition
+          CV_MERGE_JOB_DEFINITION:  !Ref MergeJobDefinition
+          LOG_LEVEL:                INFO
+
+      # Four EventBridge rules — one per angle suffix. Pattern syntax:
+      # https://docs.aws.amazon.com/AmazonS3/latest/userguide/EventBridge.html
+      # Each rule must list both the bucket-name filter AND the key
+      # prefix/suffix filter. Prefix=`court-` matches court-a, court-b,
+      # etc; suffix narrows to the specific angle.
+      Events:
+        AngleFL:
+          Type: EventBridgeRule
+          Properties:
+            Pattern:
+              source: ["aws.s3"]
+              detail-type: ["Object Created"]
+              detail:
+                bucket:
+                  name: [!Ref InputsBucket]
+                object:
+                  key:
+                    - prefix: "court-"
+                    - suffix: "_FL.mp4"
+
+        AngleFR:
+          Type: EventBridgeRule
+          Properties:
+            Pattern:
+              source: ["aws.s3"]
+              detail-type: ["Object Created"]
+              detail:
+                bucket:
+                  name: [!Ref InputsBucket]
+                object:
+                  key:
+                    - prefix: "court-"
+                    - suffix: "_FR.mp4"
+
+        AngleNL:
+          Type: EventBridgeRule
+          Properties:
+            Pattern:
+              source: ["aws.s3"]
+              detail-type: ["Object Created"]
+              detail:
+                bucket:
+                  name: [!Ref InputsBucket]
+                object:
+                  key:
+                    - prefix: "court-"
+                    - suffix: "_NL.mp4"
+
+        AngleNR:
+          Type: EventBridgeRule
+          Properties:
+            Pattern:
+              source: ["aws.s3"]
+              detail-type: ["Object Created"]
+              detail:
+                bucket:
+                  name: [!Ref InputsBucket]
+                object:
+                  key:
+                    - prefix: "court-"
+                    - suffix: "_NR.mp4"
+
+      Tags:
+        service: cv-shot-detection
+        pipeline: v1
+
+  CvDispatchLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${CvDispatchFunction}
+      RetentionInDays: !Ref LogRetentionDays
+
+Outputs:
+  FunctionArn:
+    Description: cv-dispatch Lambda ARN
+    Value: !GetAtt CvDispatchFunction.Arn
+    Export:
+      Name: UballCvDispatchArn
+
+  FunctionName:
+    Description: cv-dispatch Lambda Name
+    Value: !Ref CvDispatchFunction
