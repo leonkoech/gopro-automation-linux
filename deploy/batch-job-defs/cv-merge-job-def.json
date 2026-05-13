@@ -15,8 +15,6 @@
   "containerProperties": {
     "image": "PLACEHOLDER_ECR_IMAGE_URI",
     "command": [],
-    "vcpus": 2,
-    "memory": 4096,
     "jobRoleArn": "PLACEHOLDER_CV_BATCH_JOB_ROLE_ARN",
     "executionRoleArn": "PLACEHOLDER_CV_BATCH_EXECUTION_ROLE_ARN",
     "resourceRequirements": [

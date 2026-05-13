@@ -125,11 +125,21 @@ def create_plays_from_firebase_logs(
         start_ts = max(0.0, ts - 5.0)
         end_ts = ts + 3.0
 
-        label = SHOT_LABELS.get(classification, classification)
         is_cv = payload.get("source") == "cv"
         if is_cv:
-            note = f"{team_name} — {label} (CV)"
+            # V1 CV pipeline is distance-blind: we always assign the 2PT_MAKE/2PT_MISS
+            # bucket as a backend default, but the human-readable note must NOT claim
+            # "2-Pointer" since the model can't actually tell 2 vs 3.  V2 will emit
+            # a distance estimate and we'll restore the bucket-specific label.
+            if classification.endswith("_MAKE"):
+                cv_label = "Made"
+            elif classification.endswith("_MISS"):
+                cv_label = "Missed"
+            else:
+                cv_label = SHOT_LABELS.get(classification, classification)
+            note = f"{team_name} — {cv_label} (CV)"
         else:
+            label = SHOT_LABELS.get(classification, classification)
             note = f"{team_name} — {label}"
 
         play_data: Dict[str, Any] = {
