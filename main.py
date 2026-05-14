@@ -1913,15 +1913,31 @@ def sync_game_to_uball():
 
         if left_team.get('finalScore') is not None:
             uball_game_data['team1_score'] = left_team['finalScore']
+            # UBA-261: also snapshot the Firebase-authoritative finals into
+            # the immutable original_team{1,2}_score columns on the games
+            # row. team1_score / team2_score remain the "working" totals
+            # that get mutated by the annotation flow; original_* is the
+            # read-only reference EditorPage renders next to them so
+            # annotators can spot mistyped/missing stats.
+            uball_game_data['original_team1_score'] = left_team['finalScore']
         if right_team.get('finalScore') is not None:
             uball_game_data['team2_score'] = right_team['finalScore']
+            uball_game_data['original_team2_score'] = right_team['finalScore']
 
         # Legacy score format support
         if firebase_game.get('score'):
             score = firebase_game['score']
             if isinstance(score, dict):
-                uball_game_data['team1_score'] = score.get('home', score.get('team1'))
-                uball_game_data['team2_score'] = score.get('away', score.get('team2'))
+                legacy_home = score.get('home', score.get('team1'))
+                legacy_away = score.get('away', score.get('team2'))
+                if legacy_home is not None:
+                    uball_game_data['team1_score'] = legacy_home
+                    # UBA-261: only seed original_* from legacy score if the
+                    # primary leftTeam.finalScore path didn't already.
+                    uball_game_data.setdefault('original_team1_score', legacy_home)
+                if legacy_away is not None:
+                    uball_game_data['team2_score'] = legacy_away
+                    uball_game_data.setdefault('original_team2_score', legacy_away)
 
         # 4.5. Pass through roster and display names from Firebase game (check-in data)
         roster_team1 = firebase_game.get('rosterTeam1')
