@@ -1940,14 +1940,49 @@ def sync_game_to_uball():
                     uball_game_data.setdefault('original_team2_score', legacy_away)
 
         # 4.5. Pass through roster and display names from Firebase game (check-in data)
+        #
+        # The roster on basketball-games.<gameId>.rosterTeamN is a SNAPSHOT taken
+        # by the basketball-timer at "Start Game" time. If players check in or
+        # update their jersey numbers AFTER that snapshot, those edits only
+        # land on game_schedules.<slotId>.rosterTeamN — they never propagate
+        # to the per-game doc, and therefore never reach the annotation tool.
+        #
+        # Fix: when the game has a scheduleSlotId, re-fetch the live slot and
+        # prefer ITS roster (filtered to checked_in players) over the stale
+        # snapshot. Fall back to the snapshot if the slot is missing/empty.
         roster_team1 = firebase_game.get('rosterTeam1')
         roster_team2 = firebase_game.get('rosterTeam2')
+        roster_source = 'basketball-games snapshot'
+
+        schedule_slot_id = firebase_game.get('scheduleSlotId')
+        if schedule_slot_id:
+            try:
+                slot_doc = firebase_service.db.collection('game_schedules').document(schedule_slot_id).get()
+                if slot_doc.exists:
+                    slot = slot_doc.to_dict() or {}
+                    slot_r1 = slot.get('rosterTeam1') or []
+                    slot_r2 = slot.get('rosterTeam2') or []
+                    # Use checked-in players only, matching what basketball/page.tsx
+                    # writes to basketball-games at game-start time.
+                    live_r1 = [p for p in slot_r1 if p.get('checked_in')]
+                    live_r2 = [p for p in slot_r2 if p.get('checked_in')]
+                    if live_r1 or live_r2:
+                        roster_team1 = live_r1 or roster_team1
+                        roster_team2 = live_r2 or roster_team2
+                        roster_source = f'game_schedules/{schedule_slot_id} (live)'
+                    else:
+                        logger.info(f"[GameSync] Slot {schedule_slot_id} found but no checked-in players — using snapshot")
+                else:
+                    logger.info(f"[GameSync] Slot {schedule_slot_id} not found — using snapshot")
+            except Exception as slot_err:
+                logger.warning(f"[GameSync] Could not re-fetch slot {schedule_slot_id}: {slot_err} — using snapshot")
+
         if roster_team1:
             uball_game_data['roster_team1'] = roster_team1
-            logger.info(f"[GameSync] Passing roster_team1 ({len(roster_team1)} players)")
+            logger.info(f"[GameSync] Passing roster_team1 ({len(roster_team1)} players) from {roster_source}")
         if roster_team2:
             uball_game_data['roster_team2'] = roster_team2
-            logger.info(f"[GameSync] Passing roster_team2 ({len(roster_team2)} players)")
+            logger.info(f"[GameSync] Passing roster_team2 ({len(roster_team2)} players) from {roster_source}")
 
         left_display = left_team.get('displayName', '')
         right_display = right_team.get('displayName', '')
