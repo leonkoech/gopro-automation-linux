@@ -7,6 +7,7 @@ callers can import it without introducing a circular dependency.
 
 from __future__ import annotations
 
+import os
 from datetime import datetime
 from typing import Any, Dict
 
@@ -22,6 +23,22 @@ SHOT_LABELS: Dict[str, str] = {
     "FG_MAKE":  "Field Goal Made", "FG_MISS":  "Field Goal Missed",
     "FOUL":     "Foul",            "TIPOFF":   "Tipoff",
 }
+
+
+def _cv_plays_enabled() -> bool:
+    """Feature gate for CV-emitted plays reaching the annotation tool.
+
+    V1 far-angle model under-detects shots in production (~3-12 detections per
+    game vs an expected 70+), driven by a training-distribution mismatch with
+    production cameras.  Until the far-angle retrain lands and validates on
+    real games, CV-emitted events (those with `payload.source == "cv"`) are
+    filtered out by `plays_sync` even if they end up in Firebase `logs[]`.
+
+    Set CV_PLAYS_ENABLED=true on the Jetson .env to allow CV-source events to
+    become Supabase plays.  Operator-entered scoreboard events are unaffected
+    by this flag and always create plays.
+    """
+    return os.getenv("CV_PLAYS_ENABLED", "false").strip().lower() in ("true", "1", "yes", "on")
 
 
 def create_plays_from_firebase_logs(
@@ -71,10 +88,21 @@ def create_plays_from_firebase_logs(
     right_name = firebase_game.get("rightTeam", {}).get("name", "Team 2")
 
     created = 0
+    cv_skipped = 0
+    cv_enabled = _cv_plays_enabled()
     for log in logs:
         action = log.get("actionType", "")
         payload = log.get("payload", {}) or {}
         team_side = log.get("team")
+
+        # Feature gate: CV-source events (payload.source == "cv") are filtered
+        # out until CV_PLAYS_ENABLED=true.  Defense-in-depth with cv-merge's
+        # emit_target=cv_logs_staging shadow gate — even if CV events end up
+        # in logs[] somehow, plays_sync still won't promote them while the
+        # far-angle model is under-detecting on production cameras.
+        if payload.get("source") == "cv" and not cv_enabled:
+            cv_skipped += 1
+            continue
 
         if action == "score_added":
             points = payload.get("points", 0)
@@ -173,5 +201,11 @@ def create_plays_from_firebase_logs(
                 f"for game {uball_game_id}: {exc}"
             )
 
-    logger.info(f"[PlaysSync] Created {created}/{len(logs)} plays for game {uball_game_id}")
+    if cv_skipped:
+        logger.info(
+            f"[PlaysSync] Created {created}/{len(logs)} plays for game {uball_game_id} "
+            f"(skipped {cv_skipped} CV-source event(s); CV_PLAYS_ENABLED={cv_enabled})"
+        )
+    else:
+        logger.info(f"[PlaysSync] Created {created}/{len(logs)} plays for game {uball_game_id}")
     return created
