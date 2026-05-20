@@ -161,6 +161,16 @@ class UballClient:
                 payload["team1_score"] = game_data["team1_score"]
             if game_data.get("team2_score") is not None:
                 payload["team2_score"] = game_data["team2_score"]
+            # UBA-261 follow-up: immutable Firebase-scoreboard reference
+            # scores. main.py:1922/1937 sets these on game_data, but this
+            # allowlisted payload dropped them, so original_* never reached
+            # the annotation backend (GameCreate accepts the fields; they
+            # were simply never sent). Without this every newly-synced game
+            # shows a null reference score in EditorPage.
+            if game_data.get("original_team1_score") is not None:
+                payload["original_team1_score"] = game_data["original_team1_score"]
+            if game_data.get("original_team2_score") is not None:
+                payload["original_team2_score"] = game_data["original_team2_score"]
             if game_data.get("video_name"):
                 payload["video_name"] = game_data["video_name"]
             if game_data.get("team1_color"):
