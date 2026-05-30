@@ -1747,8 +1747,10 @@ def process_game_videos(
                     # Add scores if available
                     if left_team.get('finalScore') is not None:
                         uball_game_data['team1_score'] = left_team['finalScore']
+                        uball_game_data['original_team1_score'] = left_team['finalScore']
                     if right_team.get('finalScore') is not None:
                         uball_game_data['team2_score'] = right_team['finalScore']
+                        uball_game_data['original_team2_score'] = right_team['finalScore']
 
                     logger.info(f"[AUTO-SYNC] Creating game in Uball...")
                     uball_game = uball_client.create_game(uball_game_data)
