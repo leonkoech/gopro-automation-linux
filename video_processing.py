@@ -1747,8 +1747,20 @@ def process_game_videos(
                     # Add scores if available
                     if left_team.get('finalScore') is not None:
                         uball_game_data['team1_score'] = left_team['finalScore']
+                        uball_game_data['original_team1_score'] = left_team['finalScore']
                     if right_team.get('finalScore') is not None:
                         uball_game_data['team2_score'] = right_team['finalScore']
+                        uball_game_data['original_team2_score'] = right_team['finalScore']
+
+                    # Forward per-team display names (mirrors main.py manual-sync path).
+                    # Without these the annotation tool renders blank team names for
+                    # auto-pipeline games — the "team names blank" half of UBA-271.
+                    left_display = left_team.get('displayName', '')
+                    right_display = right_team.get('displayName', '')
+                    if left_display:
+                        uball_game_data['team1_display_name'] = left_display
+                    if right_display:
+                        uball_game_data['team2_display_name'] = right_display
 
                     logger.info(f"[AUTO-SYNC] Creating game in Uball...")
                     uball_game = uball_client.create_game(uball_game_data)
