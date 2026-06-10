@@ -2338,7 +2338,15 @@ def poll_and_register_batch_jobs(
 
     This function is called after submitting Batch jobs to:
     1. Wait for jobs to complete (or timeout)
-    2. Register successful FL/FR videos in Uball backend
+    2. Register successful videos in the Uball backend — registration happens
+       in a single FINAL pass after the polling loop settles.
+
+    Registration covers all four camera angles, not just the far cameras. Each
+    side maps as FL/NL -> LEFT and FR/NR -> RIGHT, and for each side the FULL
+    angle is preferred (FL/FR) but the NEAR angle (NL/NR) is used as a fallback
+    when the full camera failed or never recorded. This is what allows
+    near-only recordings (a common failure mode when the FL/FR cameras lose
+    power) to still land in the annotation tool instead of silently disappearing.
 
     Args:
         batch_jobs: List of batch job info dicts from process_game_videos()
@@ -2347,7 +2355,8 @@ def poll_and_register_batch_jobs(
         max_wait: Maximum wait time in seconds (default: 30 minutes)
 
     Returns:
-        Dict with registered, failed, pending job counts
+        Dict with registered, failed, pending job counts plus the
+        completed_jobs / failed_jobs lists.
     """
     from aws_batch_transcode import AWSBatchTranscoder
     import time
@@ -2380,50 +2389,9 @@ def poll_and_register_batch_jobs(
                 job_info['final_status'] = 'SUCCEEDED'
                 completed_jobs.append(job_info)
                 del pending_jobs[job_id]
-
-                # Register in Uball if FL or FR angle
-                if uball_client and job_info.get('angle') in ['FL', 'FR']:
-                    try:
-                        uball_angle = 'LEFT' if job_info['angle'] == 'FL' else 'RIGHT'
-                        s3_key = job_info.get('final_s3_key', '')
-                        filename = job_info.get('filename', s3_key.split('/')[-1])
-
-                        # Get game_id from job_info (set during submission)
-                        game_id = job_info.get('game_id', '')
-
-                        # Fallback: try to get from Batch job environment
-                        if not game_id:
-                            job_details = batch_transcoder.get_job_status(job_id)
-                            if job_details:
-                                env_vars = job_details.get('container', {}).get('environment', [])
-                                for env_var in env_vars:
-                                    if env_var.get('name') == 'GAME_ID':
-                                        game_id = env_var.get('value', '')
-                                        break
-
-                        # Final fallback: parse from S3 path
-                        if not game_id:
-                            parts = s3_key.split('/')
-                            if len(parts) >= 3:
-                                game_id = parts[2]  # Partial UUID from path
-
-                        if game_id:
-                            result = uball_client.register_video(
-                                game_id=game_id,
-                                s3_key=s3_key,
-                                angle=uball_angle,
-                                filename=filename,
-                                duration=0.0  # Will be updated by frontend
-                            )
-
-                            if result:
-                                logger.info(f"[BatchPoller] Registered {job_info['angle']} for game {game_id} in Uball")
-                            else:
-                                logger.warning(f"[BatchPoller] Failed to register {job_info['angle']} for game {game_id}")
-                        else:
-                            logger.warning(f"[BatchPoller] No game_id found for job {job_id}")
-                    except Exception as e:
-                        logger.error(f"[BatchPoller] Registration error: {e}")
+                # NOTE: registration deferred to the final pass below so we can
+                # pick the best angle per side (full preferred, near fallback)
+                # once every job for the game has settled.
 
             elif current_status == 'FAILED':
                 logger.error(f"[BatchPoller] Job {job_id} FAILED: {status.get('statusReason', 'Unknown')}")
@@ -2441,6 +2409,19 @@ def poll_and_register_batch_jobs(
         job_info['final_status'] = 'TIMEOUT'
         failed_jobs.append(job_info)
 
+    # =======================================================================
+    # FINAL REGISTRATION PASS
+    # -----------------------------------------------------------------------
+    # Register all four angles (full preferred, near fallback) now that every
+    # job has settled. Grouping by game and choosing per side here is what lets
+    # near-only recordings (FL/FR cameras dead) still reach the annotation tool.
+    #
+    #   LEFT  side: FL if it SUCCEEDED, else NL if it SUCCEEDED
+    #   RIGHT side: FR if it SUCCEEDED, else NR if it SUCCEEDED
+    # =======================================================================
+    if uball_client and completed_jobs:
+        _register_completed_jobs(uball_client, completed_jobs, batch_transcoder)
+
     result = {
         'registered': len(completed_jobs),
         'failed': len(failed_jobs),
@@ -2451,3 +2432,96 @@ def poll_and_register_batch_jobs(
 
     logger.info(f"[BatchPoller] Done: {result['registered']} succeeded, {result['failed']} failed")
     return result
+
+
+# Angle -> annotation-tool side mapping. Full angles (FL/FR) are preferred over
+# the near angles (NL/NR) for the same side; the near angle is the fallback.
+_SIDE_BY_ANGLE = {'FL': 'LEFT', 'NL': 'LEFT', 'FR': 'RIGHT', 'NR': 'RIGHT'}
+_PREFERRED_ANGLE = {'LEFT': 'FL', 'RIGHT': 'FR'}
+_FALLBACK_ANGLE = {'LEFT': 'NL', 'RIGHT': 'NR'}
+
+
+def _resolve_game_id(job_info: Dict[str, Any], batch_transcoder=None) -> str:
+    """Resolve the Uball game UUID for a completed batch job.
+
+    Preserves the original fallback chain: job_info['game_id'] first, then the
+    GAME_ID Batch container env var, then the (partial) UUID parsed from the S3
+    path. Returns '' when nothing can be resolved.
+    """
+    game_id = job_info.get('game_id', '')
+    if game_id:
+        return game_id
+
+    # Fallback: read GAME_ID from the Batch job's container environment.
+    if batch_transcoder is not None:
+        try:
+            job_details = batch_transcoder.get_job_status(job_info.get('job_id', ''))
+            if job_details:
+                env_vars = job_details.get('container', {}).get('environment', [])
+                for env_var in env_vars:
+                    if env_var.get('name') == 'GAME_ID':
+                        game_id = env_var.get('value', '')
+                        if game_id:
+                            return game_id
+        except Exception as e:
+            logger.warning(f"[BatchPoller] Could not read GAME_ID env for job "
+                           f"{job_info.get('job_id')}: {e}")
+
+    # Final fallback: parse from S3 path (partial UUID from the folder name).
+    s3_key = job_info.get('final_s3_key', '') or ''
+    parts = s3_key.split('/')
+    if len(parts) >= 3:
+        return parts[2]
+
+    return ''
+
+
+def _register_completed_jobs(uball_client, completed_jobs, batch_transcoder=None):
+    """Register SUCCEEDED jobs in Uball, one LEFT and one RIGHT per game.
+
+    Groups SUCCEEDED jobs by resolved game id, then for each game picks the
+    full angle per side if available, otherwise the near angle. Each chosen job
+    is registered via uball_client.register_video(...). Errors are logged and
+    never propagated so one bad game can't abort the rest.
+    """
+    # Group completed jobs by game, then by angle, preserving resolved game id.
+    games: Dict[str, Dict[str, Any]] = {}
+    for job_info in completed_jobs:
+        game_id = _resolve_game_id(job_info, batch_transcoder)
+        if not game_id:
+            logger.warning(f"[BatchPoller] No game_id found for job "
+                           f"{job_info.get('job_id')} — cannot register")
+            continue
+        bucket = games.setdefault(game_id, {})
+        angle = job_info.get('angle')
+        if angle in _SIDE_BY_ANGLE:
+            bucket[angle] = job_info
+
+    for game_id, angle_jobs in games.items():
+        for side in ('LEFT', 'RIGHT'):
+            # Full angle preferred, near angle as fallback.
+            chosen = angle_jobs.get(_PREFERRED_ANGLE[side]) or angle_jobs.get(_FALLBACK_ANGLE[side])
+            if not chosen:
+                continue
+
+            chosen_angle = chosen.get('angle')
+            s3_key = chosen.get('final_s3_key', '')
+            filename = chosen.get('filename') or s3_key.split('/')[-1]
+
+            try:
+                registered = uball_client.register_video(
+                    game_id=game_id,
+                    s3_key=s3_key,
+                    angle=side,
+                    filename=filename,
+                    duration=0.0  # Will be backfilled by the frontend
+                )
+                if registered:
+                    logger.info(f"[BatchPoller] Registered {side} ({chosen_angle}) "
+                                f"for game {game_id} in Uball")
+                else:
+                    logger.warning(f"[BatchPoller] Failed to register {side} "
+                                   f"({chosen_angle}) for game {game_id}")
+            except Exception as e:
+                logger.error(f"[BatchPoller] Registration error for {side} "
+                             f"({chosen_angle}) game {game_id}: {e}")
