@@ -795,7 +795,12 @@ class PipelineOrchestrator:
                             batch_jobs=all_batch_jobs,
                             uball_client=self.uball_client,
                             poll_interval=30,
-                            max_wait=3600  # 1 hour max wait
+                            # AWS Batch GPU queue waits routinely exceed an hour
+                            # (jobs can sit queued for 4+ hours), so give the
+                            # poller 6 hours before it gives up and the
+                            # backfill script (scripts/backfill_pending_videos.py)
+                            # has to reconcile what was missed.
+                            max_wait=21600  # 6 hours max wait
                         )
                         completed_count = result.get('registered', 0)
                         failed_count = result.get('failed', 0)
