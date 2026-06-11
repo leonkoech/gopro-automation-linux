@@ -5464,6 +5464,16 @@ if firebase_service and upload_service:
     except Exception as e:
         print(f"⚠ Failed to initialize pipeline orchestrator: {e}")
 
+# Auto-end guard (server-side UBA-269): ends games left In Progress when their
+# timeline has been idle past the threshold, so the pipeline always gets a window.
+if firebase_service:
+    try:
+        from game_auto_end import AutoEndGuard
+        auto_end_guard = AutoEndGuard(firebase_service=firebase_service, jetson_id=firebase_service.jetson_id)
+        auto_end_guard.start()
+    except Exception as e:
+        print(f"⚠ Failed to start auto-end guard: {e}")
+
 
 @app.route('/api/pipeline/auto-start', methods=['POST'])
 def start_auto_pipeline():
