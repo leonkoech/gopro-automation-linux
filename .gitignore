@@ -13,3 +13,13 @@ id_rsa
 
 # Alert dedup state written by scripts/monitor/monitor_jetsons.py
 .monitor-alert-state.json
+
+# Editor / agent metadata
+.claude/worktrees/
+.cursor/
+
+# Ad-hoc screenshots dropped at repo root during debugging.
+# Real diagrams / screenshots that belong in the repo should live under
+# docs/ where they're versioned alongside the prose that references them.
+/Screenshot*.png
+/Screenshot*.jpg
