@@ -11,6 +11,41 @@ from datetime import datetime
 from typing import Optional, List, Dict, Any
 
 
+def safe_path_within(base: str, *parts: str) -> Optional[str]:
+    """
+    Safely join user-supplied path parts onto a trusted base directory.
+
+    Guards against path-traversal (`..`) attacks. Any part that is absolute
+    or contains a `..` segment is rejected outright, then the fully resolved
+    path is confirmed to live *strictly inside* `base` (symlinks resolved).
+
+    Args:
+        base: Trusted base directory the result must stay within.
+        *parts: Untrusted path components (e.g. filename, session_name).
+
+    Returns:
+        The resolved absolute path if it is safely inside `base`,
+        otherwise None.
+    """
+    for part in parts:
+        if part is None:
+            return None
+        # Reject absolute components and any `..` traversal segment.
+        if os.path.isabs(part):
+            return None
+        if '..' in part.replace('\\', '/').split('/'):
+            return None
+
+    base_real = os.path.realpath(base)
+    candidate = os.path.realpath(os.path.join(base_real, *parts))
+
+    # Must be strictly within base (not base itself, not a sibling like
+    # `<base>_evil` that merely shares the string prefix).
+    if candidate.startswith(base_real + os.sep):
+        return candidate
+    return None
+
+
 class MediaService:
     """
     Service for managing media on GoPro cameras and local Jetson storage.
@@ -304,8 +339,8 @@ class MediaService:
         Returns:
             Full path or None if not found
         """
-        file_path = os.path.join(self.local_storage_dir, filename)
-        if os.path.exists(file_path) and file_path.startswith(self.local_storage_dir):
+        file_path = safe_path_within(self.local_storage_dir, filename)
+        if file_path and os.path.exists(file_path):
             return file_path
         return None
 
@@ -320,10 +355,9 @@ class MediaService:
             Dict with result
         """
         try:
-            file_path = os.path.join(self.local_storage_dir, filename)
-
-            # Security check
-            if not file_path.startswith(self.local_storage_dir):
+            # Security check - resolve and confine within storage dir
+            file_path = safe_path_within(self.local_storage_dir, filename)
+            if not file_path:
                 return {'success': False, 'error': 'Invalid file path'}
 
             if not os.path.exists(file_path):
@@ -510,10 +544,10 @@ class MediaService:
         """
         try:
             import shutil
-            session_path = os.path.join(self.segments_dir, session_name)
 
-            # Security check
-            if not session_path.startswith(self.segments_dir):
+            # Security check - resolve and confine within segments dir
+            session_path = safe_path_within(self.segments_dir, session_name)
+            if not session_path:
                 return {'success': False, 'error': 'Invalid session path'}
 
             if not os.path.exists(session_path):
@@ -543,10 +577,9 @@ class MediaService:
             Dict with result
         """
         try:
-            file_path = os.path.join(self.segments_dir, session_name, filename)
-
-            # Security check
-            if not file_path.startswith(self.segments_dir):
+            # Security check - resolve and confine within segments dir
+            file_path = safe_path_within(self.segments_dir, session_name, filename)
+            if not file_path:
                 return {'success': False, 'error': 'Invalid file path'}
 
             if not os.path.exists(file_path):
@@ -572,8 +605,8 @@ class MediaService:
         Returns:
             Full path or None if not found
         """
-        file_path = os.path.join(self.segments_dir, session_name, filename)
-        if os.path.exists(file_path) and file_path.startswith(self.segments_dir):
+        file_path = safe_path_within(self.segments_dir, session_name, filename)
+        if file_path and os.path.exists(file_path):
             return file_path
         return None
 
