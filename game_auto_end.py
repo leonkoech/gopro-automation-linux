@@ -29,10 +29,22 @@ BASKETBALL_GAMES_COLLECTION = 'basketball-games'
 # How long after the last timeline event the game is considered to have ended.
 ENDED_AT_GRACE_SECONDS = 60
 
-DEFAULT_IDLE_MINUTES = 20
+# Recovery-net threshold. The client (gopro-automation-wb, UBA-270) is the
+# authoritative transition — it ends the prior game before starting the next.
+# This guard only catches games the client can't: the last game of a session or
+# a crash with no subsequent start. logs[] is a sparse discrete-event array with
+# no heartbeat, so a live game routinely goes 20+ min silent (halftime + a
+# stoppage). 45 min keeps the guard clear of normal in-game silence; the
+# liveness gate below is what actually prevents ending a live game (UBA-305).
+DEFAULT_IDLE_MINUTES = 45
 DEFAULT_POLL_SECONDS = 300
 DEFAULT_LOOKBACK_HOURS = 36
 DEFAULT_LEADER = 'jetson-1'
+
+# A 'recording' session with no endedAt this old is treated as a ghost (camera
+# crashed without a stop) and ignored for liveness, so it can't block auto-end
+# forever. Mirrors the ghost-session handling in video_processing.py.
+DEFAULT_MAX_SESSION_AGE_HOURS = 6
 
 
 def _parse_iso(value: Any) -> Optional[datetime]:
@@ -87,27 +99,74 @@ def _latest_period(events: List[Tuple[datetime, Dict[str, Any]]], game: Dict[str
     return game.get('finalPeriod') or '2nd'
 
 
+def _game_last_activity(game: Dict[str, Any],
+                        events: List[Tuple[datetime, Dict[str, Any]]]) -> Optional[datetime]:
+    """Timestamp of the newest log event, or ``createdAt`` when logs are empty.
+
+    ``None`` when nothing is parseable — callers must never guess in that case.
+    """
+    if events:
+        return events[-1][0]
+    return _parse_iso(game.get('createdAt'))
+
+
+def _has_active_recording(sessions: List[Dict[str, Any]], last_activity: datetime,
+                          now: datetime, max_session_age: timedelta) -> bool:
+    """True if a camera is still rolling over this game's window (UBA-305).
+
+    ``logs[]`` silence can't distinguish halftime from a finished game, so we
+    gate on a real liveness signal: a still-open recording session
+    (``status=='recording'`` and ``endedAt is None``) that began at/before the
+    game's last logged event is, by definition, still filming this court right
+    now — so the game is not over. Sessions that started *after* ``last_activity``
+    belong to a later game and must not block. Sessions open longer than
+    ``max_session_age`` are treated as ghosts (crashed without a stop) and
+    ignored, so they can't block auto-end forever.
+    """
+    grace = timedelta(seconds=ENDED_AT_GRACE_SECONDS)
+    for session in sessions or []:
+        if not isinstance(session, dict):
+            continue
+        if session.get('status') != 'recording' or session.get('endedAt'):
+            continue
+        started = _parse_iso(session.get('startedAt'))
+        if started is None:
+            continue
+        if now - started > max_session_age:
+            continue
+        if started <= last_activity + grace:
+            return True
+    return False
+
+
 def evaluate_auto_end(game: Dict[str, Any], now: datetime,
                       idle_threshold: timedelta,
-                      jetson_id: str = 'unknown') -> Optional[Dict[str, Any]]:
+                      jetson_id: str = 'unknown',
+                      active_recording: bool = False) -> Optional[Dict[str, Any]]:
     """Decide whether an in-progress game should be auto-ended.
 
     Returns None if the game should NOT be auto-ended; otherwise returns the
     Firestore update payload (dotted-field keys for team maps so the rest of
     each team map is untouched).
+
+    ``active_recording`` short-circuits to None: never auto-end while a camera
+    is still recording this game (UBA-305). Kept as a bool param so this
+    decision function stays pure/Firebase-free — the caller (``_sweep``)
+    computes it from ``_has_active_recording``.
     """
     if game.get('endedAt'):
         return None
 
     events = _sorted_events(game.get('logs') or [])
 
-    if events:
-        last_activity = events[-1][0]
-    else:
-        last_activity = _parse_iso(game.get('createdAt'))
+    last_activity = _game_last_activity(game, events)
 
     if last_activity is None:
         # No parseable timestamps anywhere — never guess.
+        return None
+
+    # Never auto-end while a camera is still recording this game (UBA-305).
+    if active_recording:
         return None
 
     if now - last_activity < idle_threshold:
@@ -150,6 +209,9 @@ class AutoEndGuard:
         self.poll_seconds = int(os.getenv('AUTO_END_POLL_SECONDS', str(DEFAULT_POLL_SECONDS)))
         self.lookback = timedelta(
             hours=int(os.getenv('AUTO_END_LOOKBACK_HOURS', str(DEFAULT_LOOKBACK_HOURS))))
+        self.max_session_age = timedelta(
+            hours=int(os.getenv('AUTO_END_MAX_SESSION_AGE_HOURS',
+                                str(DEFAULT_MAX_SESSION_AGE_HOURS))))
         self._thread: Optional[threading.Thread] = None
 
     def start(self) -> None:
@@ -184,6 +246,17 @@ class AutoEndGuard:
         now = datetime.now(timezone.utc)
         cutoff_iso = _iso_z(now - self.lookback)
 
+        # Fleet-wide (jetson_id=None): the leader must see every court's cameras
+        # to know whether a game is still being filmed. A query failure must not
+        # abort the sweep — fail open to the pre-liveness behaviour (an empty
+        # list simply skips the gate) rather than crash.
+        try:
+            active_sessions = self.firebase_service.get_recording_sessions(
+                jetson_id=None, limit=100)
+        except Exception as e:
+            logger.warning(f"Auto-end: recording-session query failed, fail-open: {e}")
+            active_sessions = []
+
         # Firestore can't reliably query endedAt==None across docs missing the
         # field, so pull recent games by createdAt and filter in Python.
         games_ref = self.firebase_service.db.collection(BASKETBALL_GAMES_COLLECTION)
@@ -197,8 +270,20 @@ class AutoEndGuard:
                 game = doc.to_dict() or {}
                 if game.get('endedAt'):
                     continue
+
+                # Liveness gate (UBA-305): never end a game whose camera is
+                # still rolling (e.g. a live game silent at halftime).
+                events = _sorted_events(game.get('logs') or [])
+                last_activity = _game_last_activity(game, events)
+                if last_activity is not None and _has_active_recording(
+                        active_sessions, last_activity, now, self.max_session_age):
+                    logger.info(
+                        f"Skip auto-end {doc.id}: recording still active")
+                    continue
+
                 update = evaluate_auto_end(
-                    game, now, self.idle_threshold, jetson_id=self.jetson_id)
+                    game, now, self.idle_threshold, jetson_id=self.jetson_id,
+                    active_recording=False)
                 if not update:
                     continue
                 doc.reference.update(update)
