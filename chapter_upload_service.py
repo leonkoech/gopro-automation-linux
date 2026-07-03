@@ -28,6 +28,7 @@ import time
 import threading
 from typing import List, Dict, Any, Optional, Callable
 from logging_service import get_logger
+from path_safety import safe_path_within
 
 logger = get_logger('gopro.chapter_upload')
 
@@ -696,11 +697,23 @@ class ChapterUploadService:
                 'errors': ['Session missing segmentSession field']
             }
 
+        # Confine the temp dir strictly under /tmp/chapters. segment_session
+        # comes from a stored session doc; a `..`/absolute value must not be
+        # able to escape and have chapter bytes written outside the temp tree.
+        local_temp_dir = safe_path_within('/tmp/chapters', segment_session)
+        if not local_temp_dir:
+            return {
+                'success': False,
+                's3_prefix': '',
+                'chapters_uploaded': 0,
+                'total_bytes': 0,
+                'failed_chapters': [],
+                'errors': [f'Invalid segmentSession: {segment_session!r}']
+            }
+
         # S3 prefix for this session's chapters
         s3_prefix = f"raw-chapters/{segment_session}/"
-        
-        # Local temp directory for this session
-        local_temp_dir = f"/tmp/chapters/{segment_session}"
+
         os.makedirs(local_temp_dir, exist_ok=True)
 
         logger.info(f"Uploading {len(chapters)} chapters for session: {segment_session}")
@@ -733,7 +746,9 @@ class ChapterUploadService:
                     break
 
                 chapter_num = i + 1
-                filename = chapter['filename']
+                # filename comes from the GoPro media-list API; strip any
+                # path components so it cannot traverse out of local_temp_dir.
+                filename = os.path.basename(chapter['filename'])
                 directory = chapter['directory']
                 expected_size = int(chapter.get('size', 0))
 

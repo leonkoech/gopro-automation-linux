@@ -13,6 +13,7 @@ from logging.handlers import RotatingFileHandler
 from collections import deque
 from typing import Optional, Generator
 import time
+from path_safety import safe_path_within
 import json
 
 # Configuration
@@ -219,14 +220,14 @@ class LoggingService:
 
     def read_log_file(self, filename: str, lines: int = 500, offset: int = 0) -> dict:
         """Read contents of a log file."""
-        filepath = os.path.join(self.log_dir, filename)
+        # Security check - resolve and confine within log directory
+        # (rejects `..`, absolute paths, sibling-prefix and symlink escapes).
+        filepath = safe_path_within(self.log_dir, filename)
+        if not filepath:
+            return {'success': False, 'error': 'Invalid file path'}
 
         if not os.path.exists(filepath):
             return {'success': False, 'error': 'File not found'}
-
-        # Security check - ensure file is in log directory
-        if not os.path.abspath(filepath).startswith(os.path.abspath(self.log_dir)):
-            return {'success': False, 'error': 'Invalid file path'}
 
         try:
             with open(filepath, 'r', encoding='utf-8', errors='replace') as f:
@@ -279,11 +280,19 @@ class LoggingService:
         """Search logs for a query string."""
         results = []
 
-        files = [filename] if filename else [f['name'] for f in self.get_log_files()]
+        # Confine the (attacker-supplied) filename to the log directory.
+        # A `..` segment or absolute path is rejected outright.
+        if filename:
+            safe = safe_path_within(self.log_dir, filename)
+            if not safe:
+                return []
+            files = [os.path.basename(safe)]
+        else:
+            files = [f['name'] for f in self.get_log_files()]
 
         for fname in files:
-            filepath = os.path.join(self.log_dir, fname)
-            if not os.path.exists(filepath):
+            filepath = safe_path_within(self.log_dir, fname)
+            if not filepath or not os.path.exists(filepath):
                 continue
 
             try:

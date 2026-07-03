@@ -29,6 +29,7 @@ from typing import List, Dict, Any, Optional, Tuple
 from pathlib import Path
 
 from logging_service import get_logger
+from path_safety import safe_path_within
 
 logger = get_logger('gopro.video_processing')
 
@@ -89,9 +90,11 @@ class VideoProcessor:
         Returns:
             List of chapter info dicts with path, filename, size, duration, corruption status
         """
-        session_path = os.path.join(self.segments_dir, session_name)
-        if not os.path.exists(session_path):
-            logger.warning(f"Session path not found: {session_path}")
+        # Security check - resolve and confine within segments dir
+        # (session_name originates from a stored session doc; guard anyway).
+        session_path = safe_path_within(self.segments_dir, session_name)
+        if not session_path or not os.path.exists(session_path):
+            logger.warning(f"Session path not found or invalid: {session_name}")
             return []
 
         chapters = []
