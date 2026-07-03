@@ -24,7 +24,7 @@ from pathlib import Path
 import requests
 import re
 from videoupload import VideoUploadService
-from media_service import get_media_service
+from media_service import get_media_service, safe_path_within
 from logging_service import get_logging_service, get_logger
 from firebase_service import get_firebase_service
 from uball_client import get_uball_client
@@ -3177,8 +3177,8 @@ def list_videos():
 def delete_video(filename):
     """Delete a specific video"""
     try:
-        video_path = os.path.join(VIDEO_STORAGE_DIR, filename)
-        if os.path.exists(video_path) and video_path.startswith(VIDEO_STORAGE_DIR):
+        video_path = safe_path_within(VIDEO_STORAGE_DIR, filename)
+        if video_path and os.path.exists(video_path):
             os.remove(video_path)
             return jsonify({
                 'success': True,
@@ -3366,19 +3366,19 @@ def debug_env():
 def download_video(filename):
     """Download a specific video file"""
     try:
-        video_path = os.path.join(VIDEO_STORAGE_DIR, filename)
-        
+        # Security check - resolve and confine within storage dir
+        video_path = safe_path_within(VIDEO_STORAGE_DIR, filename)
+        if not video_path:
+            return jsonify({
+                'success': False,
+                'error': 'Invalid file path'
+            }), 403
+
         if not os.path.exists(video_path):
             return jsonify({
                 'success': False,
                 'error': 'Video not found'
             }), 404
-            
-        if not video_path.startswith(VIDEO_STORAGE_DIR):
-            return jsonify({
-                'success': False,
-                'error': 'Invalid file path'
-            }), 403
         
         return send_file(
             video_path,
@@ -3397,19 +3397,19 @@ def download_video(filename):
 def stream_video(filename):
     """Stream a specific video file with support for range requests"""
     try:
-        video_path = os.path.join(VIDEO_STORAGE_DIR, filename)
-        
+        # Security check - resolve and confine within storage dir
+        video_path = safe_path_within(VIDEO_STORAGE_DIR, filename)
+        if not video_path:
+            return jsonify({
+                'success': False,
+                'error': 'Invalid file path'
+            }), 403
+
         if not os.path.exists(video_path):
             return jsonify({
                 'success': False,
                 'error': 'Video not found'
             }), 404
-            
-        if not video_path.startswith(VIDEO_STORAGE_DIR):
-            return jsonify({
-                'success': False,
-                'error': 'Invalid file path'
-            }), 403
         
         file_size = os.path.getsize(video_path)
         range_header = request.headers.get('Range', None)

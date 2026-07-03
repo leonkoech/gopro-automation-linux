@@ -29,6 +29,7 @@ from typing import List, Dict, Any, Optional, Tuple
 from pathlib import Path
 
 from logging_service import get_logger
+from path_safety import safe_path_within
 
 logger = get_logger('gopro.video_processing')
 
@@ -89,9 +90,11 @@ class VideoProcessor:
         Returns:
             List of chapter info dicts with path, filename, size, duration, corruption status
         """
-        session_path = os.path.join(self.segments_dir, session_name)
-        if not os.path.exists(session_path):
-            logger.warning(f"Session path not found: {session_path}")
+        # Security check - resolve and confine within segments dir
+        # (session_name originates from a stored session doc; guard anyway).
+        session_path = safe_path_within(self.segments_dir, session_name)
+        if not session_path or not os.path.exists(session_path):
+            logger.warning(f"Session path not found or invalid: {session_name}")
             return []
 
         chapters = []
@@ -1493,8 +1496,11 @@ class VideoProcessor:
         """
         import shutil
 
-        # Create temp directory for this session
-        temp_dir = f"/tmp/game_extraction/{session_id}"
+        # Create temp directory for this session (confine under the temp root
+        # so a crafted session_id can't escape /tmp/game_extraction).
+        temp_dir = safe_path_within('/tmp/game_extraction', session_id)
+        if not temp_dir:
+            raise ValueError(f"Invalid session_id: {session_id!r}")
         os.makedirs(temp_dir, exist_ok=True)
         logger.info(f"Downloading S3 chapters to: {temp_dir}")
 
@@ -1507,7 +1513,9 @@ class VideoProcessor:
                 updated_chapters.append(chapter)
                 continue
 
-            filename = chapter.get('filename', os.path.basename(s3_key))
+            # Basename the (S3-key-derived) filename so an explicit `filename`
+            # containing path components can't write outside temp_dir.
+            filename = os.path.basename(chapter.get('filename') or s3_key)
             local_path = os.path.join(temp_dir, filename)
 
             try:

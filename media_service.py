@@ -11,6 +11,12 @@ from datetime import datetime
 from typing import Optional, List, Dict, Any
 
 
+# Re-exported from path_safety so existing `from media_service import
+# safe_path_within` call sites keep working while the implementation lives
+# in one shared, audited module.
+from path_safety import safe_path_within  # noqa: E402,F401
+
+
 class MediaService:
     """
     Service for managing media on GoPro cameras and local Jetson storage.
@@ -304,8 +310,8 @@ class MediaService:
         Returns:
             Full path or None if not found
         """
-        file_path = os.path.join(self.local_storage_dir, filename)
-        if os.path.exists(file_path) and file_path.startswith(self.local_storage_dir):
+        file_path = safe_path_within(self.local_storage_dir, filename)
+        if file_path and os.path.exists(file_path):
             return file_path
         return None
 
@@ -320,10 +326,9 @@ class MediaService:
             Dict with result
         """
         try:
-            file_path = os.path.join(self.local_storage_dir, filename)
-
-            # Security check
-            if not file_path.startswith(self.local_storage_dir):
+            # Security check - resolve and confine within storage dir
+            file_path = safe_path_within(self.local_storage_dir, filename)
+            if not file_path:
                 return {'success': False, 'error': 'Invalid file path'}
 
             if not os.path.exists(file_path):
@@ -455,7 +460,11 @@ class MediaService:
             Dict with session file list
         """
         try:
-            session_path = Path(self.segments_dir) / session_name
+            # Security check - resolve and confine within segments dir
+            safe_session = safe_path_within(self.segments_dir, session_name)
+            if not safe_session:
+                return {'success': False, 'error': 'Invalid session path'}
+            session_path = Path(safe_session)
 
             if not session_path.exists():
                 return {'success': False, 'error': 'Session not found'}
@@ -510,10 +519,10 @@ class MediaService:
         """
         try:
             import shutil
-            session_path = os.path.join(self.segments_dir, session_name)
 
-            # Security check
-            if not session_path.startswith(self.segments_dir):
+            # Security check - resolve and confine within segments dir
+            session_path = safe_path_within(self.segments_dir, session_name)
+            if not session_path:
                 return {'success': False, 'error': 'Invalid session path'}
 
             if not os.path.exists(session_path):
@@ -543,10 +552,9 @@ class MediaService:
             Dict with result
         """
         try:
-            file_path = os.path.join(self.segments_dir, session_name, filename)
-
-            # Security check
-            if not file_path.startswith(self.segments_dir):
+            # Security check - resolve and confine within segments dir
+            file_path = safe_path_within(self.segments_dir, session_name, filename)
+            if not file_path:
                 return {'success': False, 'error': 'Invalid file path'}
 
             if not os.path.exists(file_path):
@@ -572,8 +580,8 @@ class MediaService:
         Returns:
             Full path or None if not found
         """
-        file_path = os.path.join(self.segments_dir, session_name, filename)
-        if os.path.exists(file_path) and file_path.startswith(self.segments_dir):
+        file_path = safe_path_within(self.segments_dir, session_name, filename)
+        if file_path and os.path.exists(file_path):
             return file_path
         return None
 
