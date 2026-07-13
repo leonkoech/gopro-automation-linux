@@ -19,7 +19,8 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from game_auto_end import evaluate_auto_end  # noqa: E402
+import game_auto_end  # noqa: E402
+from game_auto_end import AutoEndGuard, evaluate_auto_end  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -236,3 +237,188 @@ def test_out_of_order_logs_use_max_timestamp_for_idle():
         _event(minutes_ago=90),   # stale event last
     ])
     assert evaluate_auto_end(game, NOW, IDLE) is None
+
+
+# ---------------------------------------------------------------------------
+# _sweep write-race coverage (UBA-304)
+#
+# _sweep() must never clobber a real final score/period when a game is ended
+# (scorekeeper "End Game" or UBA-269 auto-end) in the multi-minute window
+# between the sweep's read and its write. The fix wraps the write in a
+# Firestore transaction that re-reads endedAt. These tests stay pure by
+# substituting a direct-call runner for the real transactional decorator.
+# ---------------------------------------------------------------------------
+
+class _FakeSnapshot:
+    def __init__(self, doc_id, data, reference):
+        self.id = doc_id
+        self._data = data
+        self.reference = reference
+
+    def to_dict(self):
+        return dict(self._data)
+
+
+class _FakeDocRef:
+    """A Firestore doc reference whose committed state can diverge from the
+    stale snapshot the sweep first streamed (simulating a concurrent write)."""
+
+    def __init__(self, doc_id, state):
+        self.id = doc_id
+        self._state = state
+        self.applied = []  # updates the guard actually wrote
+
+    def get(self, transaction=None):
+        return _FakeSnapshot(self.id, dict(self._state), self)
+
+    def update(self, fields):
+        self.applied.append(fields)
+        self._state.update(fields)
+
+
+class _FakeTransaction:
+    def __init__(self):
+        self.writes = []
+
+    def update(self, ref, fields):
+        self.writes.append((ref, fields))
+        ref.update(fields)
+
+
+class _FakeQuery:
+    def __init__(self, docs):
+        self._docs = docs
+
+    def where(self, *a, **k):
+        return self
+
+    def order_by(self, *a, **k):
+        return self
+
+    def limit(self, *a, **k):
+        return self
+
+    def stream(self):
+        return list(self._docs)
+
+
+class _FakeDb:
+    def __init__(self, docs):
+        self._docs = docs
+        self.transactions = []
+
+    def collection(self, name):
+        return _FakeQuery(self._docs)
+
+    def transaction(self):
+        txn = _FakeTransaction()
+        self.transactions.append(txn)
+        return txn
+
+
+class _FakeFirebaseService:
+    def __init__(self, docs):
+        self.db = _FakeDb(docs)
+
+
+def _direct_runner(transaction, fn):
+    """Stand-in for firebase's @transactional: just run the body once."""
+    return fn(transaction)
+
+
+def _make_guard(svc):
+    return AutoEndGuard(svc, jetson_id='jetson-1')
+
+
+# --- transaction body in isolation ---------------------------------------
+
+def test_transaction_body_skips_when_ended_concurrently():
+    """The core race: endedAt is already set when the transaction re-reads →
+    the guard must return None and write nothing (real score preserved)."""
+    fresh = _game(ended_at=_iso(NOW - timedelta(minutes=1)),
+                  logs=[_event(minutes_ago=45)])
+    fresh['leftTeam'] = {'displayName': 'Sharks', 'finalScore': 88}
+    doc_ref = _FakeDocRef('g1', fresh)
+    txn = _FakeTransaction()
+
+    guard = _make_guard(_FakeFirebaseService([]))
+    result = guard._end_game_in_transaction(txn, doc_ref, NOW)
+
+    assert result is None
+    assert txn.writes == []
+    assert doc_ref.applied == []
+    assert doc_ref._state['leftTeam']['finalScore'] == 88  # untouched
+
+
+def test_transaction_body_writes_when_still_idle():
+    state = _game(logs=[_event(minutes_ago=45, team='left', period='2nd',
+                               payload={'newScore': 54})])
+    doc_ref = _FakeDocRef('g1', state)
+    txn = _FakeTransaction()
+
+    guard = _make_guard(_FakeFirebaseService([]))
+    result = guard._end_game_in_transaction(txn, doc_ref, NOW)
+
+    assert result is not None
+    update, game = result
+    assert update['autoEnded'] is True
+    assert len(txn.writes) == 1
+    ref, fields = txn.writes[0]
+    assert ref is doc_ref and fields is update
+    assert doc_ref._state['endedAt']  # now ended
+
+
+# --- full _sweep path -----------------------------------------------------
+
+def test_sweep_does_not_clobber_score_ended_during_window(monkeypatch):
+    monkeypatch.setattr(game_auto_end, '_run_transaction', _direct_runner)
+
+    # Stale snapshot the sweep streams: still idle, not ended → passes pre-filter.
+    stale = _game(logs=[_event(minutes_ago=45)])
+    # Committed state: a real "End Game" already set endedAt + the true score.
+    fresh = _game(ended_at=_iso(NOW - timedelta(minutes=1)),
+                  logs=[_event(minutes_ago=45)])
+    fresh['leftTeam'] = {'displayName': 'Sharks', 'finalScore': 88}
+    doc_ref = _FakeDocRef('g1', fresh)
+    streamed = _FakeSnapshot('g1', stale, doc_ref)
+
+    svc = _FakeFirebaseService([streamed])
+    _make_guard(svc)._sweep()
+
+    assert doc_ref.applied == []                      # guard never wrote
+    assert svc.db.transactions[0].writes == []        # transaction wrote nothing
+    assert doc_ref._state['leftTeam']['finalScore'] == 88  # real score intact
+    assert doc_ref._state['endedAt'] == fresh['endedAt']   # real endedAt intact
+
+
+def test_sweep_ends_idle_game_via_transaction(monkeypatch):
+    monkeypatch.setattr(game_auto_end, '_run_transaction', _direct_runner)
+
+    state = _game(logs=[_event(minutes_ago=45, team='left', period='2nd',
+                               payload={'newScore': 54})])
+    doc_ref = _FakeDocRef('g1', state)
+    streamed = _FakeSnapshot('g1', dict(state), doc_ref)
+
+    svc = _FakeFirebaseService([streamed])
+    _make_guard(svc)._sweep()
+
+    assert len(doc_ref.applied) == 1
+    written = doc_ref.applied[0]
+    assert written['autoEnded'] is True
+    assert written['leftTeam.finalScore'] == 54
+    assert doc_ref._state['endedAt']  # game is now ended
+
+
+def test_sweep_skips_already_ended_without_opening_transaction(monkeypatch):
+    monkeypatch.setattr(game_auto_end, '_run_transaction', _direct_runner)
+
+    ended = _game(ended_at=_iso(NOW - timedelta(hours=1)),
+                  logs=[_event(minutes_ago=45)])
+    doc_ref = _FakeDocRef('g1', ended)
+    streamed = _FakeSnapshot('g1', dict(ended), doc_ref)
+
+    svc = _FakeFirebaseService([streamed])
+    _make_guard(svc)._sweep()
+
+    assert svc.db.transactions == []  # pre-filter short-circuits, no txn opened
+    assert doc_ref.applied == []
