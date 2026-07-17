@@ -1,0 +1,17 @@
+{
+  "location": "court-a",
+  "jetson_id": "agx-1",
+  "rtsp_port": 554,
+  "rtsp_path": "/main/av",
+  "docker_image": "bauersan/jetson-ndi-yolo:latest",
+  "app_mount": "/home/dev/app",
+  "output_dir": "/home/dev/app/recordings",
+  "docker_cmd": "docker",
+  "_note": "NL/NR angle assignment is PROVISIONAL (35349->NL, 42331->NR); confirm physical placement.",
+  "cameras": [
+    { "id": "35353", "ip": "10.1.10.142", "angle": "FL" },
+    { "id": "35347", "ip": "10.1.10.52",  "angle": "FR" },
+    { "id": "35349", "ip": "10.1.10.92",  "angle": "NL" },
+    { "id": "42331", "ip": "10.1.10.76",  "angle": "NR" }
+  ]
+}
