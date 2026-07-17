@@ -332,6 +332,12 @@ if __name__ == "__main__":
         from agx_pipeline.relay import Relay
         _RELAY = Relay(FB, CFG.jetson_id, _device_state, _do_start, _do_stop, auto_fn=_auto_follow)
         _RELAY.start()
+        # Publish the Courtside schedule + roster to Firestore. The frontend's
+        # cloud IP is WAF/geo-blocked by the league site; the AGX (at the venue,
+        # allowed IP) can fetch it, so it scrapes and the frontend reads Firestore.
+        if os.getenv("COURTSIDE_SCRAPE", "true").lower() in ("1", "true", "yes"):
+            from agx_pipeline.courtside import start_refresh
+            start_refresh(FB, int(os.getenv("COURTSIDE_REFRESH_MIN", "30")))
     logger.info("AGX service starting on :%d (firebase=%s, cameras=%d, relay=%s, auto_record=%s)",
                 port, FB is not None, len(CFG.cameras), _RELAY is not None, AUTO_RECORD)
     app.run(host="0.0.0.0", port=port)
