@@ -34,6 +34,7 @@ from firebase_service import get_firebase_service
 from agx_pipeline.recording import RecordingController, load_config
 from agx_pipeline.camrec_controller import CamrecController
 from agx_pipeline.sessions import AgxSessionTracker, get_active_game
+from agx_pipeline.notifier import CameraAlerter
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(levelname)-7s %(name)s %(message)s")
@@ -49,6 +50,7 @@ CONTROLLER = CamrecController(CFG) if _BACKEND == "camrec" else RecordingControl
 logger.info("recording backend: %s", _BACKEND)
 FB = get_firebase_service()
 TRACKER = AgxSessionTracker(FB, CFG.jetson_id) if FB else None
+ALERTER = CameraAlerter(CFG.jetson_id, CFG.location)  # emails UAI on camera up<->down
 
 # in-memory current recording / pipeline state (Firebase is the durable copy)
 _lock = threading.Lock()
@@ -122,9 +124,11 @@ def _camera_up(ip: str) -> bool:
 def _device_state() -> Dict:
     """Snapshot for agx-devices/{jetson_id}: cameras + recording + current ingestion."""
     rec = bool(_current)
+    cams = [{"id": c.id, "angle": c.angle, "ip": c.ip, "up": _camera_up(c.ip)}
+            for c in CFG.cameras]
+    ALERTER.check(cams)  # email UAI on any camera up<->down transition (debounced)
     return {
-        "cameras": [{"id": c.id, "angle": c.angle, "ip": c.ip, "up": _camera_up(c.ip)}
-                    for c in CFG.cameras],
+        "cameras": cams,
         "recording": {
             "active": rec,
             "label": _current.get("label") if rec else None,
