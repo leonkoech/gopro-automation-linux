@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import shlex
 import subprocess
@@ -32,6 +33,8 @@ import sys
 import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
+
+logger = logging.getLogger("agx.recording")
 
 CONFIG_PATH = os.path.join(os.path.dirname(__file__), "cameras.json")
 CONTAINER_PREFIX = "agxrec_"
@@ -114,32 +117,23 @@ def load_config(path: str = CONFIG_PATH) -> Config:
 # --------------------------------------------------------------------------- #
 # GStreamer pipeline
 # --------------------------------------------------------------------------- #
-def _rtsp_branch(cam: Camera, cfg: Config, out_path: str, idx: int) -> List[str]:
-    """One rtspsrc->depay->parse->mp4mux->filesink branch (matches record_zowie.sh)."""
+def _single_cam_gst(cam: Camera, cfg: Config, out_path: str) -> List[str]:
+    """A complete ONE-camera gst-launch: rtspsrc->depay->parse->mp4mux->filesink.
+
+    Each camera records in its own container (see RecordingController), so one
+    camera stalling at RTSP connect can't stall the others — the failure mode of
+    the old single shared gst-launch, where any branch failing to preroll left
+    ALL cameras writing 0 bytes.
+    """
     url = f"rtsp://{cam.ip}:{cfg.rtsp_port}{cfg.rtsp_path}"
-    name = f"r{idx}"
     return [
-        "rtspsrc", f"location={url}", "protocols=tcp", f"name={name}",
-        f"{name}.", "!", "application/x-rtp,media=video",
+        "gst-launch-1.0", "-e",
+        "rtspsrc", f"location={url}", "protocols=tcp", "name=r0",
+        "r0.", "!", "application/x-rtp,media=video",
         "!", "queue", "max-size-buffers=30",
         "!", "rtph265depay", "!", "h265parse", "!", "mp4mux",
         "!", "filesink", f"location={out_path}",
     ]
-
-
-def build_gst_args(cameras: List[Camera], cfg: Config, session_dir: str,
-                   label: str) -> Dict[str, object]:
-    """Return {'gst': [...args...], 'outputs': [{angle, id, path}, ...]}."""
-    gst: List[str] = ["gst-launch-1.0", "-e"]
-    outputs = []
-    for i, cam in enumerate(cameras):
-        # container sees session_dir under the app mount
-        fname = f"{label}_{cam.angle}.mp4"
-        host_path = os.path.join(session_dir, fname)
-        container_path = _to_container_path(host_path, cfg)
-        gst += _rtsp_branch(cam, cfg, container_path, i)
-        outputs.append({"angle": cam.angle, "id": cam.id, "path": host_path})
-    return {"gst": gst, "outputs": outputs}
 
 
 def _to_container_path(host_path: str, cfg: Config) -> str:
@@ -152,20 +146,46 @@ def _to_container_path(host_path: str, cfg: Config) -> str:
 # Controller
 # --------------------------------------------------------------------------- #
 class RecordingController:
+    """Records each camera in its OWN container (isolated failures) with a
+    post-start data-flow check: a camera whose container is up but whose file is
+    still empty is stuck in RTSP preroll (the intermittent all-zero failure) —
+    it is killed and relaunched rather than silently recording nothing."""
+
     def __init__(self, cfg: Config):
         self.cfg = cfg
+        self.verify_settle = float(os.getenv("REC_VERIFY_SETTLE_SEC", "4"))
+        self.verify_retries = int(os.getenv("REC_VERIFY_RETRIES", "2"))
+        self.verify_min_bytes = int(os.getenv("REC_VERIFY_MIN_BYTES", str(64 * 1024)))
 
     def _docker(self, *args: str) -> subprocess.CompletedProcess:
         return subprocess.run(list(self.cfg.docker_cmd) + list(args),
                               capture_output=True, text=True, stdin=subprocess.DEVNULL)
 
-    def container_name(self, label: str) -> str:
-        return CONTAINER_PREFIX + label
+    def _container_name(self, label: str, angle: str) -> str:
+        return f"{CONTAINER_PREFIX}{label}_{angle}"
+
+    def _running(self) -> List[str]:
+        return self._docker("ps", "--format", "{{.Names}}").stdout.split()
+
+    def _session_containers(self, label: str) -> List[str]:
+        prefix = f"{CONTAINER_PREFIX}{label}_"
+        return [n for n in self._running() if n.startswith(prefix)]
 
     def is_recording(self, label: str) -> bool:
-        cp = self._docker("ps", "--filter", f"name=^{self.container_name(label)}$",
-                          "--format", "{{.Names}}")
-        return self.container_name(label) in cp.stdout
+        return bool(self._session_containers(label))
+
+    def _run_cmd(self, cam: Camera, session_dir: str, label: str) -> Dict[str, object]:
+        """One camera's {angle, id, name, path, cmd} (cmd = full docker run)."""
+        host_path = os.path.join(session_dir, f"{label}_{cam.angle}.mp4")
+        container_path = _to_container_path(host_path, self.cfg)
+        name = self._container_name(label, cam.angle)
+        cmd = list(self.cfg.docker_cmd) + [
+            "run", "-d", "--name", name, "--rm",
+            "--privileged", "--runtime", "nvidia", "--net=host",
+            "-v", f"{self.cfg.app_mount}:/app/data", "--workdir", "/app/data",
+            self.cfg.docker_image,
+        ] + _single_cam_gst(cam, self.cfg, container_path)
+        return {"angle": cam.angle, "id": cam.id, "name": name, "path": host_path, "cmd": cmd}
 
     def plan(self, label: str, camera_ids: Optional[List[str]] = None) -> Dict[str, object]:
         cams = self.cfg.cameras if not camera_ids else \
@@ -173,43 +193,71 @@ class RecordingController:
         if not cams:
             raise ValueError("no valid cameras selected")
         session_dir = os.path.join(self.cfg.output_dir, label)
-        built = build_gst_args(cams, self.cfg, session_dir, label)
-        docker_run = list(self.cfg.docker_cmd) + [
-            "run", "-d", "--name", self.container_name(label), "--rm",
-            "--privileged", "--runtime", "nvidia", "--net=host",
-            "-v", f"{self.cfg.app_mount}:/app/data", "--workdir", "/app/data",
-            self.cfg.docker_image,
-        ] + built["gst"]
-        return {"session_dir": session_dir, "outputs": built["outputs"],
-                "docker_run": docker_run}
+        return {"session_dir": session_dir,
+                "runs": [self._run_cmd(c, session_dir, label) for c in cams]}
+
+    def _launch(self, run: Dict) -> bool:
+        cp = subprocess.run(run["cmd"], capture_output=True, text=True, stdin=subprocess.DEVNULL)
+        if cp.returncode != 0:
+            logger.error("docker run failed for %s: %s", run["angle"], cp.stderr.strip()[-300:])
+            return False
+        return True
 
     def start(self, label: str, camera_ids: Optional[List[str]] = None) -> Dict[str, object]:
         if self.is_recording(label):
             raise RuntimeError(f"session {label} already recording")
         p = self.plan(label, camera_ids)
         os.makedirs(p["session_dir"], exist_ok=True)  # host side (best-effort)
-        cp = subprocess.run(p["docker_run"], capture_output=True, text=True,
-                            stdin=subprocess.DEVNULL)
-        if cp.returncode != 0:
-            raise RuntimeError(f"docker run failed: {cp.stderr.strip()[-400:]}")
-        time.sleep(2)
-        if not self.is_recording(label):
-            logs = self._docker("logs", self.container_name(label)).stdout[-400:]
-            raise RuntimeError(f"container did not stay up. logs: {logs}")
-        return {"label": label, "container": self.container_name(label),
-                "outputs": p["outputs"], "started_at": _utcnow()}
+        live = [r for r in p["runs"] if self._launch(r)]
+        if not live:
+            raise RuntimeError("no camera containers started")
+        self._verify_and_retry(live)
+        outputs = [{"angle": r["angle"], "id": r["id"], "path": r["path"]} for r in live]
+        logger.info("recording started (per-camera) label=%s angles=%s",
+                    label, [r["angle"] for r in live])
+        return {"label": label, "container": f"{CONTAINER_PREFIX}{label}",
+                "outputs": outputs, "started_at": _utcnow()}
+
+    def _flowing(self, run: Dict) -> bool:
+        """Container up AND file grown past the empty-preroll threshold."""
+        if run["name"] not in self._running():
+            return False
+        try:
+            return os.path.getsize(run["path"]) >= self.verify_min_bytes
+        except OSError:
+            return False
+
+    def _verify_and_retry(self, runs: List[Dict]) -> None:
+        """Confirm each camera is actually writing data; kill+relaunch any that
+        came up but stalled in RTSP preroll (0-byte), up to verify_retries."""
+        for attempt in range(self.verify_retries + 1):
+            time.sleep(self.verify_settle)
+            stalled = [r for r in runs if not self._flowing(r)]
+            if not stalled:
+                return
+            if attempt == self.verify_retries:
+                logger.warning("cameras not producing data after %d retries: %s",
+                               self.verify_retries, [r["angle"] for r in stalled])
+                return
+            for r in stalled:
+                logger.warning("camera %s not writing data — restarting (attempt %d)",
+                               r["angle"], attempt + 1)
+                self._docker("kill", r["name"])   # SIGKILL the stalled one; --rm cleans up
+                time.sleep(1)
+                self._launch(r)
 
     def stop(self, label: str, outputs: Optional[List[Dict]] = None,
              finalize_timeout: int = 30) -> Dict[str, object]:
-        name = self.container_name(label)
-        self._docker("kill", "--signal=INT", name)  # clean EOS
-        # wait for container to exit (files finalize during shutdown)
-        for _ in range(finalize_timeout):
-            if not self.is_recording(label):
+        for name in self._session_containers(label):
+            self._docker("kill", "--signal=INT", name)  # clean per-camera EOS
+        deadline = time.monotonic() + finalize_timeout
+        while time.monotonic() < deadline:
+            if not self._session_containers(label):
                 break
             time.sleep(1)
         else:
-            self._docker("kill", name)  # force
+            for name in self._session_containers(label):
+                self._docker("kill", name)  # force
         # probe only what was actually recorded: caller-supplied outputs, else
         # scan the session dir (also catches a camera that dropped mid-recording).
         if outputs is None:
@@ -285,8 +333,9 @@ def main() -> int:
     if args.action == "dry-run":
         p = ctl.plan(args.label, cam_ids)
         print("session_dir:", p["session_dir"])
-        print("outputs:", json.dumps(p["outputs"], indent=2))
-        print("\ndocker command:\n ", " ".join(shlex.quote(x) for x in p["docker_run"]))
+        for r in p["runs"]:
+            print(f"\n{r['angle']} ({r['id']}) -> {r['path']}")
+            print("  ", " ".join(shlex.quote(x) for x in r["cmd"]))
     elif args.action == "start":
         print(json.dumps(ctl.start(args.label, cam_ids), indent=2))
     elif args.action == "stop":
