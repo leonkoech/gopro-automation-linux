@@ -7,11 +7,16 @@
   "app_mount": "/home/dev/app",
   "output_dir": "/home/dev/app/recordings",
   "docker_cmd": "docker",
-  "_note": "NL/NR angle assignment is PROVISIONAL (35349->NL, 42331->NR); confirm physical placement.",
+  "_note": "NL/NR angle assignment is PROVISIONAL (35349->NL, 42331->NR); confirm physical placement. NR (42331) currently offline (lens issue) — excluded automatically while unreachable.",
+  "_shot_note": "shot_cameras = FLIR Blackfly S GigE Vision (Aravis), high-fps near-rim, SHOT DETECTION only. SL/SR basket_side is a PLACEHOLDER — confirm which serial faces which rim and swap if needed.",
   "cameras": [
-    { "id": "35353", "ip": "10.1.10.142", "angle": "FL" },
-    { "id": "35347", "ip": "10.1.10.52",  "angle": "FR" },
-    { "id": "35349", "ip": "10.1.10.92",  "angle": "NL" },
-    { "id": "42331", "ip": "10.1.10.76",  "angle": "NR" }
+    { "id": "35353", "ip": "10.1.10.142", "angle": "FL", "cv_role": "tracking" },
+    { "id": "35347", "ip": "10.1.10.52",  "angle": "FR", "cv_role": "tracking" },
+    { "id": "35349", "ip": "10.1.10.92",  "angle": "NL", "cv_role": "tracking" },
+    { "id": "42331", "ip": "10.1.10.76",  "angle": "NR", "cv_role": "tracking" }
+  ],
+  "shot_cameras": [
+    { "id": "24233344", "ip": "169.254.129.197", "angle": "SL", "basket_side": "L", "camera_name": "169.254.129.197", "serial": "BFS-PGE-04S2M-24233344" },
+    { "id": "25112169", "ip": "169.254.106.46",  "angle": "SR", "basket_side": "R", "camera_name": "169.254.106.46",  "serial": "BFS-PGE-04S2M-25112169" }
   ]
 }

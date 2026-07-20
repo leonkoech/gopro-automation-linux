@@ -67,12 +67,17 @@ class AgxSessionTracker:
                 "startedAt": started,
                 "endedAt": None,
                 "segmentSession": f"{label}_{angle}",
-                "interfaceId": o.get("id", ""),        # NDI camera id
+                "interfaceId": o.get("id", ""),        # NDI/GigE camera id
                 "recordingFile": o["path"],            # local MP4 path (AGX)
                 "totalChapters": 1,                    # one continuous file
                 "totalSizeBytes": 0,
                 "status": "recording",
                 "processedGames": [],
+                # CV routing: "tracking" (Zowietek game angles) vs
+                # "shot_detection" (FLIR near-rim high-fps). basketSide L/R for
+                # shot cams. Read by the future CV dispatcher to pick weights.
+                "cvRole": o.get("role", "tracking"),
+                "basketSide": o.get("basket_side", ""),
             }
             _, ref = self.fb.db.collection(self.col).add(doc)
             session_ids[angle] = ref.id
@@ -89,6 +94,9 @@ class AgxSessionTracker:
                 "status": "stopped",
                 "totalSizeBytes": int(f.get("size") or 0),
                 "durationSeconds": f.get("duration"),
+                "fps": f.get("fps"),                   # actual delivered fps
+                "resolution": (f"{f['width']}x{f['height']}"
+                               if f.get("width") and f.get("height") else None),
                 "chapterFiles": [{
                     "filename": (f.get("path") or "").split("/")[-1],
                     "directory": "recordings",

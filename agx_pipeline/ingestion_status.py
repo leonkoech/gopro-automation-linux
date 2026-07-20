@@ -58,6 +58,9 @@ class IngestionRun:
             "stages": {s: {"status": "pending", "done": 0, "total": totals[s], "error": None}
                        for s in STAGES},
             "angle_status": {a: {s: "pending" for s in STAGES} for a in angles},
+            # shot-detection (FLIR) footage — outcome per SL/SR angle. Separate
+            # from the transcode/upload/register stages, which shot footage skips.
+            "shots": {},
             "logs": [],
             "error": None,
             "started_at": _now(),
@@ -93,6 +96,14 @@ class IngestionRun:
 
     def set_uball_game(self, uball_game_id: Optional[str]) -> None:
         self.doc["uball_game_id"] = uball_game_id
+        self._write()
+
+    def set_shot(self, angle: str, status: str, **meta) -> None:
+        """Record a shot-detection (FLIR) camera's footage outcome for the UI.
+        status: 'uploaded' | 'kept_local' | 'failed'. meta carries fps,
+        resolution, basket_side, and s3_key/path/error as available."""
+        self.doc["shots"][angle] = {"status": status,
+                                    **{k: v for k, v in meta.items() if v is not None}}
         self._write()
 
     def start_stage(self, stage: str) -> None:

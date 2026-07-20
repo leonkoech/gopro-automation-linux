@@ -33,6 +33,7 @@ from flask import Flask, jsonify, request
 from firebase_service import get_firebase_service
 from agx_pipeline.recording import RecordingController, load_config
 from agx_pipeline.camrec_controller import CamrecController
+from agx_pipeline.shot_recording import AravisRecorder
 from agx_pipeline.sessions import AgxSessionTracker, get_active_game
 from agx_pipeline.notifier import CameraAlerter
 
@@ -47,7 +48,10 @@ CFG = load_config()
 # gst-launch. Both expose the same start()/stop() interface.
 _BACKEND = os.getenv("RECORDING_BACKEND", "gstreamer").lower()
 CONTROLLER = CamrecController(CFG) if _BACKEND == "camrec" else RecordingController(CFG)
-logger.info("recording backend: %s", _BACKEND)
+# Shot-detection cameras (FLIR/GigE) record via a separate host-side Aravis
+# recorder, alongside whichever backend records the tracking (RTSP) angles.
+SHOT = AravisRecorder(CFG) if CFG.shot_cameras else None
+logger.info("recording backend: %s (shot cameras: %d)", _BACKEND, len(CFG.shot_cameras))
 FB = get_firebase_service()
 TRACKER = AgxSessionTracker(FB, CFG.jetson_id) if FB else None
 ALERTER = CameraAlerter(CFG.jetson_id, CFG.location)  # emails UAI on camera up<->down
@@ -124,8 +128,11 @@ def _camera_up(ip: str) -> bool:
 def _device_state() -> Dict:
     """Snapshot for agx-devices/{jetson_id}: cameras + recording + current ingestion."""
     rec = bool(_current)
-    cams = [{"id": c.id, "angle": c.angle, "ip": c.ip, "up": _camera_up(c.ip)}
-            for c in CFG.cameras]
+    cams = [{"id": c.id, "angle": c.angle, "ip": c.ip, "up": _camera_up(c.ip),
+             "role": "tracking"} for c in CFG.cameras]
+    cams += [{"id": c.id, "angle": c.angle, "ip": c.ip, "up": _camera_up(c.ip),
+              "role": "shot_detection", "basket_side": c.basket_side}
+             for c in CFG.shot_cameras]
     ALERTER.check(cams)  # email UAI on any camera up<->down transition (debounced)
     return {
         "cameras": cams,
@@ -169,7 +176,7 @@ def gopros():
     cams = [{
         "id": c.id, "name": f"AGX {c.angle}", "interface": c.angle,
         "ip": c.ip, "status": "connected", "is_recording": recording,
-    } for c in CFG.cameras]
+    } for c in list(CFG.cameras) + list(CFG.shot_cameras)]
     return jsonify({"success": True, "gopros": cams})
 
 
@@ -223,18 +230,29 @@ def _do_start(game_id=None, label=None, force=False):
         except Exception as e:  # noqa: BLE001
             logger.error("start failed: %s", e)
             return {"success": False, "error": str(e)}, 500
-        session_ids = TRACKER.open(label, started["outputs"], game_id) if TRACKER else {}
+        outputs = [{**o, "role": "tracking"} for o in started["outputs"]]
+        # Shot-detection cameras (FLIR/GigE): best-effort, never blocks the game
+        # recording. Not ping-gated — a missing/busy GigE camera's gst-launch
+        # dies within the settle window and is dropped; ALL configured shot cams
+        # are attempted (the override/force decision applies only to tracking).
+        if SHOT and CFG.shot_cameras:
+            try:
+                s = SHOT.start(label, camera_ids=[c.id for c in CFG.shot_cameras])
+                outputs += s["outputs"]
+            except Exception as e:  # noqa: BLE001
+                logger.error("shot cameras did not start (recording tracking only): %s", e)
+        session_ids = TRACKER.open(label, outputs, game_id) if TRACKER else {}
         _current.update({
             "label": label, "firebase_game_id": game_id,
-            "container": started["container"], "outputs": started["outputs"],
+            "container": started["container"], "outputs": outputs,
             "session_ids": session_ids, "started_at": started["started_at"],
             "forced": bool(force),
         })
     logger.info("recording started label=%s game=%s force=%s angles=%s",
-                label, game_id, bool(force), [o["angle"] for o in started["outputs"]])
+                label, game_id, bool(force), [o["angle"] for o in outputs])
     _publish()
     return {"success": True, "label": label, "firebase_game_id": game_id, "forced": bool(force),
-            "angles": [o["angle"] for o in started["outputs"]], "sessions": session_ids}, 200
+            "angles": [o["angle"] for o in outputs], "sessions": session_ids}, 200
 
 
 def _do_stop():
@@ -244,11 +262,29 @@ def _do_stop():
             return {"success": False, "error": "not recording"}, 409
         state = dict(_current)
         _current.clear()
-    try:
-        stopped = CONTROLLER.stop(state["label"], outputs=state["outputs"])
-    except Exception as e:  # noqa: BLE001
-        logger.error("stop failed: %s", e)
-        return {"success": False, "error": str(e)}, 500
+        # Tear BOTH recorders down under the lock: (1) a failure stopping the
+        # tracking recorder must not skip the shot recorder — an un-signalled
+        # gst-launch keeps the GigE cameras locked forever; (2) holding the lock
+        # through teardown stops a concurrent start (relay auto-loop or operator)
+        # from grabbing a camera whose previous process hasn't exited yet.
+        outs = state["outputs"]
+        track_outs = [o for o in outs if o.get("role") != "shot_detection"]
+        shot_outs = [o for o in outs if o.get("role") == "shot_detection"]
+        stopped = {"label": state["label"], "files": []}
+        track_err = None
+        try:
+            stopped = CONTROLLER.stop(state["label"], outputs=track_outs)
+        except Exception as e:  # noqa: BLE001
+            track_err = str(e)
+            logger.error("tracking stop failed: %s", e)
+        if SHOT and shot_outs:
+            try:
+                stopped.setdefault("files", []).extend(
+                    SHOT.stop(state["label"], outputs=shot_outs)["files"])
+            except Exception as e:  # noqa: BLE001
+                logger.error("shot stop failed: %s", e)
+    if track_err is not None:
+        return {"success": False, "error": track_err}, 500
     if TRACKER:
         TRACKER.close(state["session_ids"], stopped["files"])
     pipeline_id = uuid.uuid4().hex[:8]
