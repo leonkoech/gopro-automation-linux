@@ -295,27 +295,48 @@ def _ingest_shot(run, cfg, shot_files, date: str, folder: str) -> None:
         res = f"{f['width']}x{f['height']}" if f.get("width") and f.get("height") else None
         fps, side = f.get("fps"), f.get("basket_side")
         meta = f"{res}@{fps}fps"
+        base = dict(fps=fps, resolution=res, basket_side=side)
         if SHOTDET_UPLOAD_S3:
             key, _fn = _s3_key(date, folder, angle)
             try:
                 _upload(f["path"], key)
-                run.set_shot(angle, "uploaded", fps=fps, resolution=res, basket_side=side, s3_key=key)
+                run.set_shot(angle, "uploaded", s3_key=key, **base)
                 run.log("info", f"shot {angle} ({meta}): uploaded as-is -> s3://{BUCKET}/{key}")
             except Exception as e:  # noqa: BLE001
-                run.set_shot(angle, "failed", fps=fps, resolution=res, basket_side=side, error=str(e)[:200])
-                run.log("error", f"shot {angle}: upload failed: {str(e)[:200]}")
+                # Upload failed — the recorded clip still lives in the session dir,
+                # which run_ingestion is about to rmtree. Preserve it locally so a
+                # transient S3 error can't permanently lose the only copy.
+                dst = _preserve_shot_local(cfg, f["path"], folder)
+                if dst:
+                    run.set_shot(angle, "kept_local", path=dst,
+                                 error=f"upload failed: {str(e)[:150]}", **base)
+                    run.log("error", f"shot {angle}: upload failed ({str(e)[:150]}); kept local -> {dst}")
+                else:
+                    run.set_shot(angle, "failed", error=str(e)[:200], **base)
+                    run.log("error", f"shot {angle}: upload AND keep-local failed: {str(e)[:200]}")
         else:
-            keep_dir = os.path.join(cfg.output_dir, "shotdet_local", folder)
-            os.makedirs(keep_dir, exist_ok=True)
-            dst = os.path.join(keep_dir, os.path.basename(f["path"]))
-            try:
-                import shutil
-                shutil.move(f["path"], dst)
-                run.set_shot(angle, "kept_local", fps=fps, resolution=res, basket_side=side, path=dst)
+            dst = _preserve_shot_local(cfg, f["path"], folder)
+            if dst:
+                run.set_shot(angle, "kept_local", path=dst, **base)
                 run.log("info", f"shot {angle} ({meta}): kept local for shot detection -> {dst}")
-            except OSError as e:
-                run.set_shot(angle, "failed", fps=fps, resolution=res, basket_side=side, error=str(e)[:200])
-                run.log("error", f"shot {angle}: keep-local failed: {str(e)[:200]}")
+            else:
+                run.set_shot(angle, "failed", error="keep-local move failed", **base)
+                run.log("error", f"shot {angle}: keep-local failed")
+
+
+def _preserve_shot_local(cfg, src_path: str, folder: str) -> Optional[str]:
+    """Move a shot clip OUT of the session dir (which run_ingestion rmtree's) into
+    <output_dir>/shotdet_local/<folder>/ so it survives cleanup. Returns the new
+    path, or None if the move failed."""
+    keep_dir = os.path.join(cfg.output_dir, "shotdet_local", folder)
+    try:
+        import shutil
+        os.makedirs(keep_dir, exist_ok=True)
+        dst = os.path.join(keep_dir, os.path.basename(src_path))
+        shutil.move(src_path, dst)
+        return dst
+    except OSError:
+        return None
 
 
 def _rm(path: str) -> None:

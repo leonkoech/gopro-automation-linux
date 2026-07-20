@@ -100,16 +100,20 @@ class AravisRecorder:
         session_dir = os.path.join(self.cfg.output_dir, label)
         os.makedirs(session_dir, exist_ok=True)
         procs: List[Dict] = []
-        for cam in cams:
-            out_path = os.path.join(session_dir, f"{label}_{cam.angle}.mp4")
-            proc = subprocess.Popen(
-                self._pipeline(cam, out_path),
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-            procs.append({"angle": cam.angle, "id": cam.id, "path": out_path,
-                          "basket_side": cam.basket_side, "proc": proc})
+        try:
+            for cam in cams:
+                out_path = os.path.join(session_dir, f"{label}_{cam.angle}.mp4")
+                proc = subprocess.Popen(
+                    self._pipeline(cam, out_path),
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                procs.append({"angle": cam.angle, "id": cam.id, "path": out_path,
+                              "basket_side": cam.basket_side, "proc": proc})
+        except OSError:
+            self._reap(procs)  # a mid-loop Popen failure must not leak earlier procs
+            raise
         # let each gst-launch negotiate + start pulling frames, then keep only
         # the ones that stayed up (a missing/busy camera dies within this window)
         time.sleep(START_SETTLE_SEC)
@@ -137,9 +141,12 @@ class AravisRecorder:
             for pr in procs:
                 self._wait_or_kill(pr["proc"], max(0.0, deadline - time.monotonic()))
         else:
-            # service restarted between start and stop: no in-memory handles. Best
-            # effort — signal any gst-launch still writing this session's files.
-            self._pkill_session(label, outputs)
+            # No in-memory handles for this label (e.g. the CLI `stop` command).
+            # Best effort — SIGINT any gst-launch still writing this session's
+            # files. NOTE: the HTTP/relay path can't reach here after a service
+            # restart — _do_stop returns 409 first once _current is empty — so
+            # recovering a recording across a restart needs manual intervention.
+            self._pkill_session(label)
         outs = outputs or (self._outputs_for(procs, alive_only=False) if procs else [])
         results = [{**o, **_probe(o["path"])} for o in outs]
         logger.info("shot stopped label=%s finalized=%s", label,
@@ -169,7 +176,7 @@ class AravisRecorder:
                 except subprocess.TimeoutExpired:
                     p.kill()
 
-    def _pkill_session(self, label: str, outputs: Optional[List[Dict]]) -> None:
+    def _pkill_session(self, label: str) -> None:
         session_dir = os.path.join(self.cfg.output_dir, label)
         try:
             # match the filesink location for this session so we only hit our procs

@@ -262,21 +262,29 @@ def _do_stop():
             return {"success": False, "error": "not recording"}, 409
         state = dict(_current)
         _current.clear()
-    outs = state["outputs"]
-    track_outs = [o for o in outs if o.get("role") != "shot_detection"]
-    shot_outs = [o for o in outs if o.get("role") == "shot_detection"]
-    try:
-        stopped = CONTROLLER.stop(state["label"], outputs=track_outs)
-    except Exception as e:  # noqa: BLE001
-        logger.error("stop failed: %s", e)
-        return {"success": False, "error": str(e)}, 500
-    # Stop the shot cameras with their own recorder (SIGINT-finalize), then merge
-    # their finalized files in. Best-effort so a shot hiccup can't fail the game.
-    if SHOT and shot_outs:
+        # Tear BOTH recorders down under the lock: (1) a failure stopping the
+        # tracking recorder must not skip the shot recorder — an un-signalled
+        # gst-launch keeps the GigE cameras locked forever; (2) holding the lock
+        # through teardown stops a concurrent start (relay auto-loop or operator)
+        # from grabbing a camera whose previous process hasn't exited yet.
+        outs = state["outputs"]
+        track_outs = [o for o in outs if o.get("role") != "shot_detection"]
+        shot_outs = [o for o in outs if o.get("role") == "shot_detection"]
+        stopped = {"label": state["label"], "files": []}
+        track_err = None
         try:
-            stopped["files"] += SHOT.stop(state["label"], outputs=shot_outs)["files"]
+            stopped = CONTROLLER.stop(state["label"], outputs=track_outs)
         except Exception as e:  # noqa: BLE001
-            logger.error("shot stop failed: %s", e)
+            track_err = str(e)
+            logger.error("tracking stop failed: %s", e)
+        if SHOT and shot_outs:
+            try:
+                stopped.setdefault("files", []).extend(
+                    SHOT.stop(state["label"], outputs=shot_outs)["files"])
+            except Exception as e:  # noqa: BLE001
+                logger.error("shot stop failed: %s", e)
+    if track_err is not None:
+        return {"success": False, "error": track_err}, 500
     if TRACKER:
         TRACKER.close(state["session_ids"], stopped["files"])
     pipeline_id = uuid.uuid4().hex[:8]
