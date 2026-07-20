@@ -30,12 +30,17 @@ import shlex
 import subprocess
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
 CONFIG_PATH = os.path.join(os.path.dirname(__file__), "cameras.json")
 CONTAINER_PREFIX = "agxrec_"
-VALID_ANGLES = ("FL", "FR", "NL", "NR")
+# Broadcast game angles (RTSP/Zowietek, player+ball tracking) and the near-rim
+# high-fps shot-detection angles (Aravis/FLIR). Kept as distinct code sets so a
+# shot camera can never be mistaken for a tracking angle downstream.
+TRACKING_ANGLES = ("FL", "FR", "NL", "NR")
+SHOT_ANGLES = ("SL", "SR")
+VALID_ANGLES = TRACKING_ANGLES + SHOT_ANGLES
 
 
 @dataclass(frozen=True)
@@ -43,6 +48,10 @@ class Camera:
     id: str
     ip: str
     angle: str
+    type: str = "rtsp"          # "rtsp" (Zowietek NDI) | "aravis" (FLIR GigE Vision)
+    cv_role: str = "tracking"   # "tracking" | "shot_detection"
+    camera_name: str = ""       # aravissrc camera-name (device id/IP); defaults to ip
+    basket_side: str = ""       # "L" | "R" — which rim a shot camera faces
 
 
 @dataclass(frozen=True)
@@ -56,16 +65,36 @@ class Config:
     output_dir: str
     docker_cmd: List[str]
     cameras: List[Camera]
+    shot_cameras: List[Camera] = field(default_factory=list)
 
     def camera_by_id(self, cam_id: str) -> Optional[Camera]:
         return next((c for c in self.cameras if c.id == cam_id), None)
+
+    def shot_camera_by_id(self, cam_id: str) -> Optional[Camera]:
+        return next((c for c in self.shot_cameras if c.id == cam_id), None)
+
+
+def _parse_camera(c: dict, *, aravis: bool) -> Camera:
+    """Build a Camera from a cameras.json entry. Tracking cams are RTSP; shot
+    cams are Aravis (FLIR GigE) and default camera_name to their IP."""
+    ip = c["ip"]
+    return Camera(
+        id=str(c["id"]),
+        ip=ip,
+        angle=c["angle"],
+        type="aravis" if aravis else c.get("type", "rtsp"),
+        cv_role=c.get("cv_role", "shot_detection" if aravis else "tracking"),
+        camera_name=c.get("camera_name") or (ip if aravis else ""),
+        basket_side=c.get("basket_side", ""),
+    )
 
 
 def load_config(path: str = CONFIG_PATH) -> Config:
     with open(path) as f:
         d = json.load(f)
-    cams = [Camera(id=str(c["id"]), ip=c["ip"], angle=c["angle"]) for c in d["cameras"]]
-    for c in cams:
+    cams = [_parse_camera(c, aravis=False) for c in d["cameras"]]
+    shot_cams = [_parse_camera(c, aravis=True) for c in d.get("shot_cameras", [])]
+    for c in cams + shot_cams:
         if c.angle not in VALID_ANGLES:
             raise ValueError(f"camera {c.id}: invalid angle {c.angle}")
     return Config(
@@ -78,6 +107,7 @@ def load_config(path: str = CONFIG_PATH) -> Config:
         output_dir=d.get("output_dir", os.path.join(d["app_mount"], "recordings")),
         docker_cmd=shlex.split(d.get("docker_cmd", "docker")),
         cameras=cams,
+        shot_cameras=shot_cams,
     )
 
 
@@ -202,19 +232,33 @@ class RecordingController:
 
 
 def _probe(path: str) -> Dict[str, object]:
+    """Finalized-file check + metadata. Returns actual fps (avg_frame_rate — the
+    real delivered rate, which for the frame-dropping FLIR capture differs from
+    the nominal rate) and resolution, so the fps-parametric shot-detection
+    pipeline gets the true capture rate rather than a hard-coded assumption."""
     if not os.path.isfile(path):
-        return {"ok": False, "reason": "missing", "duration": None, "size": 0}
+        return {"ok": False, "reason": "missing", "duration": None, "size": 0,
+                "fps": None, "width": None, "height": None}
     size = os.path.getsize(path)
     cp = subprocess.run(
-        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-         "-of", "default=nokey=1:noprint_wrappers=1", path],
+        ["ffprobe", "-v", "error", "-select_streams", "v:0",
+         "-show_entries", "stream=avg_frame_rate,width,height:format=duration",
+         "-of", "json", path],
         capture_output=True, text=True, stdin=subprocess.DEVNULL)
-    dur = None
+    dur = fps = width = height = None
     try:
-        dur = float(cp.stdout.strip())
-    except ValueError:
+        info = json.loads(cp.stdout or "{}")
+        dur = float(info.get("format", {}).get("duration"))
+        st = (info.get("streams") or [{}])[0]
+        width, height = st.get("width"), st.get("height")
+        rate = st.get("avg_frame_rate") or ""
+        if "/" in rate:
+            num, den = rate.split("/")
+            fps = round(float(num) / float(den), 3) if float(den) else None
+    except (ValueError, TypeError, KeyError):
         pass
-    return {"ok": dur is not None and size > 0, "duration": dur, "size": size}
+    return {"ok": dur is not None and size > 0, "duration": dur, "size": size,
+            "fps": fps, "width": width, "height": height}
 
 
 def _utcnow() -> str:

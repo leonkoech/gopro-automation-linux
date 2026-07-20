@@ -9,6 +9,12 @@ leftTeamId/rightTeamId), then delete the 4K masters from the AGX
 
 NL/NR are transcoded + uploaded (1080p) too, but not registered yet — the
 annotation player is 2-angle today; they're ready for the 4-angle rollout.
+
+Shot-detection footage (FLIR near-rim, role="shot_detection", angles SL/SR) is
+handled separately: it is already H.264 at native (small) resolution, so it is
+uploaded AS-IS to the SAME game folder (no downscale/transcode, no annotation
+register), joining the game by uuid for the shot-detection CV. Set
+SHOTDET_UPLOAD_S3=false to keep it on the AGX for local processing instead.
 """
 
 from __future__ import annotations
@@ -30,6 +36,10 @@ REGION = os.getenv("UPLOAD_REGION", "us-east-1")
 LOCATION = os.getenv("COURT_LOCATION", "court-a")
 COURT_TZ = os.getenv("COURT_TZ", "America/New_York")
 DELETE_RAW = os.getenv("DELETE_RAW_AFTER_TRANSCODE", "true").lower() in ("1", "true", "yes")
+# Shot-detection (FLIR) footage: upload as-is to S3 now (to build the CV
+# pipeline against real footage). Flip to false later to process it locally on
+# the AGX only — one env change, no code change.
+SHOTDET_UPLOAD_S3 = os.getenv("SHOTDET_UPLOAD_S3", "true").lower() in ("1", "true", "yes")
 CRF = os.getenv("TRANSCODE_CRF", "23")
 PRESET = os.getenv("TRANSCODE_PRESET", "veryfast")
 HW_BITRATE = os.getenv("TRANSCODE_HW_BITRATE", "8000000")  # NVENC bits/sec for 1080p
@@ -152,7 +162,11 @@ def run_ingestion(fb, cfg, pipeline_id: str, state: Dict, stopped: Dict, tracker
     firebase_game_id = state["firebase_game_id"]
     label = state["label"]
     date = _local_date(label)
-    files = [f for f in stopped["files"] if f.get("ok")]
+    ok_files = [f for f in stopped["files"] if f.get("ok")]
+    # Split by CV role: tracking (Zowietek) goes through transcode→upload→register
+    # below; shot-detection (FLIR) is uploaded as-is separately (STAGE 4).
+    shot_files = [f for f in ok_files if f.get("role") == "shot_detection"]
+    files = [f for f in ok_files if f.get("role") != "shot_detection"]
     angles = [f["angle"] for f in files]
 
     game = (fb.get_game(firebase_game_id) if fb else None) or {}
@@ -235,6 +249,12 @@ def run_ingestion(fb, cfg, pipeline_id: str, state: Dict, stopped: Dict, tracker
                 run.angle_failed("register", angle, str(e)[:200])
         run.finish_stage("register")
 
+        # STAGE 4 — shot-detection footage (FLIR SL/SR): upload as-is to the same
+        # game folder, or keep it local. Runs before cleanup so kept-local files
+        # are moved out of the session dir first (survive the rmtree below).
+        if shot_files:
+            _ingest_shot(run, cfg, shot_files, date, folder)
+
         # cleanup: 1080p is in S3; drop it + the 4K master (env-controlled) to keep the AGX free
         for r in tr.values():
             _rm(r["dst"])
@@ -259,6 +279,37 @@ def run_ingestion(fb, cfg, pipeline_id: str, state: Dict, stopped: Dict, tracker
                                                    "stage_message": str(e)[:200], "progress": 100,
                                                    "completed_at": _now()})
         raise
+
+
+def _ingest_shot(run, cfg, shot_files, date: str, folder: str) -> None:
+    """Shot-detection footage (FLIR SL/SR) — deliberately NOT the tracking path.
+
+    The clips are already H.264 at native (small) resolution, so there's no
+    downscale/transcode and no annotation register. Default (SHOTDET_UPLOAD_S3):
+    upload the file AS-IS to the SAME game folder in S3 under its SL/SR angle, so
+    it joins the game by uuid for the shot-detection CV. Otherwise preserve it on
+    the AGX under <output_dir>/shotdet_local/<folder>/ for local processing (and
+    out of the session dir so the caller's cleanup rmtree can't delete it)."""
+    for f in shot_files:
+        angle = f["angle"]
+        meta = f"{f.get('width')}x{f.get('height')}@{f.get('fps')}fps"
+        if SHOTDET_UPLOAD_S3:
+            key, _fn = _s3_key(date, folder, angle)
+            try:
+                _upload(f["path"], key)
+                run.log("info", f"shot {angle} ({meta}): uploaded as-is -> s3://{BUCKET}/{key}")
+            except Exception as e:  # noqa: BLE001
+                run.log("error", f"shot {angle}: upload failed: {str(e)[:200]}")
+        else:
+            keep_dir = os.path.join(cfg.output_dir, "shotdet_local", folder)
+            os.makedirs(keep_dir, exist_ok=True)
+            dst = os.path.join(keep_dir, os.path.basename(f["path"]))
+            try:
+                import shutil
+                shutil.move(f["path"], dst)
+                run.log("info", f"shot {angle} ({meta}): kept local for shot detection -> {dst}")
+            except OSError as e:
+                run.log("error", f"shot {angle}: keep-local failed: {str(e)[:200]}")
 
 
 def _rm(path: str) -> None:
