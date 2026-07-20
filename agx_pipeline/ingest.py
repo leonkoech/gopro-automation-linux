@@ -292,13 +292,17 @@ def _ingest_shot(run, cfg, shot_files, date: str, folder: str) -> None:
     out of the session dir so the caller's cleanup rmtree can't delete it)."""
     for f in shot_files:
         angle = f["angle"]
-        meta = f"{f.get('width')}x{f.get('height')}@{f.get('fps')}fps"
+        res = f"{f['width']}x{f['height']}" if f.get("width") and f.get("height") else None
+        fps, side = f.get("fps"), f.get("basket_side")
+        meta = f"{res}@{fps}fps"
         if SHOTDET_UPLOAD_S3:
             key, _fn = _s3_key(date, folder, angle)
             try:
                 _upload(f["path"], key)
+                run.set_shot(angle, "uploaded", fps=fps, resolution=res, basket_side=side, s3_key=key)
                 run.log("info", f"shot {angle} ({meta}): uploaded as-is -> s3://{BUCKET}/{key}")
             except Exception as e:  # noqa: BLE001
+                run.set_shot(angle, "failed", fps=fps, resolution=res, basket_side=side, error=str(e)[:200])
                 run.log("error", f"shot {angle}: upload failed: {str(e)[:200]}")
         else:
             keep_dir = os.path.join(cfg.output_dir, "shotdet_local", folder)
@@ -307,8 +311,10 @@ def _ingest_shot(run, cfg, shot_files, date: str, folder: str) -> None:
             try:
                 import shutil
                 shutil.move(f["path"], dst)
+                run.set_shot(angle, "kept_local", fps=fps, resolution=res, basket_side=side, path=dst)
                 run.log("info", f"shot {angle} ({meta}): kept local for shot detection -> {dst}")
             except OSError as e:
+                run.set_shot(angle, "failed", fps=fps, resolution=res, basket_side=side, error=str(e)[:200])
                 run.log("error", f"shot {angle}: keep-local failed: {str(e)[:200]}")
 
 
