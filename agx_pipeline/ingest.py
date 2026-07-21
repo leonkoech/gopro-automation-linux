@@ -255,12 +255,22 @@ def run_ingestion(fb, cfg, pipeline_id: str, state: Dict, stopped: Dict, tracker
         if shot_files:
             _ingest_shot(run, cfg, shot_files, date, folder)
 
-        # cleanup: 1080p is in S3; drop it + the 4K master (env-controlled) to keep the AGX free
+        # cleanup: 1080p is in S3; drop it + the 4K master (env-controlled) to keep the
+        # AGX free. CRITICAL: only delete the raw master once its S3 upload is CONFIRMED
+        # (r["uploaded"]) — NOT merely once the transcode succeeded (r["ok"]). A good
+        # transcode whose upload failed must never lose the only copy. For the same
+        # reason, only rmtree the session dir when every angle uploaded; otherwise an
+        # un-uploaded raw would be destroyed along with it.
+        all_uploaded = all(r.get("uploaded") for r in tr.values())
         for r in tr.values():
-            _rm(r["dst"])
-            if DELETE_RAW and r["ok"]:
-                _rm(r["src"])
-        if DELETE_RAW:
+            if r.get("uploaded"):
+                _rm(r["dst"])
+                if DELETE_RAW:
+                    _rm(r["src"])
+            else:
+                run.log("error", f"{r['filename']}: S3 upload not confirmed — keeping raw "
+                                 f"master on disk for retry ({r['src']})")
+        if DELETE_RAW and all_uploaded:
             import shutil
             shutil.rmtree(os.path.join(cfg.output_dir, label), ignore_errors=True)
 
