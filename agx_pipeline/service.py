@@ -25,6 +25,7 @@ import subprocess
 import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from typing import Dict, Optional
 
@@ -225,27 +226,42 @@ def _do_start(game_id=None, label=None, force=False):
         down = [c.angle for c in CFG.cameras if c.id not in cam_ids]
         if down:
             logger.warning("recording without offline cameras: %s", down)
-        try:
-            started = CONTROLLER.start(label, camera_ids=cam_ids)
-        except Exception as e:  # noqa: BLE001
-            logger.error("start failed: %s", e)
-            return {"success": False, "error": str(e)}, 500
-        outputs = [{**o, "role": "tracking"} for o in started["outputs"]]
-        # Shot-detection cameras (FLIR/GigE): best-effort, never blocks the game
-        # recording. Not ping-gated — a missing/busy GigE camera's gst-launch
-        # dies within the settle window and is dropped; ALL configured shot cams
-        # are attempted (the override/force decision applies only to tracking).
-        if SHOT and CFG.shot_cameras:
+        # Start the tracking + shot recorders CONCURRENTLY so the two camera
+        # families begin capturing within ~1s of each other, not the variable
+        # 3-15s skew a sequential start produced (tracking's launch+verify used
+        # to delay the shot start, and its duration varied per game). Residual
+        # latency (RTSP jitter-buffer vs Aravis) is small and correctable
+        # downstream. The matching concurrent stop is in _do_stop.
+        started_at = _utcnow()
+        with ThreadPoolExecutor(max_workers=2) as ex:
+            f_track = ex.submit(CONTROLLER.start, label, cam_ids)
+            # Shot cams (FLIR/GigE): best-effort, never blocks the game. Not
+            # ping-gated — a busy/missing GigE cam's gst-launch dies in the
+            # settle window and is dropped; all configured shot cams are tried.
+            f_shot = (ex.submit(SHOT.start, label, [c.id for c in CFG.shot_cameras])
+                      if SHOT and CFG.shot_cameras else None)
             try:
-                s = SHOT.start(label, camera_ids=[c.id for c in CFG.shot_cameras])
-                outputs += s["outputs"]
+                started = f_track.result()
             except Exception as e:  # noqa: BLE001
-                logger.error("shot cameras did not start (recording tracking only): %s", e)
+                logger.error("start failed: %s", e)
+                if f_shot:
+                    try:
+                        f_shot.result()   # let it finish launching, then
+                        SHOT.stop(label)  # don't leave shot cams recording
+                    except Exception:  # noqa: BLE001
+                        pass
+                return {"success": False, "error": str(e)}, 500
+            outputs = [{**o, "role": "tracking"} for o in started["outputs"]]
+            if f_shot:
+                try:
+                    outputs += f_shot.result()["outputs"]
+                except Exception as e:  # noqa: BLE001
+                    logger.error("shot cameras did not start (recording tracking only): %s", e)
         session_ids = TRACKER.open(label, outputs, game_id) if TRACKER else {}
         _current.update({
             "label": label, "firebase_game_id": game_id,
             "container": started["container"], "outputs": outputs,
-            "session_ids": session_ids, "started_at": started["started_at"],
+            "session_ids": session_ids, "started_at": started_at,
             "forced": bool(force),
         })
     logger.info("recording started label=%s game=%s force=%s angles=%s",
@@ -272,17 +288,23 @@ def _do_stop():
         shot_outs = [o for o in outs if o.get("role") == "shot_detection"]
         stopped = {"label": state["label"], "files": []}
         track_err = None
-        try:
-            stopped = CONTROLLER.stop(state["label"], outputs=track_outs)
-        except Exception as e:  # noqa: BLE001
-            track_err = str(e)
-            logger.error("tracking stop failed: %s", e)
-        if SHOT and shot_outs:
+        # Stop both recorders CONCURRENTLY so the SIGINT (which ends capture)
+        # lands at ~the same instant for both families — matching the concurrent
+        # start above, so both start- and end-skew stay small.
+        with ThreadPoolExecutor(max_workers=2) as ex:
+            f_track = ex.submit(CONTROLLER.stop, state["label"], track_outs)
+            f_shot = (ex.submit(SHOT.stop, state["label"], shot_outs)
+                      if SHOT and shot_outs else None)
             try:
-                stopped.setdefault("files", []).extend(
-                    SHOT.stop(state["label"], outputs=shot_outs)["files"])
+                stopped = f_track.result()
             except Exception as e:  # noqa: BLE001
-                logger.error("shot stop failed: %s", e)
+                track_err = str(e)
+                logger.error("tracking stop failed: %s", e)
+            if f_shot:
+                try:
+                    stopped.setdefault("files", []).extend(f_shot.result()["files"])
+                except Exception as e:  # noqa: BLE001
+                    logger.error("shot stop failed: %s", e)
     if track_err is not None:
         return {"success": False, "error": track_err}, 500
     if TRACKER:
