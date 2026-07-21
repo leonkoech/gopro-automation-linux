@@ -61,6 +61,8 @@ class IngestionRun:
             # shot-detection (FLIR) footage — outcome per SL/SR angle. Separate
             # from the transcode/upload/register stages, which shot footage skips.
             "shots": {},
+            # FL<->FR audio cross-correlation sync (offset_frames/offset_sec) or None
+            "audio_sync": None,
             "logs": [],
             "error": None,
             "started_at": _now(),
@@ -104,6 +106,11 @@ class IngestionRun:
         resolution, basket_side, and s3_key/path/error as available."""
         self.doc["shots"][angle] = {"status": status,
                                     **{k: v for k, v in meta.items() if v is not None}}
+        self._write()
+
+    def set_audio_sync(self, data: Dict) -> None:
+        """Record the FL<->FR audio cross-correlation result (per-game frame offset)."""
+        self.doc["audio_sync"] = data
         self._write()
 
     def start_stage(self, stage: str) -> None:

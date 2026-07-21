@@ -25,8 +25,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import shlex
+import signal
 import subprocess
 import sys
 import time
@@ -41,6 +43,15 @@ CONTAINER_PREFIX = "agxrec_"
 TRACKING_ANGLES = ("FL", "FR", "NL", "NR")
 SHOT_ANGLES = ("SL", "SR")
 VALID_ANGLES = TRACKING_ANGLES + SHOT_ANGLES
+
+logger = logging.getLogger("agx.recording")
+
+# Court audio for cross-correlation sync. The stripped record container can't
+# mux AAC, so audio is captured host-side (one audio-only ffmpeg per camera),
+# journaled to the session dir, and finalized on stop. Kill-switch:
+# RECORD_AUDIO=false skips it entirely. Never affects the video recording.
+RECORD_AUDIO = os.getenv("RECORD_AUDIO", "true").lower() in ("1", "true", "yes")
+AUDIO_JOURNAL = "audio_capture.json"
 
 
 @dataclass(frozen=True)
@@ -148,6 +159,23 @@ def _to_container_path(host_path: str, cfg: Config) -> str:
     return os.path.join("/app/data", rel)
 
 
+def _audio_cmd(cam: Camera, cfg: Config, out_path: str) -> List[str]:
+    """Host ffmpeg pulling ONLY the RTSP AAC audio (no decode/re-encode) to m4a.
+    -allowed_media_types audio means the video RTP is never even set up."""
+    url = f"rtsp://{cam.ip}:{cfg.rtsp_port}{cfg.rtsp_path}"
+    return ["ffmpeg", "-nostdin", "-loglevel", "error",
+            "-allowed_media_types", "audio", "-rtsp_transport", "tcp",
+            "-i", url, "-vn", "-c:a", "copy", out_path]
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
 # --------------------------------------------------------------------------- #
 # Controller
 # --------------------------------------------------------------------------- #
@@ -196,8 +224,9 @@ class RecordingController:
         if not self.is_recording(label):
             logs = self._docker("logs", self.container_name(label)).stdout[-400:]
             raise RuntimeError(f"container did not stay up. logs: {logs}")
+        audio = self._start_audio(label, camera_ids, p["session_dir"])
         return {"label": label, "container": self.container_name(label),
-                "outputs": p["outputs"], "started_at": _utcnow()}
+                "outputs": p["outputs"], "audio": audio, "started_at": _utcnow()}
 
     def stop(self, label: str, outputs: Optional[List[Dict]] = None,
              finalize_timeout: int = 30) -> Dict[str, object]:
@@ -215,7 +244,9 @@ class RecordingController:
         if outputs is None:
             outputs = self._scan_outputs(label)
         results = [{**o, **_probe(o["path"])} for o in outputs]
-        return {"label": label, "stopped_at": _utcnow(), "files": results}
+        audio = self._stop_audio(os.path.join(self.cfg.output_dir, label))
+        return {"label": label, "stopped_at": _utcnow(), "files": results,
+                "audio": audio}
 
     def _scan_outputs(self, label: str) -> List[Dict]:
         """Discover recorded files in the session dir as [{angle, id, path}]."""
@@ -229,6 +260,59 @@ class RecordingController:
                     found.append({"angle": angle, "id": cam.id if cam else "",
                                   "path": os.path.join(session_dir, fn)})
         return found
+
+    # ---- host-side audio capture (court audio for cross-correlation sync) ----
+    def _start_audio(self, label: str, camera_ids: Optional[List[str]],
+                     session_dir: str) -> List[Dict]:
+        """Best-effort: one host ffmpeg per camera capturing audio-only. PIDs are
+        journaled to <session>/audio_capture.json so stop() can finalize them even
+        across a service restart. Never raises — audio must not break video."""
+        if not RECORD_AUDIO:
+            return []
+        cams = self.cfg.cameras if not camera_ids else \
+            [c for cid in camera_ids for c in [self.cfg.camera_by_id(cid)] if c]
+        procs: List[Dict] = []
+        for cam in cams:
+            out = os.path.join(session_dir, f"{label}_{cam.angle}.m4a")
+            try:
+                p = subprocess.Popen(_audio_cmd(cam, self.cfg, out),
+                                     stdin=subprocess.DEVNULL,
+                                     stdout=subprocess.DEVNULL,
+                                     stderr=subprocess.DEVNULL)
+                procs.append({"angle": cam.angle, "pid": p.pid, "path": out})
+            except OSError as e:  # noqa: BLE001
+                logger.warning("audio capture failed to start (%s): %s", cam.angle, e)
+        try:
+            with open(os.path.join(session_dir, AUDIO_JOURNAL), "w") as f:
+                json.dump(procs, f)
+        except OSError:
+            pass
+        return procs
+
+    def _stop_audio(self, session_dir: str) -> List[Dict]:
+        """SIGINT each audio ffmpeg (clean finalize), reap, and return the files
+        that actually captured data. Best-effort; never raises."""
+        try:
+            with open(os.path.join(session_dir, AUDIO_JOURNAL)) as f:
+                procs = json.load(f)
+        except (OSError, ValueError):
+            return []
+        for pr in procs:
+            try:
+                os.kill(pr["pid"], signal.SIGINT)
+            except OSError:
+                pass
+        deadline = time.time() + 15
+        while time.time() < deadline and any(_pid_alive(pr["pid"]) for pr in procs):
+            time.sleep(0.5)
+        for pr in procs:
+            if _pid_alive(pr["pid"]):
+                try:
+                    os.kill(pr["pid"], signal.SIGKILL)
+                except OSError:
+                    pass
+        return [{"angle": pr["angle"], "path": pr["path"]} for pr in procs
+                if os.path.isfile(pr["path"]) and os.path.getsize(pr["path"]) > 1024]
 
 
 def _probe(path: str) -> Dict[str, object]:

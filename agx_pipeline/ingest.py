@@ -127,13 +127,45 @@ def _probe_dur(path: str) -> Optional[float]:
         return None
 
 
-def _upload(local: str, key: str) -> None:
+def _upload(local: str, key: str, content_type: str = "video/mp4") -> None:
     import boto3
     from boto3.s3.transfer import TransferConfig
     s3 = boto3.client("s3", region_name=REGION)
-    s3.upload_file(local, BUCKET, key, ExtraArgs={"ContentType": "video/mp4"},
+    s3.upload_file(local, BUCKET, key, ExtraArgs={"ContentType": content_type},
                    Config=TransferConfig(multipart_threshold=64 * 1024 * 1024,
                                          multipart_chunksize=64 * 1024 * 1024, max_concurrency=4))
+
+
+def _ingest_audio_sync(run, date: str, folder: str, audio_list) -> None:
+    """Cross-correlate FL & FR court audio into a per-game frame offset, archive
+    the small audio side-files next to the game's videos in S3, and record the
+    result on the ingestion-runs doc. Best-effort: any failure only logs."""
+    paths = {a["angle"]: a["path"] for a in (audio_list or [])
+             if a.get("path") and os.path.isfile(a["path"])}
+    if not paths:
+        return
+    for ang, path in paths.items():  # archive the (small) audio alongside the game
+        try:
+            key = _s3_key(date, folder, ang)[0][:-4] + ".m4a"
+            _upload(path, key, content_type="audio/mp4")
+        except Exception as e:  # noqa: BLE001
+            run.log("warn", f"audio {ang}: upload failed ({str(e)[:120]})")
+    if not ({"FL", "FR"} <= paths.keys()):
+        run.log("info", f"audio sync skipped: need FL+FR, have {sorted(paths)}")
+        return
+    try:
+        from agx_pipeline import audio_sync  # lazy: keep numpy/scipy off the hot path
+        res = audio_sync.measure_offset(paths["FL"], paths["FR"], fps=30.0)
+        run.set_audio_sync(res)
+        if res.get("ok"):
+            run.log("info",
+                    f"audio sync FL<->FR: {res['offset_frames']:+.2f} frames "
+                    f"({res['offset_sec']:+.3f}s), drift {res.get('drift_frames')}f, "
+                    f"{res['n_confident']} confident windows")
+        else:
+            run.log("warn", f"audio sync inconclusive: {res.get('reason')}")
+    except Exception as e:  # noqa: BLE001
+        run.log("warn", f"audio sync error: {str(e)[:150]}")
 
 
 def _create_or_get_game(client, game: Dict, firebase_game_id: str, date: str) -> Optional[Dict]:
@@ -254,6 +286,10 @@ def run_ingestion(fb, cfg, pipeline_id: str, state: Dict, stopped: Dict, tracker
         # are moved out of the session dir first (survive the rmtree below).
         if shot_files:
             _ingest_shot(run, cfg, shot_files, date, folder)
+
+        # audio cross-correlation sync (FL<->FR) from the host-captured side-files;
+        # runs before cleanup so the session-dir .m4a files still exist.
+        _ingest_audio_sync(run, date, folder, stopped.get("audio"))
 
         # cleanup: 1080p is in S3; drop it + the 4K master (env-controlled) to keep the AGX free
         for r in tr.values():
