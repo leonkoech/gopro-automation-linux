@@ -300,6 +300,25 @@ def _do_stop():
                        "duration": f.get("duration")} for f in stopped["files"]]}, 200
 
 
+def _do_preview():
+    """Snapshot every camera -> S3 -> presigned URLs for the dashboard preview
+    grid. Shared by the HTTP route and the relay. Best-effort per camera."""
+    from agx_pipeline.preview import capture_all
+    try:
+        previews = capture_all(CFG)
+        return {"success": True, "previews": previews,
+                "up_count": sum(1 for p in previews if p["up"]), "total": len(previews)}, 200
+    except Exception as e:  # noqa: BLE001
+        logger.error("preview failed: %s", e)
+        return {"success": False, "error": str(e)[:300]}, 500
+
+
+@app.route("/api/preview", methods=["POST", "GET"])
+def preview_cameras():
+    payload, status = _do_preview()
+    return jsonify(payload), status
+
+
 @app.route("/api/recording/start", methods=["POST"])
 def start_recording():
     body = request.get_json(silent=True) or {}
@@ -366,7 +385,8 @@ if __name__ == "__main__":
     port = int(os.getenv("AGX_SERVICE_PORT", "5000"))
     if FB:
         from agx_pipeline.relay import Relay
-        _RELAY = Relay(FB, CFG.jetson_id, _device_state, _do_start, _do_stop, auto_fn=_auto_follow)
+        _RELAY = Relay(FB, CFG.jetson_id, _device_state, _do_start, _do_stop,
+                       auto_fn=_auto_follow, on_preview=_do_preview)
         _RELAY.start()
         # Publish the Courtside schedule + roster to Firestore. The frontend's
         # cloud IP is WAF/geo-blocked by the league site; the AGX (at the venue,

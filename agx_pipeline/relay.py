@@ -30,12 +30,14 @@ def _now() -> str:
 class Relay:
     def __init__(self, fb, jetson_id: str, state_fn: Callable[[], Dict],
                  on_start: Callable, on_stop: Callable,
-                 auto_fn: Optional[Callable] = None, interval: float = 3.0):
+                 auto_fn: Optional[Callable] = None, interval: float = 3.0,
+                 on_preview: Optional[Callable] = None):
         self.fb = fb
         self.jetson_id = jetson_id
         self.state_fn = state_fn      # () -> device status dict
-        self.on_start = on_start      # (game_id, label) -> (payload, status)
+        self.on_start = on_start      # (game_id, label, force) -> (payload, status)
         self.on_stop = on_stop        # () -> (payload, status)
+        self.on_preview = on_preview  # () -> (payload, status); camera snapshots
         self.auto_fn = auto_fn        # () -> None; auto start/stop from game lifecycle
         self.interval = interval
         self._stop = threading.Event()
@@ -68,6 +70,9 @@ class Relay:
                                                    bool(cmd.get("force")))
                     elif action == "stop":
                         payload, _ = self.on_stop()
+                    elif action == "preview":
+                        payload, _ = (self.on_preview() if self.on_preview
+                                      else ({"success": False, "error": "preview not supported"}, 501))
                     else:
                         payload = {"success": False, "error": f"unknown action {action}"}
                     d.reference.update({
