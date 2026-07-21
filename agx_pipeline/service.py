@@ -65,6 +65,19 @@ _auto_recorded: set = set()        # firebase_game_ids already auto-handled (avo
 AUTO_RECORD = os.getenv("AUTO_RECORD_ON_GAME", "true").lower() in ("1", "true", "yes")
 AUTO_MAX_AGE_MIN = int(os.getenv("AUTO_RECORD_MAX_AGE_MIN", "45"))       # ignore games older than this
 AUTO_MAX_DURATION_MIN = int(os.getenv("AUTO_RECORD_MAX_DURATION_MIN", "180"))  # safety auto-stop
+# Disk guard: refuse to START a normal recording below DISK_MIN_FREE_GB (4K
+# masters accumulate ~65 GB/hr and are only freed at game-end), and EMERGENCY
+# auto-stop a recording that drives free space below DISK_CRITICAL_GB mid-game
+# (before the disk fully fills and corrupts the still-open MP4). "Start anyway"
+# (force) bypasses the pre-start check; the mid-game emergency stop still applies.
+DISK_MIN_FREE_GB = int(os.getenv("DISK_MIN_FREE_GB", "50"))
+DISK_CRITICAL_GB = int(os.getenv("DISK_CRITICAL_GB", "15"))
+
+
+def _free_gb() -> float:
+    """Free space (GB) on the recording filesystem."""
+    path = CFG.output_dir if os.path.isdir(CFG.output_dir) else "/"
+    return shutil.disk_usage(path).free / (1024 ** 3)
 
 
 def _age_seconds(iso: Optional[str]) -> float:
@@ -80,31 +93,39 @@ def _age_seconds(iso: Optional[str]) -> float:
 def _auto_follow() -> None:
     """Auto start/stop recording from the check-in game lifecycle (runs every ~3s).
 
-    Start when a game freshly goes 'active' in check-in; stop when that game ends
-    (or a max-duration safety net trips). Freshness guard avoids recording a
-    stale left-active game forever on service restart.
+    Start when a game freshly goes 'active' in check-in; stop when that game ends,
+    a max-duration safety net trips (now applies to unattached/force recordings
+    too, so a forgotten "Start anyway" can't run forever), or free disk falls
+    below the critical floor (emergency stop before the disk fills and corrupts
+    the open recording). Freshness guard avoids recording a stale left-active
+    game forever on service restart.
     """
     if not AUTO_RECORD or not FB:
         return
-    cur_id = _current.get("firebase_game_id") if _current else None
-    if cur_id:
-        g = FB.get_game(cur_id)
-        ended = (not g) or g.get("status") != "active" or g.get("endedAt")
+    if _current:
+        cur_id = _current.get("firebase_game_id")
+        ended = False
+        if cur_id:
+            g = FB.get_game(cur_id)
+            ended = (not g) or g.get("status") != "active" or g.get("endedAt")
         too_long = _age_seconds(_current.get("started_at")) > AUTO_MAX_DURATION_MIN * 60
-        if ended or too_long:
-            logger.info("auto-stop: game %s (%s)", cur_id, "ended" if ended else "max-duration")
-            _auto_recorded.add(cur_id)
+        low_disk = _free_gb() < DISK_CRITICAL_GB
+        if ended or too_long or low_disk:
+            reason = "ended" if ended else "low-disk" if low_disk else "max-duration"
+            logger.warning("auto-stop: %s (%s)", cur_id or "unattached recording", reason)
+            if cur_id:
+                _auto_recorded.add(cur_id)
             _do_stop()
-    else:
-        active = get_active_game(FB)
-        aid = active["id"] if active else None
-        if aid and aid not in _auto_recorded:
-            if _age_seconds(active.get("createdAt")) <= AUTO_MAX_AGE_MIN * 60:
-                logger.info("auto-start: check-in game %s went active", aid)
-                _auto_recorded.add(aid)
-                _do_start(aid, None)
-            else:
-                _auto_recorded.add(aid)  # stale left-active game — ignore, never auto-record
+        return
+    active = get_active_game(FB)
+    aid = active["id"] if active else None
+    if aid and aid not in _auto_recorded:
+        if _age_seconds(active.get("createdAt")) <= AUTO_MAX_AGE_MIN * 60:
+            logger.info("auto-start: check-in game %s went active", aid)
+            _auto_recorded.add(aid)
+            _do_start(aid, None)
+        else:
+            _auto_recorded.add(aid)  # stale left-active game — ignore, never auto-record
 
 
 _conn_cache: Dict[str, tuple] = {}   # ip -> (up: bool, monotonic_ts)
@@ -145,6 +166,7 @@ def _device_state() -> Dict:
         },
         "current_ingestion": (_last_pipeline or {}).get("pipeline_id"),
         "location": CFG.location,
+        "disk_free_gb": round(_free_gb(), 1),
     }
 
 
@@ -210,6 +232,14 @@ def _do_start(game_id=None, label=None, force=False):
         if not game_id and not force:
             return {"success": False,
                     "error": "no firebase_game_id and no active check-in game"}, 400
+        free_gb = _free_gb()
+        if free_gb < DISK_MIN_FREE_GB and not force:
+            return {"success": False,
+                    "error": f"low disk: only {free_gb:.0f} GB free (need {DISK_MIN_FREE_GB} GB). "
+                             f"Free space first, or use Start anyway to override."}, 507
+        if free_gb < DISK_MIN_FREE_GB:
+            logger.warning("recording forced with LOW DISK: %.0f GB free (< %d GB)",
+                           free_gb, DISK_MIN_FREE_GB)
         label = label or _label()
         # Record only cameras that are reachable, so one down camera doesn't
         # break the whole recording (single gst-launch fails if any rtspsrc dies).
