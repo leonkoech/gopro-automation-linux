@@ -758,6 +758,9 @@ class VideoProcessor:
                 '-c:v', 'libx264',
                 '-preset', 'ultrafast',
                 '-crf', '23',
+                # Keyframe every second (default keyint 250 ≈ 8.3s makes the
+                # annotation editor stall for seconds on every seek).
+                '-g', '30', '-sc_threshold', '0',
                 '-c:a', 'aac', '-b:a', '128k',
             ])
 
@@ -843,6 +846,9 @@ class VideoProcessor:
                     '-c:v', 'libx264',
                     '-preset', 'ultrafast',
                     '-crf', '23',
+                    # Keyframe every second (default keyint 250 ≈ 8.3s makes
+                    # the annotation editor stall for seconds on every seek).
+                    '-g', '30', '-sc_threshold', '0',
                     '-c:a', 'aac', '-b:a', '128k',
                 ])
 

@@ -82,7 +82,11 @@ def _transcode_hw(src: str, dst: str, cfg) -> bool:
         "filesrc", f"location={cin}", "!", "qtdemux", "!", "h265parse", "!",
         "nvv4l2decoder", "!", "nvvideoconvert", "!",
         "video/x-raw(memory:NVMM),width=1920,height=1080", "!",
-        "nvv4l2h264enc", f"bitrate={HW_BITRATE}", "iframeinterval=30", "!",
+        # idrinterval matters, not just iframeinterval: browsers/ffmpeg can only
+        # seek to IDR frames, and nvv4l2h264enc defaults idrinterval to 256
+        # (~8.5s at 30fps) — the cause of multi-second seek stalls in the
+        # annotation editor. IDR every 30 frames = seekable every second.
+        "nvv4l2h264enc", f"bitrate={HW_BITRATE}", "iframeinterval=30", "idrinterval=30", "!",
         "h264parse", "!", "mp4mux", "!", "filesink", f"location={cout}",
     ]
     cp = subprocess.run(cmd, capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=10800)
@@ -95,8 +99,12 @@ def _transcode_hw(src: str, dst: str, cfg) -> bool:
 def _transcode_sw(src: str, dst: str) -> bool:
     """Software libx264 fallback (CPU-heavy; correct but saturates the box)."""
     os.makedirs(os.path.dirname(dst), exist_ok=True)
+    # -g 30 -sc_threshold 0: keyframe every second (libx264 defaults to 250,
+    # ~8.3s — unseekable in the annotation editor). Matches the HW path's
+    # iframeinterval/idrinterval=30.
     cmd = ["ffmpeg", "-nostdin", "-y", "-i", src, "-vf", "scale=-2:1080",
            "-c:v", "libx264", "-preset", PRESET, "-crf", CRF,
+           "-g", "30", "-sc_threshold", "0",
            "-movflags", "+faststart", "-an", dst]
     cp = subprocess.run(cmd, capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=10800)
     if cp.returncode != 0:
