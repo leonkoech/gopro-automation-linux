@@ -7,12 +7,12 @@
   "app_mount": "/home/dev/app",
   "output_dir": "/home/dev/app/recordings",
   "docker_cmd": "docker",
-  "_note": "NL/NR angle assignment is PROVISIONAL (35349->NL, 42331->NR); confirm physical placement. NR (42331) currently offline (lens issue) — excluded automatically while unreachable.",
+  "_note": "Angle mapping CONFIRMED from game footage 2026-07-21 after Tim physically swapped the cameras ending 47/49: 35353=FL, 35347(.52)=NL, 35349(.92)=FR. Do NOT 'correct' 35347/35349 back to the old FR/NL labels without re-checking footage — that mislabel registered the wrong angle to the annotation tool for the 2026-07-20 games and had to be repaired in S3 + video_metadata. Corroborating evidence: 35347/.52 is the flaky camera (drops early mid-game, delivers no RTSP audio); 35349/.92 records clean. NR (42331) currently offline (lens issue) — excluded automatically while unreachable.",
   "_shot_note": "shot_cameras = FLIR Blackfly S GigE Vision (Aravis), high-fps near-rim, SHOT DETECTION only. SL/SR basket_side is a PLACEHOLDER — confirm which serial faces which rim and swap if needed.",
   "cameras": [
     { "id": "35353", "ip": "10.1.10.142", "angle": "FL", "cv_role": "tracking" },
-    { "id": "35347", "ip": "10.1.10.52",  "angle": "FR", "cv_role": "tracking" },
-    { "id": "35349", "ip": "10.1.10.92",  "angle": "NL", "cv_role": "tracking" },
+    { "id": "35347", "ip": "10.1.10.52",  "angle": "NL", "cv_role": "tracking" },
+    { "id": "35349", "ip": "10.1.10.92",  "angle": "FR", "cv_role": "tracking" },
     { "id": "42331", "ip": "10.1.10.76",  "angle": "NR", "cv_role": "tracking" }
   ],
   "shot_cameras": [
