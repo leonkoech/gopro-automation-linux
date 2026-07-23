@@ -192,6 +192,14 @@ def _create_or_get_game(client, game: Dict, firebase_game_id: str, date: str) ->
         "video_name": f"{left.get('name', 'Team 1')} vs {right.get('name', 'Team 2')}",
         "firebase_game_id": firebase_game_id,
         "source": "agx",
+        # AGX games are annotated on the synced two-angle editor: plays are marked
+        # in base/master-angle time, and each angle carries a manual sync offset to
+        # align it. The clip pipeline (Sync-to-UBall) only ADDS those per-angle
+        # offsets when this flag is true — otherwise it cuts at raw timestamps and
+        # the annotator's manual sync is silently ignored. AGX games therefore MUST
+        # be born with the new convention; the annotation tool only sets it for
+        # games created through its own UI, not for ones we create here.
+        "timestamps_in_base_coords": True,
         "team1_score": left.get("finalScore"),
         "team2_score": right.get("finalScore"),
     })
