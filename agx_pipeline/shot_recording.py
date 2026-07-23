@@ -21,19 +21,37 @@ so ingestion routes shot footage to shot detection (never through the
 tracking transcode/register path).
 
 Pipeline (proven on-box, ~1080-equivalent load at 720x540):
-    gst-launch-1.0 -e aravissrc camera-name=<ip|serial>
+    gst-launch-1.0 -e aravissrc camera-name=<ip|serial> do-timestamp=true
+        exposure-auto=off exposure=<us> gain-auto=continuous
+      ! video/x-raw,framerate=<fps>/1
       ! videoconvert ! nvvidconv
-      ! nvv4l2h264enc bitrate=<bits> insert-sps-pps=1 iframeinterval=<n> maxperf-enable=1
+      ! nvv4l2h264enc bitrate=<bits> insert-sps-pps=1 iframeinterval=<n>
+        idrinterval=<n> maxperf-enable=1
       ! h264parse ! mp4mux ! filesink location=<out>
 
-NOTE: effective fps is exposure-limited on the camera (ExposureAuto=Continuous
-in a dim gym caps ~66fps). That's a camera-config/lighting matter, not a
-pipeline one — this recorder captures whatever the sensor delivers; ingestion
-probes and records the ACTUAL fps.
+Timing/rate design (CV-team findings, 2026-07-23 — measured on 2026-07-20 games):
+- The caps filter locks a CONSTANT frame rate (aravissrc programs the camera's
+  AcquisitionFrameRate from downstream caps). Free-running cameras drifted apart
+  (SR ~161fps vs SL ~171fps on the same rig), which broke cross-camera sync.
+  120fps is an integer multiple of the 30fps court video and leaves large
+  bandwidth/exposure headroom, so the sensor can actually HOLD it.
+- Auto-exposure silently caps the frame rate in a dim gym (the SR deficit, and
+  the historical ~66fps night measurement). Exposure is therefore FIXED and
+  short (default 3ms — also kills motion blur); brightness adapts via auto-GAIN,
+  which never limits fps.
+- `do-timestamp=true` stamps buffers with real capture time so dropped frames
+  leave honest PTS gaps in the container instead of a uniformly re-stamped
+  track that lies about recording time.
+- Each start() writes a `<label>_shot_timing.json` sidecar with the wall-clock
+  spawn time per camera, so cross-camera offset becomes a lookup, not an
+  estimation. (A shared hardware trigger / per-frame FLIR hardware timestamps
+  would be better still, but that is rig wiring, not software config.)
+Ingestion still probes and records the ACTUAL delivered fps.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import signal
@@ -48,6 +66,12 @@ logger = logging.getLogger("agx.shot")
 DEFAULT_BITRATE = os.getenv("SHOT_BITRATE", "8000000")            # NVENC bits/sec
 DEFAULT_IFRAME = os.getenv("SHOT_IFRAME_INTERVAL", "30")
 START_SETTLE_SEC = float(os.getenv("SHOT_START_SETTLE_SEC", "2.5"))
+# Constant frame rate locked on the camera via caps (0 disables the lock and
+# reverts to free-running — see module docstring for why locked 120 is the default).
+SHOT_FPS = int(os.getenv("SHOT_FPS", "120"))
+# Fixed exposure in µs, auto-exposure OFF (0 leaves the camera's own auto
+# exposure untouched). Must stay well under the frame period (8333µs at 120fps).
+SHOT_EXPOSURE_US = int(os.getenv("SHOT_EXPOSURE_US", "3000"))
 
 
 class AravisRecorder:
@@ -66,16 +90,24 @@ class AravisRecorder:
                 for c in [self.cfg.shot_camera_by_id(cid)] if c]
 
     def _pipeline(self, cam: Camera, out_path: str) -> List[str]:
-        return [
-            "gst-launch-1.0", "-e",
-            "aravissrc", f"camera-name={cam.camera_name or cam.ip}",
+        src = ["aravissrc", f"camera-name={cam.camera_name or cam.ip}", "do-timestamp=true"]
+        if SHOT_EXPOSURE_US > 0:
+            src += ["exposure-auto=off", f"exposure={SHOT_EXPOSURE_US}", "gain-auto=continuous"]
+        cmd = ["gst-launch-1.0", "-e", *src]
+        if SHOT_FPS > 0:
+            cmd += ["!", f"video/x-raw,framerate={SHOT_FPS}/1"]
+        cmd += [
             "!", "videoconvert",
             "!", "nvvidconv",
             "!", "nvv4l2h264enc", f"bitrate={DEFAULT_BITRATE}",
-            "insert-sps-pps=1", f"iframeinterval={DEFAULT_IFRAME}", "maxperf-enable=1",
+            # idrinterval too: nvv4l2h264enc defaults idrinterval to 256, and only
+            # IDR frames are seekable (same defect fixed in ingest._transcode_hw)
+            "insert-sps-pps=1", f"iframeinterval={DEFAULT_IFRAME}",
+            f"idrinterval={DEFAULT_IFRAME}", "maxperf-enable=1",
             "!", "h264parse", "!", "mp4mux",
             "!", "filesink", f"location={out_path}",
         ]
+        return cmd
 
     def _outputs_for(self, procs: List[Dict], alive_only: bool) -> List[Dict]:
         out = []
@@ -103,6 +135,7 @@ class AravisRecorder:
         try:
             for cam in cams:
                 out_path = os.path.join(session_dir, f"{label}_{cam.angle}.mp4")
+                spawned_at = _utcnow()  # wall-clock anchor for cross-camera sync
                 proc = subprocess.Popen(
                     self._pipeline(cam, out_path),
                     stdin=subprocess.DEVNULL,
@@ -110,7 +143,8 @@ class AravisRecorder:
                     stderr=subprocess.DEVNULL,
                 )
                 procs.append({"angle": cam.angle, "id": cam.id, "path": out_path,
-                              "basket_side": cam.basket_side, "proc": proc})
+                              "basket_side": cam.basket_side, "proc": proc,
+                              "spawned_at": spawned_at})
         except OSError:
             self._reap(procs)  # a mid-loop Popen failure must not leak earlier procs
             raise
@@ -125,6 +159,7 @@ class AravisRecorder:
             self._reap(procs)  # nothing came up — clean up any half-started procs
             raise RuntimeError("no shot cameras started (present? held by another process?)")
         self._procs[label] = procs
+        self._write_timing_sidecar(session_dir, label, procs)
         outputs = self._outputs_for(procs, alive_only=True)
         logger.info("shot recording started label=%s angles=%s", label,
                     [o["angle"] for o in outputs])
@@ -154,6 +189,28 @@ class AravisRecorder:
         return {"label": label, "stopped_at": _utcnow(), "files": results}
 
     # -- internals --------------------------------------------------------- #
+    @staticmethod
+    def _write_timing_sidecar(session_dir: str, label: str, procs: List[Dict]) -> None:
+        """Persist per-camera wall-clock spawn times so downstream sync is a
+        lookup (frame N ≈ spawned_at + pipeline latency + N/fps) instead of an
+        estimation. Best-effort: a sidecar failure must never kill a recording."""
+        sidecar = {
+            "label": label,
+            "written_at": _utcnow(),
+            "fps_lock": SHOT_FPS or None,
+            "exposure_us": SHOT_EXPOSURE_US or None,
+            "cameras": [{"angle": pr["angle"], "id": pr["id"], "path": pr["path"],
+                         "spawned_at": pr["spawned_at"],
+                         "alive_after_settle": pr["proc"].poll() is None}
+                        for pr in procs],
+        }
+        path = os.path.join(session_dir, f"{label}_shot_timing.json")
+        try:
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump(sidecar, fh, indent=2)
+        except OSError as e:
+            logger.warning("could not write shot timing sidecar %s: %s", path, e)
+
     @staticmethod
     def _wait_or_kill(proc: subprocess.Popen, timeout: float) -> None:
         try:
