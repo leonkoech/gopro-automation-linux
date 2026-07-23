@@ -22,7 +22,7 @@ tracking transcode/register path).
 
 Pipeline (proven on-box, ~1080-equivalent load at 720x540):
     gst-launch-1.0 -e aravissrc camera-name=<ip|serial> do-timestamp=true
-        exposure-auto=off exposure=<us> gain-auto=continuous
+        exposure-auto=off exposure=<us> gain-auto=on   ("on" == Continuous)
       ! video/x-raw,framerate=<fps>/1
       ! videoconvert ! nvvidconv
       ! nvv4l2h264enc bitrate=<bits> insert-sps-pps=1 iframeinterval=<n>
@@ -92,7 +92,11 @@ class AravisRecorder:
     def _pipeline(self, cam: Camera, out_path: str) -> List[str]:
         src = ["aravissrc", f"camera-name={cam.camera_name or cam.ip}", "do-timestamp=true"]
         if SHOT_EXPOSURE_US > 0:
-            src += ["exposure-auto=off", f"exposure={SHOT_EXPOSURE_US}", "gain-auto=continuous"]
+            # NB: aravis' GstArvAuto enum nick for Continuous is "on", NOT
+            # "continuous" (gst-inspect: 0=off, 1=once, 2=on). Using
+            # "continuous" fails the property set, which kills the pipeline
+            # before it ever reaches caps negotiation — i.e. no recording at all.
+            src += ["exposure-auto=off", f"exposure={SHOT_EXPOSURE_US}", "gain-auto=on"]
         cmd = ["gst-launch-1.0", "-e", *src]
         if SHOT_FPS > 0:
             cmd += ["!", f"video/x-raw,framerate={SHOT_FPS}/1"]
