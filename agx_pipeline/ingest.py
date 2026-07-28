@@ -176,12 +176,51 @@ def _ingest_audio_sync(run, date: str, folder: str, audio_list) -> None:
         run.log("warn", f"audio sync error: {str(e)[:150]}")
 
 
-def _create_or_get_game(client, game: Dict, firebase_game_id: str, date: str) -> Optional[Dict]:
+def _resolve_checkin_roster(fb, game: Dict) -> "tuple[Optional[list], Optional[list]]":
+    """Pick the roster to register on the annotation game (team1, team2).
+
+    Prefer the LIVE check-in slot ``game_schedules/<scheduleSlotId>`` filtered to
+    checked-in players, so attendance/roster edits the operator makes on the
+    check-in page reach the annotation tool. The per-game ``basketball-games``
+    ``rosterTeamN`` is only a snapshot frozen at "Start Game" time, so edits made
+    after that never propagate through it. Fall back to that snapshot when the
+    slot is missing/unreadable or has no checked-in players.
+
+    Mirrors the proven logic in ``main.py`` ``/api/games/sync`` (:1953-1984) so
+    the AGX auto-ingestion no longer creates games with an empty roster. This is
+    best-effort: any failure reading the slot falls back to the snapshot and
+    never breaks ingestion.
+    """
+    roster1 = game.get("rosterTeam1")
+    roster2 = game.get("rosterTeam2")
+    slot_id = game.get("scheduleSlotId")
+    if not (fb and getattr(fb, "db", None) and slot_id):
+        return roster1, roster2
+    try:
+        slot_doc = fb.db.collection("game_schedules").document(slot_id).get()
+        if not slot_doc.exists:
+            logger.info("ingest roster: slot %s not found — using snapshot", slot_id)
+            return roster1, roster2
+        slot = slot_doc.to_dict() or {}
+        live1 = [p for p in (slot.get("rosterTeam1") or []) if p.get("checked_in")]
+        live2 = [p for p in (slot.get("rosterTeam2") or []) if p.get("checked_in")]
+        if live1 or live2:
+            logger.info("ingest roster: using checked-in slot roster %s (%d/%d players)",
+                        slot_id, len(live1), len(live2))
+            return (live1 or roster1), (live2 or roster2)
+        logger.info("ingest roster: slot %s has no checked-in players — using snapshot", slot_id)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("ingest roster: slot %s fetch failed (%s) — using snapshot", slot_id, e)
+    return roster1, roster2
+
+
+def _create_or_get_game(client, fb, game: Dict, firebase_game_id: str, date: str) -> Optional[Dict]:
     existing = client.get_game_by_firebase_id(firebase_game_id)
     if existing:
         return existing
     left, right = game.get("leftTeam", {}) or {}, game.get("rightTeam", {}) or {}
-    return client.create_game({
+    roster1, roster2 = _resolve_checkin_roster(fb, game)
+    payload = {
         "date": date,
         "team1_id": game.get("leftTeamId"),   # reuse the check-in game's annotation team UUIDs
         "team2_id": game.get("rightTeamId"),
@@ -202,7 +241,14 @@ def _create_or_get_game(client, game: Dict, firebase_game_id: str, date: str) ->
         "timestamps_in_base_coords": True,
         "team1_score": left.get("finalScore"),
         "team2_score": right.get("finalScore"),
-    })
+    }
+    # Only send rosters when we actually have them, so an empty list never
+    # overwrites anything and matches the /api/games/sync payload shape.
+    if roster1:
+        payload["roster_team1"] = roster1
+    if roster2:
+        payload["roster_team2"] = roster2
+    return client.create_game(payload)
 
 
 def run_ingestion(fb, cfg, pipeline_id: str, state: Dict, stopped: Dict, tracker) -> None:
@@ -236,7 +282,7 @@ def run_ingestion(fb, cfg, pipeline_id: str, state: Dict, stopped: Dict, tracker
             run.log("warn", "UBALL creds not configured — will transcode+upload but not register")
         else:
             try:
-                uball_game = _create_or_get_game(client, game, firebase_game_id, date)
+                uball_game = _create_or_get_game(client, fb, game, firebase_game_id, date)
             except Exception as e:  # noqa: BLE001
                 run.log("error", f"create annotation game: {e}")
         game_uuid = (uball_game or {}).get("id")
