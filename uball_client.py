@@ -185,6 +185,12 @@ class UballClient:
                 payload["team1_display_name"] = game_data["team1_display_name"]
             if game_data.get("team2_display_name"):
                 payload["team2_display_name"] = game_data["team2_display_name"]
+            # Same allowlist trap as original_*_score before it: ingest.py has
+            # sent this since PR #72, but the field never reached the backend
+            # because it wasn't forwarded here — so AGX games were still born
+            # as "legacy" and the clip pipeline ignored manual sync offsets.
+            if game_data.get("timestamps_in_base_coords") is not None:
+                payload["timestamps_in_base_coords"] = game_data["timestamps_in_base_coords"]
 
             response = requests.post(
                 f"{self.backend_url}/api/games/",
