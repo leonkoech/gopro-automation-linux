@@ -15,6 +15,13 @@ handled separately: it is already H.264 at native (small) resolution, so it is
 uploaded AS-IS to the SAME game folder (no downscale/transcode, no annotation
 register), joining the game by uuid for the shot-detection CV. Set
 SHOTDET_UPLOAD_S3=false to keep it on the AGX for local processing instead.
+
+Transcode toggle (4K passthrough): the dashboard writes
+`agx-settings/{jetson_id}.transcode = false` and the next ingestion uploads the
+raw 4K masters as-is (`_4K` filename suffix) instead of 1080p proxies — for
+promo shoots where the footage must stay 4K. Passthrough skips the annotation
+game + register (the editor needs the 1080p H.264 proxy). Default is ON;
+TRANSCODE_ENABLED env is the no-Firebase fallback.
 """
 
 from __future__ import annotations
@@ -45,6 +52,28 @@ PRESET = os.getenv("TRANSCODE_PRESET", "veryfast")
 HW_BITRATE = os.getenv("TRANSCODE_HW_BITRATE", "8000000")  # NVENC bits/sec for 1080p
 MAX_PARALLEL = int(os.getenv("TRANSCODE_PARALLEL", "2"))
 UBALL_ANGLE = {"FL": "LEFT", "FR": "RIGHT"}  # registered angles (annotation is 2-angle today)
+SETTINGS_COLLECTION = "agx-settings"
+TRANSCODE_DEFAULT = os.getenv("TRANSCODE_ENABLED", "true").lower() in ("1", "true", "yes")
+
+
+def _transcode_enabled(fb, jetson_id: str) -> bool:
+    """Operator toggle: `agx-settings/{jetson_id}.transcode` (dashboard-writable).
+
+    True (default) = normal 4K→1080p ingest. False = 4K passthrough for shoots
+    that must stay 4K. Read fresh at each ingestion, so flipping the toggle
+    while a recording is still running applies at stop. Any read failure falls
+    back to TRANSCODE_ENABLED — a Firebase blip must never silently change what
+    gets uploaded.
+    """
+    if not fb:
+        return TRANSCODE_DEFAULT
+    try:
+        snap = fb.db.collection(SETTINGS_COLLECTION).document(jetson_id).get()
+        val = (snap.to_dict() or {}).get("transcode") if snap.exists else None
+        return TRANSCODE_DEFAULT if val is None else bool(val)
+    except Exception:  # noqa: BLE001
+        logger.warning("agx-settings read failed — using default transcode=%s", TRANSCODE_DEFAULT)
+        return TRANSCODE_DEFAULT
 
 
 def _now() -> str:
@@ -221,18 +250,26 @@ def run_ingestion(fb, cfg, pipeline_id: str, state: Dict, stopped: Dict, tracker
     left, right = game.get("leftTeam", {}) or {}, game.get("rightTeam", {}) or {}
     video_name = f"{left.get('name', 'Team 1')} vs {right.get('name', 'Team 2')}"
 
+    transcode = _transcode_enabled(fb, cfg.jetson_id)
+    reg_angles = [a for a in angles if a in UBALL_ANGLE] if transcode else []
     run = IngestionRun(fb, pipeline_id, {
         "jetson_id": cfg.jetson_id, "firebase_game_id": firebase_game_id,
         "video_name": video_name, "date": date}, angles,
-        register_angles=[a for a in angles if a in UBALL_ANGLE])
-    logger.info("ingest %s game=%s date=%s angles=%s delete_raw=%s",
-                pipeline_id, firebase_game_id, date, angles, DELETE_RAW)
+        register_angles=reg_angles)
+    logger.info("ingest %s game=%s date=%s angles=%s delete_raw=%s transcode=%s",
+                pipeline_id, firebase_game_id, date, angles, DELETE_RAW, transcode)
 
     try:
-        # annotation game (needed for the S3 folder = uball game uuid)
-        client = get_uball_client()
+        # annotation game (needed for the S3 folder = uball game uuid).
+        # 4K passthrough skips it entirely: the masters aren't annotation-ready
+        # (4K H.265, no 1080p proxy), so creating an empty annotation game would
+        # only clutter the tool.
+        client = None
         uball_game = None
-        if not client:
+        if not transcode:
+            run.log("info", "transcoding OFF (agx-settings) — uploading 4K masters "
+                            "as-is; annotation game + register skipped")
+        elif not (client := get_uball_client()):
             run.log("warn", "UBALL creds not configured — will transcode+upload but not register")
         else:
             try:
@@ -248,11 +285,23 @@ def run_ingestion(fb, cfg, pipeline_id: str, state: Dict, stopped: Dict, tracker
         run.start_stage("transcode")
 
         def _do(f: Dict) -> tuple:
-            _, fn = _s3_key(date, folder, f["angle"])
+            if not transcode:
+                # 4K passthrough: the raw master IS the upload artifact (dst ==
+                # src); the _4K suffix keeps it from ever being mistaken for a
+                # 1080p proxy.
+                key, fn = _s3_key(date, folder, f["angle"] + "_4K")
+                src = f["path"]
+                ok = os.path.isfile(src) and os.path.getsize(src) > 0
+                return f["angle"], {"src": src, "dst": src, "filename": fn,
+                                    "key": key, "ok": ok,
+                                    "dur": _probe_dur(src) if ok else None,
+                                    "size": os.path.getsize(src) if ok else 0,
+                                    "uploaded": False}
+            key, fn = _s3_key(date, folder, f["angle"])
             dst = os.path.join(work_dir, fn)
             ok = _transcode_1080p(f["path"], dst, cfg)
             return f["angle"], {"src": f["path"], "dst": dst, "filename": fn,
-                                "key": _s3_key(date, folder, f["angle"])[0], "ok": ok,
+                                "key": key, "ok": ok,
                                 "dur": _probe_dur(dst) if ok else None,
                                 "size": os.path.getsize(dst) if ok and os.path.exists(dst) else 0,
                                 "uploaded": False}
@@ -279,9 +328,10 @@ def run_ingestion(fb, cfg, pipeline_id: str, state: Dict, stopped: Dict, tracker
                 run.angle_failed("upload", angle, str(e)[:200])
         run.finish_stage("upload")
 
-        # STAGE 3 — register FL/FR in the annotation tool
+        # STAGE 3 — register FL/FR in the annotation tool (empty in 4K
+        # passthrough: reg_angles=[], the masters aren't annotation-ready)
         run.start_stage("register")
-        for angle in [a for a in angles if a in UBALL_ANGLE]:
+        for angle in reg_angles:
             r = tr.get(angle, {})
             if not r.get("uploaded"):
                 run.angle_failed("register", angle, "not uploaded")
@@ -316,7 +366,10 @@ def run_ingestion(fb, cfg, pipeline_id: str, state: Dict, stopped: Dict, tracker
         all_uploaded = all(r.get("uploaded") for r in tr.values())
         for r in tr.values():
             if r.get("uploaded"):
-                _rm(r["dst"])
+                # 4K passthrough has dst == src: the dst is the raw master, so
+                # its deletion is DELETE_RAW's call, not automatic.
+                if r["dst"] != r["src"]:
+                    _rm(r["dst"])
                 if DELETE_RAW:
                     _rm(r["src"])
             else:
