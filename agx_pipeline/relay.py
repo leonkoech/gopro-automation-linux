@@ -31,13 +31,15 @@ class Relay:
     def __init__(self, fb, jetson_id: str, state_fn: Callable[[], Dict],
                  on_start: Callable, on_stop: Callable,
                  auto_fn: Optional[Callable] = None, interval: float = 3.0,
-                 on_preview: Optional[Callable] = None):
+                 on_preview: Optional[Callable] = None,
+                 on_highlight: Optional[Callable] = None):
         self.fb = fb
         self.jetson_id = jetson_id
         self.state_fn = state_fn      # () -> device status dict
         self.on_start = on_start      # (game_id, label, force) -> (payload, status)
         self.on_stop = on_stop        # () -> (payload, status)
         self.on_preview = on_preview  # () -> (payload, status); camera snapshots
+        self.on_highlight = on_highlight  # (cmd) -> (payload, status); ACKs fast, cut runs threaded
         self.auto_fn = auto_fn        # () -> None; auto start/stop from game lifecycle
         self.interval = interval
         self._stop = threading.Event()
@@ -73,6 +75,12 @@ class Relay:
                     elif action == "preview":
                         payload, _ = (self.on_preview() if self.on_preview
                                       else ({"success": False, "error": "preview not supported"}, 501))
+                    elif action == "highlight_clip":
+                        # Handler validates + spawns the cut on a daemon thread and
+                        # returns immediately — a long ffmpeg run in this loop would
+                        # stall the heartbeat and auto start/stop.
+                        payload, _ = (self.on_highlight(cmd) if self.on_highlight
+                                      else ({"success": False, "error": "highlight not supported"}, 501))
                     else:
                         payload = {"success": False, "error": f"unknown action {action}"}
                     d.reference.update({

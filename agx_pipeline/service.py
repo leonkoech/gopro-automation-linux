@@ -35,6 +35,7 @@ from firebase_service import get_firebase_service
 from agx_pipeline.recording import RecordingController, load_config
 from agx_pipeline.camrec_controller import CamrecController
 from agx_pipeline.shot_recording import AravisRecorder
+from agx_pipeline.highlight import HighlightRecorder, cut_highlight
 from agx_pipeline.sessions import AgxSessionTracker, get_active_game
 from agx_pipeline.notifier import CameraAlerter
 
@@ -52,6 +53,11 @@ CONTROLLER = CamrecController(CFG) if _BACKEND == "camrec" else RecordingControl
 # Shot-detection cameras (FLIR/GigE) record via a separate host-side Aravis
 # recorder, alongside whichever backend records the tracking (RTSP) angles.
 SHOT = AravisRecorder(CFG) if CFG.shot_cameras else None
+# Highlight sidecar: closed short segments of one watchable angle so a clip can
+# be cut mid-game (the raw masters have no moov until stop). Best-effort.
+HIGHLIGHT = (HighlightRecorder(CFG)
+             if os.getenv("HIGHLIGHT_RECORDER", "true").lower() in ("1", "true", "yes")
+             else None)
 logger.info("recording backend: %s (shot cameras: %d)", _BACKEND, len(CFG.shot_cameras))
 FB = get_firebase_service()
 TRACKER = AgxSessionTracker(FB, CFG.jetson_id) if FB else None
@@ -145,6 +151,7 @@ def _device_state() -> Dict:
             "started_at": _current.get("started_at") if rec else None,
         },
         "current_ingestion": (_last_pipeline or {}).get("pipeline_id"),
+        "highlight": HIGHLIGHT.status() if HIGHLIGHT else None,
         "location": CFG.location,
     }
 
@@ -264,6 +271,11 @@ def _do_start(game_id=None, label=None, force=False):
             "session_ids": session_ids, "started_at": started_at,
             "forced": bool(force),
         })
+        if HIGHLIGHT:
+            try:
+                HIGHLIGHT.start(label)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("highlight recorder failed to start: %s", e)
     logger.info("recording started label=%s game=%s force=%s angles=%s",
                 label, game_id, bool(force), [o["angle"] for o in outputs])
     _publish()
@@ -305,6 +317,11 @@ def _do_stop():
                     stopped.setdefault("files", []).extend(f_shot.result()["files"])
                 except Exception as e:  # noqa: BLE001
                     logger.error("shot stop failed: %s", e)
+        if HIGHLIGHT:
+            try:
+                HIGHLIGHT.stop()
+            except Exception as e:  # noqa: BLE001
+                logger.warning("highlight recorder stop failed: %s", e)
     if track_err is not None:
         return {"success": False, "error": track_err}, 500
     if TRACKER:
@@ -333,6 +350,42 @@ def _do_preview():
     except Exception as e:  # noqa: BLE001
         logger.error("preview failed: %s", e)
         return {"success": False, "error": str(e)[:300]}, 500
+
+
+def _do_highlight(cmd: Dict):
+    """Queue a highlight-clip cut (docs/HIGHLIGHT_CLIP_INTEGRATION_PLAN.md
+    Stage 1). ACKs immediately; the cut runs on a daemon thread and reports
+    via basketball-games/{game}.highlights.{logId}. Shared by the HTTP route
+    and the Firebase relay."""
+    if not HIGHLIGHT:
+        return {"success": False, "error": "highlight recorder disabled"}, 501
+    log_id = cmd.get("logId") or cmd.get("log_id")
+    ts = cmd.get("ts")
+    with _lock:
+        game_id = cmd.get("firebase_game_id") or _current.get("firebase_game_id")
+        label = _current.get("label")
+    if not (log_id and ts and game_id):
+        return {"success": False, "error": "logId, ts and firebase_game_id required"}, 400
+    try:
+        t_epoch = datetime.fromisoformat(str(ts).replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return {"success": False, "error": f"unparseable ts: {ts}"}, 400
+    hl = HIGHLIGHT.status()
+    if not hl["active"]:
+        return {"success": False, "error": "highlight recorder not running"}, 409
+    req = {"game_id": game_id, "log_id": str(log_id), "ts_epoch": t_epoch,
+           "label": label or hl.get("label"),
+           "pre": cmd.get("pre"), "post": cmd.get("post")}
+    threading.Thread(target=cut_highlight, args=(FB, CFG, HIGHLIGHT, req),
+                     name=f"highlight-{str(log_id)[:8]}", daemon=True).start()
+    return {"success": True, "queued": True, "logId": str(log_id),
+            "angle": hl["angle"]}, 202
+
+
+@app.route("/api/highlight", methods=["POST"])
+def highlight_clip():
+    payload, status = _do_highlight(request.get_json(silent=True) or {})
+    return jsonify(payload), status
 
 
 @app.route("/api/preview", methods=["POST", "GET"])
@@ -408,7 +461,8 @@ if __name__ == "__main__":
     if FB:
         from agx_pipeline.relay import Relay
         _RELAY = Relay(FB, CFG.jetson_id, _device_state, _do_start, _do_stop,
-                       auto_fn=_auto_follow, on_preview=_do_preview)
+                       auto_fn=_auto_follow, on_preview=_do_preview,
+                       on_highlight=_do_highlight)
         _RELAY.start()
         # Publish the Courtside schedule + roster to Firestore. The frontend's
         # cloud IP is WAF/geo-blocked by the league site; the AGX (at the venue,
