@@ -1,11 +1,11 @@
-"""Tests for the AGX ingest transcode toggle (4K passthrough).
+"""Tests for the AGX ingest 4K-masters toggle.
 
-Promo shoots need the footage to STAY 4K: the dashboard writes
-`agx-settings/{jetson_id}.transcode = false`, and ingest must then upload the
-raw 4K masters as-is (`_4K` filename suffix) instead of the 1080p proxies,
-skip the annotation register (the editor needs 1080p H.264), and — critically —
-NOT delete the raw master during cleanup when DELETE_RAW is off, even though
-in passthrough mode dst == src.
+`agx-settings/{jetson_id}.transcode = false` = "4K mode": the NORMAL pipeline
+runs unchanged (1080p proxies uploaded, annotation game + register) and the raw
+4K masters are ALSO uploaded (`_4K` filename suffix) into the same game folder,
+each logging its full s3://bucket/key so the operator can copy it from the
+dashboard's ingestion card. The raw master must survive on disk until BOTH its
+uploads (1080p proxy + 4K copy) are confirmed, even with DELETE_RAW on.
 """
 
 from __future__ import annotations
@@ -23,6 +23,9 @@ if str(ROOT) not in sys.path:
 
 from agx_pipeline import ingest  # noqa: E402
 
+GAME_UUID = "12345678-abcd-ef00-1111-222233334444"
+FOLDER = "12345678-abcd-ef00-1111"  # first 4 uuid segments
+
 
 # --- helpers ---------------------------------------------------------------
 
@@ -35,7 +38,15 @@ def _fb_with_settings(transcode):
     snap.exists = transcode is not None
     snap.to_dict.return_value = {} if transcode is None else {"transcode": transcode}
     fb.db.collection.return_value.document.return_value.get.return_value = snap
+    fb.get_game.return_value = {}
     return fb
+
+
+def _uball_client():
+    client = MagicMock()
+    client.get_game_by_firebase_id.return_value = None
+    client.create_game.return_value = {"id": GAME_UUID}
+    return client
 
 
 def _make_state_and_files(tmp_path, label="game_20260728_120000"):
@@ -57,6 +68,10 @@ def _cfg(tmp_path):
                            docker_image="img", location="court-a")
 
 
+def _run_doc(fb):
+    return fb.db.collection.return_value.document.return_value.update.call_args.args[0]
+
+
 @pytest.fixture
 def uploads(monkeypatch):
     """Record `_upload` calls; never touch the network or ffprobe."""
@@ -64,6 +79,20 @@ def uploads(monkeypatch):
     monkeypatch.setattr(ingest, "_upload", lambda local, key, **kw: calls.append((local, key)))
     monkeypatch.setattr(ingest, "_probe_dur", lambda path: 12.3)
     return calls
+
+
+@pytest.fixture
+def fake_transcode(monkeypatch):
+    transcoded = []
+
+    def _fake(src, dst, cfg):
+        Path(dst).parent.mkdir(parents=True, exist_ok=True)
+        Path(dst).write_bytes(b"\x00" * 64)
+        transcoded.append(src)
+        return True
+
+    monkeypatch.setattr(ingest, "_transcode_1080p", _fake)
+    return transcoded
 
 
 # --- _transcode_enabled ----------------------------------------------------
@@ -87,94 +116,86 @@ def test_toggle_read_error_falls_back_to_default():
     assert ingest._transcode_enabled(fb, "agx-01") is True
 
 
-# --- run_ingestion: 4K passthrough (transcode off) -------------------------
+# --- run_ingestion: 4K mode (normal pipeline + 4K masters) -----------------
 
 
-def test_passthrough_uploads_raw_4k_and_keeps_raw_when_delete_raw_off(
-        tmp_path, monkeypatch, uploads):
-    state, stopped, session_dir = _make_state_and_files(tmp_path)
-    monkeypatch.setattr(ingest, "DELETE_RAW", False)
-    monkeypatch.setattr(ingest, "_transcode_1080p",
-                        lambda *a, **k: pytest.fail("must not transcode in passthrough"))
-    monkeypatch.setattr(ingest, "get_uball_client",
-                        lambda: pytest.fail("must not touch annotation tool in passthrough"))
-
-    ingest.run_ingestion(_fb_with_settings(False), _cfg(tmp_path),
-                         "pid1", state, stopped, None)
-
-    # both raw masters uploaded as-is under the _4K suffix, no-game folder
-    assert sorted(k.rsplit("_", 2)[-2] for _, k in uploads) == ["FL", "FR"]
-    for local, key in uploads:
-        assert key.endswith("_4K.mp4")
-        assert "agx-game_20260728_120000" in key
-        assert local in [f["path"] for f in stopped["files"]]  # uploaded the raw itself
-    # dst == src in passthrough: cleanup must not delete the raw when DELETE_RAW is off
-    for f in stopped["files"]:
-        assert Path(f["path"]).exists()
-    assert session_dir.exists()
-
-
-def test_passthrough_deletes_raw_after_upload_when_delete_raw_on(
-        tmp_path, monkeypatch, uploads):
-    state, stopped, session_dir = _make_state_and_files(tmp_path)
-    monkeypatch.setattr(ingest, "DELETE_RAW", True)
-    monkeypatch.setattr(ingest, "_transcode_1080p",
-                        lambda *a, **k: pytest.fail("must not transcode in passthrough"))
-    monkeypatch.setattr(ingest, "get_uball_client", lambda: None)
-
-    ingest.run_ingestion(_fb_with_settings(False), _cfg(tmp_path),
-                         "pid2", state, stopped, None)
-
-    assert len(uploads) == 2
-    assert not session_dir.exists()  # raws uploaded -> session dir cleaned up
-
-
-def test_passthrough_logs_copyable_s3_paths_and_records_uploads(
-        tmp_path, monkeypatch, uploads):
-    """The operator finds 4K footage from the run log: every uploaded angle logs
-    its full s3://bucket/key (shown on the dashboard's ingestion card), and the
-    run doc records the s3 prefix + per-angle keys."""
+def test_4k_mode_runs_normal_pipeline_and_also_uploads_masters(
+        tmp_path, monkeypatch, uploads, fake_transcode):
     state, stopped, _ = _make_state_and_files(tmp_path)
     monkeypatch.setattr(ingest, "DELETE_RAW", False)
-    monkeypatch.setattr(ingest, "_transcode_1080p",
-                        lambda *a, **k: pytest.fail("must not transcode in passthrough"))
-    monkeypatch.setattr(ingest, "get_uball_client",
-                        lambda: pytest.fail("must not touch annotation tool in passthrough"))
+    client = _uball_client()
+    monkeypatch.setattr(ingest, "get_uball_client", lambda: client)
     fb = _fb_with_settings(False)
 
-    ingest.run_ingestion(fb, _cfg(tmp_path), "pid4", state, stopped, None)
+    ingest.run_ingestion(fb, _cfg(tmp_path), "pid1", state, stopped, None)
 
-    run_doc = fb.db.collection.return_value.document.return_value.update.call_args.args[0]
-    s3_logs = [l["msg"] for l in run_doc["logs"] if "uploaded -> s3://" in l["msg"]]
-    assert len(s3_logs) == 2
-    fl = next(m for m in s3_logs if m.startswith("FL uploaded"))
-    assert f"s3://{ingest.BUCKET}/" in fl and "_FL_4K.mp4" in fl
-    assert run_doc["s3"]["prefix"].endswith("/agx-game_20260728_120000/")
-    assert run_doc["uploads"]["FL"]["s3_key"].endswith("_FL_4K.mp4")
-    assert run_doc["uploads"]["FR"]["s3_key"].endswith("_FR_4K.mp4")
+    # normal pipeline intact: transcoded, annotation game created, FL/FR registered
+    assert len(fake_transcode) == 2
+    client.create_game.assert_called_once()
+    assert client.register_video.call_count == 2
+    for call in client.register_video.call_args_list:
+        assert not call.kwargs["s3_key"].endswith("_4K.mp4")  # registers the 1080p proxy
+
+    # PLUS the raw masters uploaded into the same game folder
+    proxy_keys = [k for _, k in uploads if not k.endswith("_4K.mp4")]
+    master = {k: local for local, k in uploads if k.endswith("_4K.mp4")}
+    assert len(proxy_keys) == 2 and len(master) == 2
+    raw_paths = {f["path"] for f in stopped["files"]}
+    for key, local in master.items():
+        assert f"/{FOLDER}/" in key
+        assert local in raw_paths  # the 4K upload ships the raw master itself
+
+    # discoverable: s3:// paths in the run log + structured uploads map
+    doc = _run_doc(fb)
+    master_logs = [l["msg"] for l in doc["logs"] if "4K master uploaded -> s3://" in l["msg"]]
+    assert len(master_logs) == 2
+    assert doc["uploads"]["FL_4K"]["s3_key"].endswith("_FL_4K.mp4")
+    assert doc["uploads"]["FR_4K"]["s3_key"].endswith("_FR_4K.mp4")
+    assert doc["uploads"]["FL"]["s3_key"].endswith("_FL.mp4")
+
+    # DELETE_RAW off -> raws stay on disk
+    for p in raw_paths:
+        assert Path(p).exists()
 
 
-# --- run_ingestion: normal path (transcode on) -----------------------------
+def test_4k_mode_raw_deleted_only_after_both_uploads(
+        tmp_path, monkeypatch, uploads, fake_transcode):
+    """DELETE_RAW on: a raw whose 4K upload failed must survive cleanup (and
+    keep the session dir alive); a fully-uploaded raw is deleted."""
+    state, stopped, session_dir = _make_state_and_files(tmp_path)
+    monkeypatch.setattr(ingest, "DELETE_RAW", True)
+    monkeypatch.setattr(ingest, "get_uball_client", lambda: _uball_client())
+
+    def _upload_fr_4k_fails(local, key, **kw):
+        if key.endswith("_FR_4K.mp4"):
+            raise RuntimeError("s3 blip")
+        uploads.append((local, key))
+
+    monkeypatch.setattr(ingest, "_upload", _upload_fr_4k_fails)
+    fb = _fb_with_settings(False)
+
+    ingest.run_ingestion(fb, _cfg(tmp_path), "pid2", state, stopped, None)
+
+    by_angle = {f["angle"]: Path(f["path"]) for f in stopped["files"]}
+    assert not by_angle["FL"].exists()   # both uploads confirmed -> deleted
+    assert by_angle["FR"].exists()       # 4K upload failed -> raw kept for retry
+    assert session_dir.exists()          # dir with a kept raw must not be rmtree'd
+    doc = _run_doc(fb)
+    assert any("FR 4K master upload failed" in l["msg"] for l in doc["logs"])
+    assert doc["status"] == "completed"  # normal 1080p flow succeeded regardless
 
 
-def test_transcode_on_produces_1080p_names_and_transcodes(tmp_path, monkeypatch, uploads):
+# --- run_ingestion: normal mode (toggle on) --------------------------------
+
+
+def test_normal_mode_uploads_no_4k_masters(tmp_path, monkeypatch, uploads, fake_transcode):
     state, stopped, _ = _make_state_and_files(tmp_path)
     monkeypatch.setattr(ingest, "DELETE_RAW", False)
-    transcoded = []
-
-    def fake_transcode(src, dst, cfg):
-        Path(dst).parent.mkdir(parents=True, exist_ok=True)
-        Path(dst).write_bytes(b"\x00" * 64)
-        transcoded.append(src)
-        return True
-
-    monkeypatch.setattr(ingest, "_transcode_1080p", fake_transcode)
     monkeypatch.setattr(ingest, "get_uball_client", lambda: None)  # no register creds
 
     ingest.run_ingestion(_fb_with_settings(True), _cfg(tmp_path),
                          "pid3", state, stopped, None)
 
-    assert len(transcoded) == 2
+    assert len(fake_transcode) == 2
     assert len(uploads) == 2
-    for _, key in uploads:
-        assert not key.endswith("_4K.mp4")
+    assert not any(k.endswith("_4K.mp4") for _, k in uploads)

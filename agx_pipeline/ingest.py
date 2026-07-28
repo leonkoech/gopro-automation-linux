@@ -16,14 +16,16 @@ uploaded AS-IS to the SAME game folder (no downscale/transcode, no annotation
 register), joining the game by uuid for the shot-detection CV. Set
 SHOTDET_UPLOAD_S3=false to keep it on the AGX for local processing instead.
 
-Transcode toggle (4K passthrough): the dashboard writes
-`agx-settings/{jetson_id}.transcode = false` and the next ingestion uploads the
-raw 4K masters as-is (`_4K` filename suffix) instead of 1080p proxies — for
-promo shoots where the footage must stay 4K. Passthrough skips the annotation
-tool entirely (the editor needs the 1080p H.264 proxy); instead, every uploaded
-file's full s3://bucket/key is written to the run log, which the dashboard's
-ingestion card shows — the operator copies the path straight from there.
-Default is ON; TRANSCODE_ENABLED env is the no-Firebase fallback.
+4K-masters toggle: the dashboard writes
+`agx-settings/{jetson_id}.transcode = false` and ingestion runs the NORMAL
+pipeline (1080p proxies, annotation game + register — nothing about the usual
+flow changes) and ALSO uploads the raw 4K masters (`_4K` filename suffix) into
+the same game folder, logging each one's full s3://bucket/key to the run log
+(shown on the dashboard's ingestion card). Use case: marketing clips get cut
+from the 4K masters later, while the game still flows to annotation as usual.
+The raw master is only deleted from the AGX once BOTH its uploads are
+confirmed. Default is normal-only; TRANSCODE_ENABLED env is the no-Firebase
+fallback (field is named `transcode` for compatibility: false = keep 4K).
 """
 
 from __future__ import annotations
@@ -61,11 +63,11 @@ TRANSCODE_DEFAULT = os.getenv("TRANSCODE_ENABLED", "true").lower() in ("1", "tru
 def _transcode_enabled(fb, jetson_id: str) -> bool:
     """Operator toggle: `agx-settings/{jetson_id}.transcode` (dashboard-writable).
 
-    True (default) = normal 4K→1080p ingest. False = 4K passthrough for shoots
-    that must stay 4K. Read fresh at each ingestion, so flipping the toggle
-    while a recording is still running applies at stop. Any read failure falls
-    back to TRANSCODE_ENABLED — a Firebase blip must never silently change what
-    gets uploaded.
+    True (default) = normal ingest only. False = 4K mode: the normal pipeline
+    runs unchanged AND the raw 4K masters are also uploaded. Read fresh at each
+    ingestion, so flipping the toggle while a recording is still running
+    applies at stop. Any read failure falls back to TRANSCODE_ENABLED — a
+    Firebase blip must never silently change what gets uploaded.
     """
     if not fb:
         return TRANSCODE_DEFAULT
@@ -298,26 +300,23 @@ def run_ingestion(fb, cfg, pipeline_id: str, state: Dict, stopped: Dict, tracker
     left, right = game.get("leftTeam", {}) or {}, game.get("rightTeam", {}) or {}
     video_name = f"{left.get('name', 'Team 1')} vs {right.get('name', 'Team 2')}"
 
-    transcode = _transcode_enabled(fb, cfg.jetson_id)
-    reg_angles = [a for a in angles if a in UBALL_ANGLE] if transcode else []
+    keep_4k = not _transcode_enabled(fb, cfg.jetson_id)
+    reg_angles = [a for a in angles if a in UBALL_ANGLE]
     run = IngestionRun(fb, pipeline_id, {
         "jetson_id": cfg.jetson_id, "firebase_game_id": firebase_game_id,
         "video_name": video_name, "date": date}, angles,
         register_angles=reg_angles)
-    logger.info("ingest %s game=%s date=%s angles=%s delete_raw=%s transcode=%s",
-                pipeline_id, firebase_game_id, date, angles, DELETE_RAW, transcode)
+    logger.info("ingest %s game=%s date=%s angles=%s delete_raw=%s keep_4k=%s",
+                pipeline_id, firebase_game_id, date, angles, DELETE_RAW, keep_4k)
 
     try:
-        # annotation game (needed for the S3 folder = uball game uuid).
-        # 4K passthrough skips the annotation tool entirely: the masters aren't
-        # editor-playable (4K H.265). The S3 destination of every uploaded file
-        # is logged below instead, so the operator finds footage from the run log.
-        client = None
+        # annotation game (needed for the S3 folder = uball game uuid)
+        client = get_uball_client()
         uball_game = None
-        if not transcode:
-            run.log("info", "transcoding OFF (agx-settings) — uploading 4K masters "
-                            "as-is; annotation tool skipped, S3 paths in this log")
-        elif not (client := get_uball_client()):
+        if keep_4k:
+            run.log("info", "4K mode (agx-settings) — normal pipeline runs as usual, "
+                            "and the raw 4K masters will ALSO be uploaded (paths in this log)")
+        if not client:
             run.log("warn", "UBALL creds not configured — will transcode+upload but not register")
         else:
             try:
@@ -334,18 +333,6 @@ def run_ingestion(fb, cfg, pipeline_id: str, state: Dict, stopped: Dict, tracker
         run.start_stage("transcode")
 
         def _do(f: Dict) -> tuple:
-            if not transcode:
-                # 4K passthrough: the raw master IS the upload artifact (dst ==
-                # src); the _4K suffix keeps it from ever being mistaken for a
-                # 1080p proxy.
-                key, fn = _s3_key(date, folder, f["angle"] + "_4K")
-                src = f["path"]
-                ok = os.path.isfile(src) and os.path.getsize(src) > 0
-                return f["angle"], {"src": src, "dst": src, "filename": fn,
-                                    "key": key, "ok": ok,
-                                    "dur": _probe_dur(src) if ok else None,
-                                    "size": os.path.getsize(src) if ok else 0,
-                                    "uploaded": False}
             key, fn = _s3_key(date, folder, f["angle"])
             dst = os.path.join(work_dir, fn)
             ok = _transcode_1080p(f["path"], dst, cfg)
@@ -383,8 +370,7 @@ def run_ingestion(fb, cfg, pipeline_id: str, state: Dict, stopped: Dict, tracker
                 run.angle_failed("upload", angle, str(e)[:200])
         run.finish_stage("upload")
 
-        # STAGE 3 — register FL/FR in the annotation tool (empty in 4K
-        # passthrough: reg_angles=[], the masters aren't annotation-ready)
+        # STAGE 3 — register FL/FR in the annotation tool
         run.start_stage("register")
         for angle in reg_angles:
             r = tr.get(angle, {})
@@ -402,6 +388,29 @@ def run_ingestion(fb, cfg, pipeline_id: str, state: Dict, stopped: Dict, tracker
                 run.angle_failed("register", angle, str(e)[:200])
         run.finish_stage("register")
 
+        # STAGE 3b — 4K mode: ALSO upload the raw masters into the same game
+        # folder. Runs AFTER register so annotation availability is never
+        # delayed by the big files. Marketing clips get cut from these later;
+        # the s3:// path in the run log is how operators find them. A failed
+        # 4K upload keeps the raw on the AGX (see cleanup) but does not fail
+        # the run — the normal 1080p flow already succeeded.
+        if keep_4k:
+            for angle, r in tr.items():
+                if not r.get("ok"):
+                    continue
+                src = r["src"]
+                key, _fn = _s3_key(date, folder, angle + "_4K")
+                try:
+                    _upload(src, key)
+                    r["uploaded_4k"] = True
+                    size = os.path.getsize(src) if os.path.exists(src) else None
+                    run.set_upload(f"{angle}_4K", key, size)
+                    mb = f" ({size / 1e6:.0f} MB)" if size else ""
+                    run.log("info", f"{angle} 4K master uploaded -> s3://{BUCKET}/{key}{mb}")
+                except Exception as e:  # noqa: BLE001
+                    run.log("error", f"{angle} 4K master upload failed — raw kept on "
+                                     f"AGX for retry: {str(e)[:150]}")
+
         # STAGE 4 — shot-detection footage (FLIR SL/SR): upload as-is to the same
         # game folder, or keep it local. Runs before cleanup so kept-local files
         # are moved out of the session dir first (survive the rmtree below).
@@ -412,25 +421,24 @@ def run_ingestion(fb, cfg, pipeline_id: str, state: Dict, stopped: Dict, tracker
         # runs before cleanup so the session-dir .m4a files still exist.
         _ingest_audio_sync(run, date, folder, stopped.get("audio"))
 
-        # cleanup: 1080p is in S3; drop it + the 4K master (env-controlled) to keep the
-        # AGX free. CRITICAL: only delete the raw master once its S3 upload is CONFIRMED
-        # (r["uploaded"]) — NOT merely once the transcode succeeded (r["ok"]). A good
-        # transcode whose upload failed must never lose the only copy. For the same
-        # reason, only rmtree the session dir when every angle uploaded; otherwise an
-        # un-uploaded raw would be destroyed along with it.
-        all_uploaded = all(r.get("uploaded") for r in tr.values())
+        # cleanup: 1080p is in S3; drop it + the raw master (env-controlled) to keep
+        # the AGX free. CRITICAL: only delete the raw master once EVERY upload that
+        # needs it is CONFIRMED — the 1080p (r["uploaded"]) and, in 4K mode, the 4K
+        # master copy (r["uploaded_4k"]) — NOT merely once the transcode succeeded
+        # (r["ok"]). A good transcode whose upload failed must never lose the only
+        # copy. For the same reason, only rmtree the session dir when every raw is
+        # safe; otherwise an un-uploaded raw would be destroyed along with it.
+        def _raw_safe_to_delete(r: Dict) -> bool:
+            return bool(r.get("uploaded") and (not keep_4k or r.get("uploaded_4k")))
         for r in tr.values():
             if r.get("uploaded"):
-                # 4K passthrough has dst == src: the dst is the raw master, so
-                # its deletion is DELETE_RAW's call, not automatic.
-                if r["dst"] != r["src"]:
-                    _rm(r["dst"])
-                if DELETE_RAW:
+                _rm(r["dst"])
+                if DELETE_RAW and _raw_safe_to_delete(r):
                     _rm(r["src"])
             else:
                 run.log("error", f"{r['filename']}: S3 upload not confirmed — keeping raw "
                                  f"master on disk for retry ({r['src']})")
-        if DELETE_RAW and all_uploaded:
+        if DELETE_RAW and all(_raw_safe_to_delete(r) for r in tr.values()):
             import shutil
             shutil.rmtree(os.path.join(cfg.output_dir, label), ignore_errors=True)
 
