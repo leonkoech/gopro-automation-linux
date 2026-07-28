@@ -55,6 +55,10 @@ class IngestionRun:
             "status": "running",
             "progress": 0,
             "angles": angles,
+            # where this run's files land in S3 ({bucket, prefix}) + per-angle
+            # uploaded keys — so operators can find the footage from the UI
+            "s3": None,
+            "uploads": {},
             "stages": {s: {"status": "pending", "done": 0, "total": totals[s], "error": None}
                        for s in STAGES},
             "angle_status": {a: {s: "pending" for s in STAGES} for a in angles},
@@ -98,6 +102,19 @@ class IngestionRun:
 
     def set_uball_game(self, uball_game_id: Optional[str]) -> None:
         self.doc["uball_game_id"] = uball_game_id
+        self._write()
+
+    def set_s3(self, bucket: str, prefix: str) -> None:
+        """Record the S3 folder this run uploads into (shown in the UI)."""
+        self.doc["s3"] = {"bucket": bucket, "prefix": prefix}
+        self._write()
+
+    def set_upload(self, angle: str, s3_key: str, size: Optional[int] = None) -> None:
+        """Record one angle's uploaded S3 key (shown in the UI)."""
+        entry = {"s3_key": s3_key}
+        if size is not None:
+            entry["size"] = size
+        self.doc["uploads"][angle] = entry
         self._write()
 
     def set_shot(self, angle: str, status: str, **meta) -> None:

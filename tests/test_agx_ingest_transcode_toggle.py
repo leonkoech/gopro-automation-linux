@@ -129,6 +129,31 @@ def test_passthrough_deletes_raw_after_upload_when_delete_raw_on(
     assert not session_dir.exists()  # raws uploaded -> session dir cleaned up
 
 
+def test_passthrough_logs_copyable_s3_paths_and_records_uploads(
+        tmp_path, monkeypatch, uploads):
+    """The operator finds 4K footage from the run log: every uploaded angle logs
+    its full s3://bucket/key (shown on the dashboard's ingestion card), and the
+    run doc records the s3 prefix + per-angle keys."""
+    state, stopped, _ = _make_state_and_files(tmp_path)
+    monkeypatch.setattr(ingest, "DELETE_RAW", False)
+    monkeypatch.setattr(ingest, "_transcode_1080p",
+                        lambda *a, **k: pytest.fail("must not transcode in passthrough"))
+    monkeypatch.setattr(ingest, "get_uball_client",
+                        lambda: pytest.fail("must not touch annotation tool in passthrough"))
+    fb = _fb_with_settings(False)
+
+    ingest.run_ingestion(fb, _cfg(tmp_path), "pid4", state, stopped, None)
+
+    run_doc = fb.db.collection.return_value.document.return_value.update.call_args.args[0]
+    s3_logs = [l["msg"] for l in run_doc["logs"] if "uploaded -> s3://" in l["msg"]]
+    assert len(s3_logs) == 2
+    fl = next(m for m in s3_logs if m.startswith("FL uploaded"))
+    assert f"s3://{ingest.BUCKET}/" in fl and "_FL_4K.mp4" in fl
+    assert run_doc["s3"]["prefix"].endswith("/agx-game_20260728_120000/")
+    assert run_doc["uploads"]["FL"]["s3_key"].endswith("_FL_4K.mp4")
+    assert run_doc["uploads"]["FR"]["s3_key"].endswith("_FR_4K.mp4")
+
+
 # --- run_ingestion: normal path (transcode on) -----------------------------
 
 

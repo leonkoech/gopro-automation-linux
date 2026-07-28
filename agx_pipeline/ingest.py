@@ -20,8 +20,10 @@ Transcode toggle (4K passthrough): the dashboard writes
 `agx-settings/{jetson_id}.transcode = false` and the next ingestion uploads the
 raw 4K masters as-is (`_4K` filename suffix) instead of 1080p proxies — for
 promo shoots where the footage must stay 4K. Passthrough skips the annotation
-game + register (the editor needs the 1080p H.264 proxy). Default is ON;
-TRANSCODE_ENABLED env is the no-Firebase fallback.
+tool entirely (the editor needs the 1080p H.264 proxy); instead, every uploaded
+file's full s3://bucket/key is written to the run log, which the dashboard's
+ingestion card shows — the operator copies the path straight from there.
+Default is ON; TRANSCODE_ENABLED env is the no-Firebase fallback.
 """
 
 from __future__ import annotations
@@ -307,14 +309,14 @@ def run_ingestion(fb, cfg, pipeline_id: str, state: Dict, stopped: Dict, tracker
 
     try:
         # annotation game (needed for the S3 folder = uball game uuid).
-        # 4K passthrough skips it entirely: the masters aren't annotation-ready
-        # (4K H.265, no 1080p proxy), so creating an empty annotation game would
-        # only clutter the tool.
+        # 4K passthrough skips the annotation tool entirely: the masters aren't
+        # editor-playable (4K H.265). The S3 destination of every uploaded file
+        # is logged below instead, so the operator finds footage from the run log.
         client = None
         uball_game = None
         if not transcode:
             run.log("info", "transcoding OFF (agx-settings) — uploading 4K masters "
-                            "as-is; annotation game + register skipped")
+                            "as-is; annotation tool skipped, S3 paths in this log")
         elif not (client := get_uball_client()):
             run.log("warn", "UBALL creds not configured — will transcode+upload but not register")
         else:
@@ -325,6 +327,7 @@ def run_ingestion(fb, cfg, pipeline_id: str, state: Dict, stopped: Dict, tracker
         game_uuid = (uball_game or {}).get("id")
         run.set_uball_game(game_uuid)
         folder = "-".join(game_uuid.split("-")[:4]) if game_uuid else f"agx-{label}"
+        run.set_s3(BUCKET, f"{LOCATION}/{date}/{folder}/")
         work_dir = os.path.join(cfg.output_dir, label, "1080p")
 
         # STAGE 1 — transcode (parallel, bounded); mark each angle as it finishes
@@ -369,6 +372,12 @@ def run_ingestion(fb, cfg, pipeline_id: str, state: Dict, stopped: Dict, tracker
             try:
                 _upload(r["dst"], r["key"])
                 r["uploaded"] = True
+                run.set_upload(angle, r["key"], r.get("size"))
+                # full copy-pasteable path in the run log — this is how the
+                # operator finds the footage (especially 4K passthrough, which
+                # never touches the annotation tool)
+                mb = f" ({r['size'] / 1e6:.0f} MB)" if r.get("size") else ""
+                run.log("info", f"{angle} uploaded -> s3://{BUCKET}/{r['key']}{mb}")
                 run.angle_done("upload", angle)
             except Exception as e:  # noqa: BLE001
                 run.angle_failed("upload", angle, str(e)[:200])
