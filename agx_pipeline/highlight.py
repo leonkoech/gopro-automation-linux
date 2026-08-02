@@ -49,6 +49,9 @@ ANGLES = [a.strip() for a in os.getenv("HIGHLIGHT_ANGLES", "FL,FR").split(",") i
 S3_BUCKET = os.getenv("UPLOAD_BUCKET", "uball-videos-production")
 S3_PREFIX = os.getenv("HIGHLIGHT_S3_PREFIX", "highlights")
 AWS_REGION = os.getenv("UPLOAD_REGION", "us-east-1")
+# CloudFront CDN in front of the S3 bucket — serve clips via the CDN (fast, cached,
+# HTTPS, reliable) instead of a raw/presigned S3 URL. Empty => presigned S3 fallback.
+CLOUDFRONT_DOMAIN = os.getenv("HIGHLIGHT_CDN_DOMAIN", "d22gul8sdref0l.cloudfront.net")
 # SigV4 presigned URLs cap at 7 days.
 URL_TTL = min(int(os.getenv("HIGHLIGHT_URL_TTL", str(7 * 24 * 3600))), 604800)
 
@@ -328,9 +331,10 @@ def cut_highlight(fb, cfg, recorder: HighlightRecorder, req: Dict) -> None:
         s3 = boto3.client("s3", region_name=AWS_REGION)
         s3.upload_file(final, S3_BUCKET, key,
                        ExtraArgs={"ContentType": "video/mp4"})
-        url = s3.generate_presigned_url(
-            "get_object", Params={"Bucket": S3_BUCKET, "Key": key},
-            ExpiresIn=URL_TTL)
+        url = (f"https://{CLOUDFRONT_DOMAIN}/{key}" if CLOUDFRONT_DOMAIN
+               else s3.generate_presigned_url(
+                   "get_object", Params={"Bucket": S3_BUCKET, "Key": key},
+                   ExpiresIn=URL_TTL))
 
         _mark(fb, game_id, log_id, {"status": "ready", "url": url,
                                     "s3_key": key, "angle": angle,
