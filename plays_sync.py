@@ -16,13 +16,28 @@ from logging_service import get_logger
 logger = get_logger("gopro.plays_sync")
 
 
+# Points → canonical annotation-tool classification. These MUST match the
+# vocabulary the box score / UBall sync / chatbot expect: a 2-point make is
+# FG_MAKE and a free throw is FREE_THROW_MAKE. (The old 2PT_MAKE/FT_MAKE were
+# wrong and polluted the plays table; 4-pointers were dropped entirely.)
+_MAKE_BY_POINTS: Dict[int, str] = {1: "FREE_THROW_MAKE", 2: "FG_MAKE", 3: "3PT_MAKE", 4: "4PT_MAKE"}
+_MISS_BY_POINTS: Dict[int, str] = {1: "FREE_THROW_MISS", 2: "FG_MISS", 3: "3PT_MISS", 4: "4PT_MISS"}
+
 SHOT_LABELS: Dict[str, str] = {
-    "2PT_MAKE": "2-Pointer Made",  "2PT_MISS": "2-Pointer Missed",
-    "3PT_MAKE": "3-Pointer Made",  "3PT_MISS": "3-Pointer Missed",
-    "FT_MAKE":  "Free Throw Made", "FT_MISS":  "Free Throw Missed",
-    "FG_MAKE":  "Field Goal Made", "FG_MISS":  "Field Goal Missed",
-    "FOUL":     "Foul",            "TIPOFF":   "Tipoff",
+    "FG_MAKE": "Field Goal Made", "FG_MISS": "Field Goal Missed",
+    "3PT_MAKE": "3-Pointer Made", "3PT_MISS": "3-Pointer Missed",
+    "4PT_MAKE": "4-Pointer Made", "4PT_MISS": "4-Pointer Missed",
+    "FREE_THROW_MAKE": "Free Throw Made", "FREE_THROW_MISS": "Free Throw Missed",
+    "FOUL": "Foul", "TIPOFF": "Tipoff",
 }
+
+# Resolve the play's camera side (LEFT/RIGHT) from scoring team + period +
+# startingSideTeam1 — the same halftime-aware math the highlight clips use.
+# Imported defensively so this module still loads in the legacy (non-AGX) env.
+try:
+    from agx_pipeline.side_attribution import scoring_hoop_side as _scoring_hoop_side
+except Exception:  # pragma: no cover - legacy env without agx_pipeline
+    _scoring_hoop_side = None
 
 
 def _cv_plays_enabled() -> bool:
@@ -104,28 +119,23 @@ def create_plays_from_firebase_logs(
             cv_skipped += 1
             continue
 
-        if action == "score_added":
-            points = payload.get("points", 0)
-            if points == 2:
-                classification = "2PT_MAKE"
-            elif points == 3:
-                classification = "3PT_MAKE"
-            elif points == 1:
-                classification = "FT_MAKE"
-            else:
-                continue
+        # Player pre-fill: only a player tap (player_score_added) carries a
+        # player; a team-button score (score_added) does not, and the annotator
+        # fills it in later — but the card + clip are already placed for them.
+        player_id = None
+        player_name = None
+        if action in ("score_added", "player_score_added"):
+            classification = _MAKE_BY_POINTS.get(payload.get("points", 0))
+            if not classification:
+                continue  # 0-point / malformed score log
+            if action == "player_score_added":
+                player_id = payload.get("playerId")
+                player_name = payload.get("playerName")
         elif action == "shot_missed":
-            # UBA-237: V1 introduces missed shots via the CV pipeline.
-            # Same payload shape as score_added (`payload.points` chooses
-            # the distance bucket); V1 always sets 2.
-            points = payload.get("points", 2)
-            if points == 2:
-                classification = "2PT_MISS"
-            elif points == 3:
-                classification = "3PT_MISS"
-            elif points == 1:
-                classification = "FT_MISS"
-            else:
+            # UBA-237: V1 missed shots via the CV pipeline. `payload.points`
+            # chooses the distance bucket (V1 always sets 2).
+            classification = _MISS_BY_POINTS.get(payload.get("points", 2))
+            if not classification:
                 logger.warning(f"[PlaysSync] shot_missed log has invalid points: {payload}")
                 continue
         elif action == "foul_added":
@@ -154,21 +164,29 @@ def create_plays_from_firebase_logs(
         end_ts = ts + 3.0
 
         is_cv = payload.get("source") == "cv"
+        label = SHOT_LABELS.get(classification, classification)
+
+        # Camera side (LEFT/RIGHT) the play happened at — flips at halftime.
+        # Same math as the highlight clips; None if the resolver isn't available
+        # (legacy env) or the event has no team (e.g. tipoff).
+        angle = None
+        if _scoring_hoop_side and team_side in ("left", "right"):
+            hoop = _scoring_hoop_side(team_side, log.get("period"),
+                                      firebase_game.get("startingSideTeam1"))
+            angle = hoop.upper() if hoop else None
+
+        confidence = 1.0  # operator-entered scoreboard truth
         if is_cv:
-            # V1 CV pipeline is distance-blind: we always assign the 2PT_MAKE/2PT_MISS
-            # bucket as a backend default, but the human-readable note must NOT claim
-            # "2-Pointer" since the model can't actually tell 2 vs 3.  V2 will emit
-            # a distance estimate and we'll restore the bucket-specific label.
-            if classification.endswith("_MAKE"):
-                cv_label = "Made"
-            elif classification.endswith("_MISS"):
-                cv_label = "Missed"
-            else:
-                cv_label = SHOT_LABELS.get(classification, classification)
-            note = f"{team_name} — {cv_label} (CV)"
+            c = payload.get("confidence")
+            confidence = float(c) if c is not None else None
+
+        if is_cv:
+            # V1 CV is distance-blind — don't claim a specific shot value.
+            cv_word = ("Made" if classification.endswith("_MAKE")
+                       else "Missed" if classification.endswith("_MISS") else label)
+            note = f"{team_name} — {cv_word} (CV)"
         else:
-            label = SHOT_LABELS.get(classification, classification)
-            note = f"{team_name} — {label}"
+            note = f"{player_name or team_name} — {label}"
 
         play_data: Dict[str, Any] = {
             "game_id": uball_game_id,
@@ -177,20 +195,25 @@ def create_plays_from_firebase_logs(
             "timestamp_seconds": ts,
             "start_timestamp": start_ts,
             "end_timestamp": end_ts,
+            # source tags the card's origin so annotators can tell auto-seeded
+            # scoreboard plays ("firebase") from CV ("cv") and their own ("manual").
+            "source": "cv" if is_cv else "firebase",
+            "events": [{
+                "label": classification,
+                "playerA": player_name, "playerAId": player_id,
+                "playerB": None, "playerBId": None,
+                "confidence": confidence,
+            }],
         }
         if team:
             play_data["team"] = team
-
-        # Carry CV provenance + confidence through to the backend (optional fields
-        # on PlayCreate; safely dropped by the backend if the columns are absent
-        # prior to the 007 migration being applied). Triggered by
-        # `payload.source == "cv"` rather than the actionType so an operator-
-        # entered shot is never mis-stamped.
-        if is_cv:
-            play_data["source"] = "cv"
-            confidence = payload.get("confidence")
-            if confidence is not None:
-                play_data["confidence"] = float(confidence)
+        if angle:
+            play_data["angle"] = angle
+        if player_id or player_name:
+            play_data["player_a"] = player_name
+            play_data["player_a_id"] = player_id
+        if confidence is not None:
+            play_data["confidence"] = confidence
 
         try:
             client.create_play(play_data)
