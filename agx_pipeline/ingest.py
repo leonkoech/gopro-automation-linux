@@ -325,6 +325,10 @@ def run_ingestion(fb, cfg, pipeline_id: str, state: Dict, stopped: Dict, tracker
                 run.log("error", f"create annotation game: {e}")
         game_uuid = (uball_game or {}).get("id")
         run.set_uball_game(game_uuid)
+        run.set_register_game(
+            ok=bool(game_uuid),
+            error=None if game_uuid else
+            ("UBALL creds not configured" if not client else "annotation game not created"))
         folder = "-".join(game_uuid.split("-")[:4]) if game_uuid else f"agx-{label}"
         run.set_s3(BUCKET, f"{LOCATION}/{date}/{folder}/")
         work_dir = os.path.join(cfg.output_dir, label, "1080p")
@@ -396,10 +400,16 @@ def run_ingestion(fb, cfg, pipeline_id: str, state: Dict, stopped: Dict, tracker
         if client and game_uuid:
             try:
                 from plays_sync import create_plays_from_firebase_logs
-                n_plays = create_plays_from_firebase_logs(client, game_uuid, game)
-                run.log("info", f"register plays: {n_plays} card(s) from scoreboard log")
+                summary: Dict = {}
+                n_plays = create_plays_from_firebase_logs(client, game_uuid, game, summary=summary)
+                run.set_register_plays(created=n_plays,
+                                       with_players=summary.get("with_players", 0),
+                                       by_label=summary.get("by_label"))
             except Exception as e:  # noqa: BLE001
-                run.log("error", f"register plays failed: {str(e)[:200]}")
+                run.set_register_plays(0, 0, ok=False, error=str(e)[:200])
+        else:
+            run.set_register_plays(0, 0, ok=False,
+                                   error="no annotation game (UBALL creds?)")
 
         # STAGE 3b — 4K mode: ALSO upload the raw masters into the same game
         # folder. Runs AFTER register so annotation availability is never
