@@ -42,7 +42,7 @@ GAMES = "basketball-games"
 
 SEG_SEC = int(os.getenv("HIGHLIGHT_SEGMENT_SEC", "4"))
 BUFFER_MIN = int(os.getenv("HIGHLIGHT_BUFFER_MIN", "10"))       # ring size (janitor)
-PRE_SEC = float(os.getenv("HIGHLIGHT_PRE_SEC", "12"))           # window before T
+PRE_SEC = float(os.getenv("HIGHLIGHT_PRE_SEC", "5"))            # window before T (5s pre-roll, per 2026-08-03 sync)
 POST_SEC = float(os.getenv("HIGHLIGHT_POST_SEC", "3"))          # window after T
 STALL_SEC = float(os.getenv("HIGHLIGHT_STALL_SEC", "25"))       # no fresh segment -> rotate angle
 ANGLES = [a.strip() for a in os.getenv("HIGHLIGHT_ANGLES", "FL,FR").split(",") if a.strip()]
