@@ -46,6 +46,11 @@ PRE_SEC = float(os.getenv("HIGHLIGHT_PRE_SEC", "12"))           # window before 
 POST_SEC = float(os.getenv("HIGHLIGHT_POST_SEC", "3"))          # window after T
 STALL_SEC = float(os.getenv("HIGHLIGHT_STALL_SEC", "25"))       # no fresh segment -> rotate angle
 ANGLES = [a.strip() for a in os.getenv("HIGHLIGHT_ANGLES", "FL,FR").split(",") if a.strip()]
+# Side-aware buffering (issue #4): a left- and a right-hoop buffer so a clip can
+# be cut from the camera that filmed the scoring team's basket. Each side fails
+# over within itself (FL→NL, FR→NR) so a stall never crosses to the wrong hoop.
+LEFT_ANGLES = [a.strip() for a in os.getenv("HIGHLIGHT_LEFT_ANGLES", "FL,NL").split(",") if a.strip()]
+RIGHT_ANGLES = [a.strip() for a in os.getenv("HIGHLIGHT_RIGHT_ANGLES", "FR,NR").split(",") if a.strip()]
 S3_BUCKET = os.getenv("UPLOAD_BUCKET", "uball-videos-production")
 S3_PREFIX = os.getenv("HIGHLIGHT_S3_PREFIX", "highlights")
 AWS_REGION = os.getenv("UPLOAD_REGION", "us-east-1")
@@ -71,10 +76,12 @@ class HighlightRecorder:
     older than BUFFER_MIN so the buffer never grows past a few hundred MB.
     """
 
-    def __init__(self, cfg):
+    def __init__(self, cfg, angles: Optional[List[str]] = None,
+                 side: Optional[str] = None):
         self.cfg = cfg
-        # Preferred-order camera rotation (default FL, then FR).
-        self._cams = [c for a in ANGLES for c in cfg.cameras if c.angle == a]
+        self.side = side  # "left"/"right"/None — segregates this buffer's dir
+        # Preferred-order camera rotation within this side (e.g. FL then NL).
+        self._cams = [c for a in (angles or ANGLES) for c in cfg.cameras if c.angle == a]
         self._lock = threading.Lock()
         self._proc: Optional[subprocess.Popen] = None
         self._cam_idx = 0
@@ -85,7 +92,9 @@ class HighlightRecorder:
     # ---- paths -------------------------------------------------------------
     def buf_dir(self, label: str) -> str:
         # Sibling of recordings/{label} — survives ingest's session rmtree.
-        return os.path.join(self.cfg.output_dir, "highlight_buf", label)
+        # Per-side subdir so the left/right buffers never conflate segments.
+        base = os.path.join(self.cfg.output_dir, "highlight_buf", label)
+        return os.path.join(base, self.side) if self.side else base
 
     # ---- lifecycle ---------------------------------------------------------
     def start(self, label: str) -> None:
@@ -94,9 +103,8 @@ class HighlightRecorder:
             return
         with self._lock:
             self._teardown_locked()
-            # Old buffers are dead weight once a new game starts.
-            shutil.rmtree(os.path.join(self.cfg.output_dir, "highlight_buf"),
-                          ignore_errors=True)
+            # Wipe only THIS side's buffer; HighlightBuffer clears stale labels.
+            shutil.rmtree(self.buf_dir(label), ignore_errors=True)
             self._label = label
             self._cam_idx = 0
             self._stop_evt = threading.Event()
@@ -209,6 +217,51 @@ class HighlightRecorder:
         except OSError:
             return []
         return sorted(found)
+
+
+class HighlightBuffer:
+    """A left- and a right-hoop HighlightRecorder, so a clip can be cut from the
+    camera that filmed the scoring team's basket (issue #4). This class just
+    keeps both sides buffered; the scoring side is resolved per-cut by the
+    caller (team + period + startingSideTeam1) and passed to ``recorder_for``.
+    """
+
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self.left = HighlightRecorder(cfg, angles=LEFT_ANGLES, side="left")
+        self.right = HighlightRecorder(cfg, angles=RIGHT_ANGLES, side="right")
+
+    def start(self, label: str) -> None:
+        # Clear all stale buffers (old labels/sides) once, then start both.
+        shutil.rmtree(os.path.join(self.cfg.output_dir, "highlight_buf"),
+                      ignore_errors=True)
+        self.left.start(label)
+        self.right.start(label)
+
+    def stop(self) -> None:
+        self.left.stop()
+        self.right.stop()
+
+    def recorder_for(self, side: Optional[str]) -> HighlightRecorder:
+        """The recorder for ``side`` ("left"/"right"; None → left), falling back
+        to the other side if the preferred one isn't producing segments — a clip
+        from the wrong angle beats no clip."""
+        want = self.right if side == "right" else self.left
+        if want.status()["active"]:
+            return want
+        other = self.left if want is self.right else self.right
+        if other.status()["active"]:
+            logger.warning("highlight %s side inactive — falling back to %s",
+                           want.side, other.side)
+            return other
+        return want
+
+    def active(self) -> bool:
+        return self.left.status()["active"] or self.right.status()["active"]
+
+    def status(self) -> Dict:
+        return {"active": self.active(),
+                "left": self.left.status(), "right": self.right.status()}
 
 
 # --------------------------------------------------------------------------- #

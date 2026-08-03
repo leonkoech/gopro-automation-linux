@@ -35,7 +35,8 @@ from firebase_service import get_firebase_service
 from agx_pipeline.recording import RecordingController, load_config
 from agx_pipeline.camrec_controller import CamrecController
 from agx_pipeline.shot_recording import AravisRecorder
-from agx_pipeline.highlight import HighlightRecorder, cut_highlight
+from agx_pipeline.highlight import HighlightBuffer, cut_highlight
+from agx_pipeline.side_attribution import scoring_hoop_side
 from agx_pipeline.sessions import AgxSessionTracker, get_active_game
 from agx_pipeline.notifier import CameraAlerter
 
@@ -53,9 +54,10 @@ CONTROLLER = CamrecController(CFG) if _BACKEND == "camrec" else RecordingControl
 # Shot-detection cameras (FLIR/GigE) record via a separate host-side Aravis
 # recorder, alongside whichever backend records the tracking (RTSP) angles.
 SHOT = AravisRecorder(CFG) if CFG.shot_cameras else None
-# Highlight sidecar: closed short segments of one watchable angle so a clip can
-# be cut mid-game (the raw masters have no moov until stop). Best-effort.
-HIGHLIGHT = (HighlightRecorder(CFG)
+# Highlight sidecar: closed short segments per hoop side so a clip can be cut
+# mid-game (raw masters have no moov until stop) from the camera that filmed the
+# scoring team's basket (issue #4). Best-effort.
+HIGHLIGHT = (HighlightBuffer(CFG)
              if os.getenv("HIGHLIGHT_RECORDER", "true").lower() in ("1", "true", "yes")
              else None)
 logger.info("recording backend: %s (shot cameras: %d)", _BACKEND, len(CFG.shot_cameras))
@@ -352,6 +354,31 @@ def _do_preview():
         return {"success": False, "error": str(e)[:300]}, 500
 
 
+_start_side_cache: Dict[str, str] = {}
+
+
+def _starting_side_team1(game_id: str) -> Optional[str]:
+    """startingSideTeam1 ('left'/'right') off the game doc — which hoop team1
+    attacks at tip-off. Set by the operator at check-in, so it may be unset at
+    the very first score; we cache only valid values and re-read until it
+    appears. Returns None when unknown (caller then falls back side-agnostically)."""
+    cached = _start_side_cache.get(game_id)
+    if cached in ("left", "right"):
+        return cached
+    if not FB:
+        return None
+    try:
+        snap = FB.db.collection("basketball-games").document(game_id).get()
+        val = (snap.to_dict() or {}).get("startingSideTeam1") if snap.exists else None
+    except Exception as e:  # noqa: BLE001
+        logger.warning("startingSideTeam1 read failed (%s): %s", game_id, e)
+        return None
+    if val in ("left", "right"):
+        _start_side_cache[game_id] = val
+        return val
+    return None
+
+
 def _do_highlight(cmd: Dict):
     """Queue a highlight-clip cut (docs/HIGHLIGHT_CLIP_INTEGRATION_PLAN.md
     Stage 1). ACKs immediately; the cut runs on a daemon thread and reports
@@ -370,16 +397,21 @@ def _do_highlight(cmd: Dict):
         t_epoch = datetime.fromisoformat(str(ts).replace("Z", "+00:00")).timestamp()
     except ValueError:
         return {"success": False, "error": f"unparseable ts: {ts}"}, 400
-    hl = HIGHLIGHT.status()
-    if not hl["active"]:
+    if not HIGHLIGHT.active():
         return {"success": False, "error": "highlight recorder not running"}, 409
+    # Route the cut to the camera on the scoring team's current hoop side
+    # (issue #4): team+period ride on the command, startingSideTeam1 is on the
+    # game doc. Unknown side → left recorder (the prior single-buffer default).
+    side = scoring_hoop_side(cmd.get("team"), cmd.get("period"),
+                             _starting_side_team1(game_id))
+    recorder = HIGHLIGHT.recorder_for(side)
     req = {"game_id": game_id, "log_id": str(log_id), "ts_epoch": t_epoch,
-           "label": label or hl.get("label"),
+           "label": label or recorder.status().get("label"),
            "pre": cmd.get("pre"), "post": cmd.get("post")}
-    threading.Thread(target=cut_highlight, args=(FB, CFG, HIGHLIGHT, req),
+    threading.Thread(target=cut_highlight, args=(FB, CFG, recorder, req),
                      name=f"highlight-{str(log_id)[:8]}", daemon=True).start()
     return {"success": True, "queued": True, "logId": str(log_id),
-            "angle": hl["angle"]}, 202
+            "side": side, "angle": recorder.angle()}, 202
 
 
 @app.route("/api/highlight", methods=["POST"])
