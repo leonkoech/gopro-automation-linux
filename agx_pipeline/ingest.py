@@ -388,6 +388,19 @@ def run_ingestion(fb, cfg, pipeline_id: str, state: Dict, stopped: Dict, tracker
                 run.angle_failed("register", angle, str(e)[:200])
         run.finish_stage("register")
 
+        # Register Plays — turn the scoreboard's score log into annotation cards
+        # (clip-ready, canonical labels, player pre-filled where the scorekeeper
+        # tapped a player, else left for the annotator) so a game opens already
+        # carded. Best-effort + idempotent: a failure never fails the ingestion
+        # run, and the converter no-ops if the game already has plays.
+        if client and game_uuid:
+            try:
+                from plays_sync import create_plays_from_firebase_logs
+                n_plays = create_plays_from_firebase_logs(client, game_uuid, game)
+                run.log("info", f"register plays: {n_plays} card(s) from scoreboard log")
+            except Exception as e:  # noqa: BLE001
+                run.log("error", f"register plays failed: {str(e)[:200]}")
+
         # STAGE 3b — 4K mode: ALSO upload the raw masters into the same game
         # folder. Runs AFTER register so annotation availability is never
         # delayed by the big files. Marketing clips get cut from these later;
