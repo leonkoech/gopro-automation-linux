@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import os
 from datetime import datetime
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from logging_service import get_logger
 
@@ -60,6 +60,7 @@ def create_plays_from_firebase_logs(
     client: Any,
     uball_game_id: str,
     firebase_game: Dict[str, Any],
+    summary: Optional[Dict[str, Any]] = None,
 ) -> int:
     """Create plays in the annotation tool from a Firebase game's logs.
 
@@ -87,6 +88,9 @@ def create_plays_from_firebase_logs(
             logger.info(
                 f"[PlaysSync] Game {uball_game_id} already has {len(existing)} plays — skipping."
             )
+            if summary is not None:
+                summary.update({"created": 0, "with_players": 0,
+                                "by_label": {}, "skipped_existing": True})
             return 0
     except Exception as exc:
         logger.warning(
@@ -104,6 +108,8 @@ def create_plays_from_firebase_logs(
 
     created = 0
     cv_skipped = 0
+    with_players = 0
+    by_label: Dict[str, int] = {}
     cv_enabled = _cv_plays_enabled()
     for log in logs:
         action = log.get("actionType", "")
@@ -218,6 +224,9 @@ def create_plays_from_firebase_logs(
         try:
             client.create_play(play_data)
             created += 1
+            by_label[classification] = by_label.get(classification, 0) + 1
+            if player_id:
+                with_players += 1
         except Exception as exc:
             logger.warning(
                 f"[PlaysSync] Failed to create play ({classification} at {ts:.1f}s) "
@@ -231,4 +240,7 @@ def create_plays_from_firebase_logs(
         )
     else:
         logger.info(f"[PlaysSync] Created {created}/{len(logs)} plays for game {uball_game_id}")
+    if summary is not None:
+        summary.update({"created": created, "with_players": with_players,
+                        "by_label": by_label, "skipped_existing": False})
     return created

@@ -22,7 +22,7 @@ Doc shape (id = pipeline_id):
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 COLLECTION = "ingestion-runs"
 STAGES = ("transcode", "upload", "register")
@@ -45,7 +45,7 @@ class IngestionRun:
         self.logs: List[Dict] = []
         totals = {"transcode": len(angles), "upload": len(angles),
                   "register": len([a for a in angles if a in self._reg])}
-        self.doc = {
+        self.doc: Dict[str, Any] = {
             "pipeline_id": pipeline_id,
             "jetson_id": meta.get("jetson_id"),
             "firebase_game_id": meta.get("firebase_game_id"),
@@ -62,6 +62,12 @@ class IngestionRun:
             "stages": {s: {"status": "pending", "done": 0, "total": totals[s], "error": None}
                        for s in STAGES},
             "angle_status": {a: {s: "pending" for s in STAGES} for a in angles},
+            # Post-register milestones (single ops, not per-angle) — shown as
+            # their own nodes on the ingestion card so operators see the full
+            # annotation handoff: the game created + the play cards seeded.
+            "register_game": {"status": "pending", "error": None},
+            "register_plays": {"status": "pending", "created": 0,
+                               "with_players": 0, "by_label": {}, "error": None},
             # shot-detection (FLIR) footage — outcome per SL/SR angle. Separate
             # from the transcode/upload/register stages, which shot footage skips.
             "shots": {},
@@ -103,6 +109,28 @@ class IngestionRun:
     def set_uball_game(self, uball_game_id: Optional[str]) -> None:
         self.doc["uball_game_id"] = uball_game_id
         self._write()
+
+    def set_register_game(self, ok: bool, error: Optional[str] = None) -> None:
+        """Milestone: the annotation game was (or wasn't) created. The UI builds
+        the click-through link from `uball_game_id`."""
+        self.doc["register_game"] = {"status": "done" if ok else "failed", "error": error}
+        self.log("info", "register game: done") if ok else self.log("error", f"register game: {error}")
+
+    def set_register_plays(self, created: int, with_players: int,
+                           by_label: Optional[Dict] = None, ok: bool = True,
+                           error: Optional[str] = None) -> None:
+        """Milestone: N annotation cards seeded from the scoreboard log,
+        `with_players` of them already player-attributed (the rest the annotator
+        tags). `by_label` feeds the node's hover breakdown."""
+        self.doc["register_plays"] = {
+            "status": "done" if ok else "failed",
+            "created": created, "with_players": with_players,
+            "by_label": by_label or {}, "error": error,
+        }
+        if ok:
+            self.log("info", f"register plays: {created} card(s), {with_players} with players")
+        else:
+            self.log("error", f"register plays: {error}")
 
     def set_s3(self, bucket: str, prefix: str) -> None:
         """Record the S3 folder this run uploads into (shown in the UI)."""
