@@ -16,7 +16,7 @@
     { "id": "42331", "ip": "10.1.10.76",  "angle": "NR", "cv_role": "tracking" }
   ],
   "shot_cameras": [
-    { "id": "24233344", "ip": "169.254.129.197", "angle": "SL", "basket_side": "L", "camera_name": "169.254.129.197", "serial": "BFS-PGE-04S2M-24233344" },
-    { "id": "25112169", "ip": "169.254.106.46",  "angle": "SR", "basket_side": "R", "camera_name": "169.254.106.46",  "serial": "BFS-PGE-04S2M-25112169" }
+    { "id": "24233344", "ip": "10.1.10.101", "angle": "SL", "basket_side": "L", "camera_name": "10.1.10.101", "serial": "BFS-PGE-04S2M-24233344" },
+    { "id": "25112169", "ip": "10.1.10.100", "angle": "SR", "basket_side": "R", "camera_name": "10.1.10.100", "serial": "BFS-PGE-04S2M-25112169" }
   ]
 }
