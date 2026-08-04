@@ -411,6 +411,21 @@ def run_ingestion(fb, cfg, pipeline_id: str, state: Dict, stopped: Dict, tracker
             run.set_register_plays(0, 0, ok=False,
                                    error="no annotation game (UBALL creds?)")
 
+        # Publish Game Highlight to Core — a whole-game reel assembled from the
+        # AGX highlight clips already cut + uploaded this game (references their
+        # CloudFront URLs; no re-upload, no annotation / Sync-to-UBall
+        # dependency). Lands in Core's admin publish queue behind the gate.
+        # Best-effort + idempotent (Core upserts on firebase_game_id); re-fetch
+        # the game first so clips that became ready late are included.
+        try:
+            from agx_pipeline.core_highlight import publish_core_highlight
+            fresh = (fb.get_game(firebase_game_id) if fb else None) or game
+            n_hl = publish_core_highlight(firebase_game_id, fresh, date)
+            if n_hl:
+                run.log("info", f"core game-highlight published: {n_hl} clips")
+        except Exception as e:  # noqa: BLE001 — never fail ingestion on this
+            run.log("error", f"core game-highlight publish failed: {str(e)[:200]}")
+
         # STAGE 3b — 4K mode: ALSO upload the raw masters into the same game
         # folder. Runs AFTER register so annotation availability is never
         # delayed by the big files. Marketing clips get cut from these later;
