@@ -364,16 +364,25 @@ def cut_highlight(fb, cfg, recorder: HighlightRecorder, req: Dict) -> None:
 
         # 3. 4K H.265 → 1080p H.264, IDR every 30 frames (ingest's HW path with
         #    SW fallback) so the trim below and browser seeking are accurate.
-        from agx_pipeline.ingest import _transcode_1080p
+        from agx_pipeline.ingest import _transcode_1080p, PRESET, CRF
         if not _transcode_1080p(merged, hd, cfg):
             raise RuntimeError("transcode failed")
 
-        # 4. Precise trim to [T-pre, T+post] (stream copy, snaps to ≤1s-early IDR).
+        # 4. Trim to [T-pre, T+post] with a RE-ENCODE (not stream copy). A copy
+        #    trim snapped to a ≤1s-early IDR and started mid-GOP, which played
+        #    back as stutter / frozen frames at the top of the clip. Re-encoding
+        #    the ~8s window emits a fresh keyframe at t=0 and forces a CONSTANT
+        #    30fps (-r 30 -vsync cfr), normalising the RTSP source's slightly
+        #    variable frame timing — smooth playback. Cheap: 1080p H.264,
+        #    veryfast, only ~8s (the heavy 4K decode/scale already ran on the GPU
+        #    in step 3).
         offset = max(0.0, t0 - picked[0][0])
-        if not _run(["ffmpeg", "-nostdin", "-y", "-ss", f"{offset:.2f}",
-                     "-i", hd, "-t", f"{pre + post:.2f}", "-c", "copy",
-                     "-movflags", "+faststart", final]):
-            raise RuntimeError("trim failed")
+        if not _run(["ffmpeg", "-nostdin", "-y",
+                     "-ss", f"{offset:.2f}", "-i", hd, "-t", f"{pre + post:.2f}",
+                     "-c:v", "libx264", "-preset", PRESET, "-crf", CRF,
+                     "-r", "30", "-vsync", "cfr", "-g", "30", "-sc_threshold", "0",
+                     "-movflags", "+faststart", "-an", final]):
+            raise RuntimeError("trim/re-encode failed")
         if not (os.path.isfile(final) and os.path.getsize(final) > 0):
             raise RuntimeError("empty clip")
 
