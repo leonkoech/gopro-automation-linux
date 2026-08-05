@@ -19,9 +19,11 @@ from typing import Optional
 LEFT = "left"
 RIGHT = "right"
 
-# Physical camera layout (cv_merge/team_attribution.py): FL/NL film the left
-# hoop, FR/NR the right hoop.
-HOOP_CAMERAS = {LEFT: ("FL", "NL"), RIGHT: ("FR", "NR")}
+# Physical camera layout at this facility (2026-08-05): despite the FL/FR naming,
+# FR/NR film the LEFT hoop and FL/NL the RIGHT hoop. Kept in sync with
+# highlight.LEFT_ANGLES / RIGHT_ANGLES (the recap cut path). Labels only — no
+# behavioural consumer today, but must match reality if one is added.
+HOOP_CAMERAS = {LEFT: ("FR", "NR"), RIGHT: ("FL", "NL")}
 
 
 def _opposite(side: str) -> str:
