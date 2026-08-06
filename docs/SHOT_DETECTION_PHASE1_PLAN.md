@@ -79,6 +79,15 @@ clip-first, verdict-second) — that's fine and expected.
   small `rims.json` config; add a one-time calibration note.
 - **Acceptance:** offline on the box, run `detect_made_shot` on a known window from a
   past game and reproduce that shot's `makemiss_v43/` verdict.
+- **✅ VALIDATED off-Orin (2026-08-07)** on real current-AGX SL footage (game
+  `736bd664`, a 45 s window) via `scratchpad/shotcheck/smoke.py` on a system-python
+  venv (torch 2.8 / ultralytics 8.4 / MPS): detector v3 loads + runs; **auto-rim
+  from the hoop = [354.5, 250.1] ≈ the canonical SL rim [355, 252]** (rig matches,
+  and hoop-detection is a viable auto-calibration); ball track builds; `logic.decide`
+  produces geometrically sensible verdicts (low ρ→MAKE, high ρ→MISS, aperture fires
+  on UNCERTAIN). Wiring de-risked. **Still pending:** a GT-accuracy % against
+  `makemiss_v43` (needs the 2026-07-20 source videos, not currently available) and
+  the Orin ML runtime for on-box deploy.
 
 ### P1.1 — Window extraction from the live recording  *(clock sync)*
 - Read `{label}_shot_timing.json`; map `T_trigger → frame N` per §2.
