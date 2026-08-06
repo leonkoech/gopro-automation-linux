@@ -38,6 +38,7 @@ from datetime import datetime, timezone
 from typing import Dict, Optional
 
 from uball_client import get_uball_client
+from email_notifier import GameNotification, send_games_ready_email
 from agx_pipeline.ingestion_status import IngestionRun
 
 logger = logging.getLogger("agx.ingest")
@@ -284,6 +285,36 @@ def _create_or_get_game(client, fb, game: Dict, firebase_game_id: str, date: str
     return client.create_game(payload)
 
 
+def _notify_annotators_ready(cfg, date: str, game: Dict, game_uuid: Optional[str]) -> None:
+    """Email the annotators that a game is ready to annotate (both angles up).
+
+    Best-effort and self-contained: SMTP creds + recipients come from env
+    (SMTP_*, ANNOTATOR_NOTIFY_EMAIL/CC); incomplete config disables it silently.
+    Never raises — a mail failure must not fail the ingestion run."""
+    try:
+        left = game.get("leftTeam", {}) or {}
+        right = game.get("rightTeam", {}) or {}
+        try:
+            game_number = int(game.get("gameNumber") or game.get("game_number") or 0)
+        except (TypeError, ValueError):
+            game_number = 0
+        notif = GameNotification(
+            game_number=game_number,
+            team_a_name=left.get("displayName") or left.get("name") or "Team 1",
+            team_b_name=right.get("displayName") or right.get("name") or "Team 2",
+            uball_game_id=game_uuid,
+        )
+        sent = send_games_ready_email(
+            jetson_name=getattr(cfg, "jetson_id", "") or "",
+            recording_date=date,
+            ready_games=[notif],
+            failed_games=[],
+        )
+        logger.info("annotator email notify: sent=%s game=%s", sent, game_uuid)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("annotator email notify failed: %s", e)
+
+
 def run_ingestion(fb, cfg, pipeline_id: str, state: Dict, stopped: Dict, tracker) -> None:
     """Transcode → upload 1080p → register → delete 4K, driving the ingestion-runs doc."""
     firebase_game_id = state["firebase_game_id"]
@@ -376,6 +407,7 @@ def run_ingestion(fb, cfg, pipeline_id: str, state: Dict, stopped: Dict, tracker
 
         # STAGE 3 — register FL/FR in the annotation tool
         run.start_stage("register")
+        registered_angles = []
         for angle in reg_angles:
             r = tr.get(angle, {})
             if not r.get("uploaded"):
@@ -388,9 +420,19 @@ def run_ingestion(fb, cfg, pipeline_id: str, state: Dict, stopped: Dict, tracker
                 client.register_video(game_id=game_uuid, s3_key=r["key"], angle=UBALL_ANGLE[angle],
                                       filename=r["filename"], duration=r["dur"], file_size=r["size"])
                 run.angle_done("register", angle)
+                registered_angles.append(angle)
             except Exception as e:  # noqa: BLE001
                 run.angle_failed("register", angle, str(e)[:200])
         run.finish_stage("register")
+
+        # The game is ready for annotation once EVERY registered angle (both FL +
+        # FR today) is in the annotation tool — i.e. both camera angles are up in
+        # the cloud. That is the moment to email the annotators. Best-effort:
+        # recipients + SMTP come from env, missing config disables it silently,
+        # and a mail failure never fails ingestion.
+        if reg_angles and len(registered_angles) == len(reg_angles):
+            run.log("info", "both angles registered — game ready; notifying annotators")
+            _notify_annotators_ready(cfg, date, game, game_uuid)
 
         # Register Plays — turn the scoreboard's score log into annotation cards
         # (clip-ready, canonical labels, player pre-filled where the scorekeeper
