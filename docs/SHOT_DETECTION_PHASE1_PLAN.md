@@ -96,6 +96,16 @@ clip-first, verdict-second) — that's fine and expected.
 - **Calibrate `pipeline_latency`** (gst settle before first frame): one-time, compare a
   known event's wall-clock to its frame. Expected small (<0.5 s), constant per rig.
 - **Acceptance:** for a past game, the mapped window contains the rim-crossing frame.
+- **✅ VALIDATED end-to-end (2026-08-07)** — `agx_pipeline/shot_detect/window.py`
+  (pure sidecar frame-lookup, unit-tested) + `validate.py` (`validate_shot`: side →
+  window → decode → detect → verdict). On real SL footage with a synthetic trigger
+  ~3 s after a known make (team=left → SL): **`cv_made=True`, `agrees=True`** (2 makes
+  in the look-back window), and the crossing *nearest the press* was a MISS (a later
+  rebound) — confirming the look-back + any-make-agreement design. Shipped `rims.json`
+  gave correct results. **⚠️ Latency ≈ 34 s** — dominated by `read_window` decoding
+  from frame 0 of a 3.4 GB file; the detector on the ~1,200-frame window is a small
+  fraction. **P1.2 optimization:** decode only the window (seek-free from the tail of
+  the live file), not from frame 0.
 
 ### P1.2 — Wire into the trigger (shadow, no TV yet)
 - In `service.py::_do_highlight` (or a sibling task), after cutting the clip, spawn a
