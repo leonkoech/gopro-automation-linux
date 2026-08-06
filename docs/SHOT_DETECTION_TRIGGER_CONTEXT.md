@@ -72,6 +72,17 @@ The **high-fps FLIR SL/SR** line (NOT the old oblique color fusion):
 - **FRESH_VALIDATION.md 0.951 is the OLD oblique color-fusion model** (far_v16 +
   net-motion) — a different lineage; don't conflate with high-fps.
 
+### Make/miss internals — the "99–100%" logic (verified 2026-08-07)
+
+The make/miss decision = **3 ingredients** (all in `uball_shot_detection_dual_fusion_v2/near_v0/highfps/`):
+1. **Detector v3** — `near_v0/weights/ball_yolo26s_gray_hifps_v3_best.pt` (grayscale, ~1000-frame trained). ✅ durable. (Newer than the v2 in older notes.)
+2. **v4.3 rim-event splitting** (`SPLIT_FIX`) — baked into `makemiss_v2.py` (line 53, default `"1"`). ✅ durable, default-on.
+3. **v4.2 aperture rule** (ρ ≤ 1.10 decides make/miss for UNCERTAIN crossings; color classifier retired) — the clean version lives in **`logic.py::decide()`** (`UNCERTAIN_RULE="aperture"`, `UNCERTAIN_RHO=1.10`, → `GEO_MAKE`/`GEO_MISS`). ⚠️ **partially durable.**
+
+**⚠️ Soft spot to fix before Stage-2 leans on it:** the deployed runner `makemiss_v2.py` still decides UNCERTAIN crossings with the **old color classifier** (`classifier_all17.pt`, its `finalize()` path) — the aperture-rule post-hoc transform that actually hit 100% on Game 2 lived in throwaway shell heredocs and is **gone**. The *rule* survives in `logic.py`; the *results* survive in `data/highfps_near_test/makemiss_v43{,_split}/`. So nothing is lost, but the runner isn't self-contained: run it fresh and you get classifier verdicts, not aperture ones.
+- **Fix (small, safe, ~2 lines):** bake the aperture rule into `makemiss_v2.py::finalize()` (use `info["rho"] <= 1.10` for UNCERTAIN instead of the classifier `prob >= 0.5`), OR route the runner through `logic.py::decide()`. Deterministically identical to the validated 100%/95% numbers; **retires the color classifier** (drops `classifier_all17.pt` + `phase2_train` from the runtime — one less thing to carry onto the AGX for Stage 2).
+- **For the Phase-1 build:** use **detector v3 + `logic.py::decide()` (aperture)** as the make/miss module — that IS the self-contained 99–100% logic. Do NOT wire in the classifier path.
+
 ### Where the model + docs live (repos OUTSIDE gopro-automation-linux)
 - Weights + detector training/annotation:
   `~/Cellstrat/GitHub_Repositories/Training_frameworks/Uball HighFPS Shot Detection/`
