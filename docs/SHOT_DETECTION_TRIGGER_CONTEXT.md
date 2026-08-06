@@ -111,11 +111,18 @@ window. The spotter is purely a **Phase 2** concern. → Build **Phase 1 first**
 
 ## 5. Open design issues / decisions (still to resolve)
 
-1. **Clock sync trigger↔FLIR footage @171fps** (the long pole). Scoreboard press is
-   a wall-clock; SL/SR footage needs a frame-accurate anchor. ⚠️ Handoff warns:
-   OpenCV seeks (`CAP_PROP_POS_FRAMES`) land ~13 frames early on this 171fps H.264 —
-   **sequential decode only**. **NEXT ACTION: read `agx_pipeline/shot_recording.py`**
-   to learn how FLIR frames are timestamped today.
+1. **Clock sync trigger↔FLIR footage — LARGELY SOLVED (verified 2026-08-07).**
+   `agx_pipeline/shot_recording.py` records the FLIR cams via GStreamer/Aravis with
+   **`do-timestamp=true`** and a **locked fps** (`SHOT_FPS=120`, integer multiple of
+   the 30fps court video), and writes a **timing sidecar** `{label}_shot_timing.json`
+   in the session dir with, per camera: `angle` (SL/SR), `id`, `path`, and a
+   wall-clock **`spawned_at`** anchor + `fps_lock`. So trigger→frame is a *lookup*,
+   not an estimate: `frame_N ≈ spawned_at + pipeline_latency + N/fps`; inverting,
+   for a trigger wall-clock T → `N ≈ (T − spawned_at − pipeline_latency) × fps`.
+   Remaining: (a) calibrate the small constant `pipeline_latency` (gst settle before
+   first frame), (b) **sequential decode only** to the target frame (OpenCV
+   `CAP_PROP_POS_FRAMES` seeks land ~13 frames early on this H.264 — a known trap).
+   The sidecar makes Phase 1 tractable; this is no longer the blocker.
 2. **Don't pick SL vs SR from the operator's team button** (re-inherits the y2Hwx
    error). Run the triggered side AND cross-check, or run both and let CV say which
    rim → CV validates the side/team.
