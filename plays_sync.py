@@ -7,7 +7,6 @@ callers can import it without introducing a circular dependency.
 
 from __future__ import annotations
 
-import os
 from datetime import datetime
 from typing import Any, Dict, Optional
 
@@ -21,7 +20,6 @@ logger = get_logger("gopro.plays_sync")
 # FG_MAKE and a free throw is FREE_THROW_MAKE. (The old 2PT_MAKE/FT_MAKE were
 # wrong and polluted the plays table; 4-pointers were dropped entirely.)
 _MAKE_BY_POINTS: Dict[int, str] = {1: "FREE_THROW_MAKE", 2: "FG_MAKE", 3: "3PT_MAKE", 4: "4PT_MAKE"}
-_MISS_BY_POINTS: Dict[int, str] = {1: "FREE_THROW_MISS", 2: "FG_MISS", 3: "3PT_MISS", 4: "4PT_MISS"}
 
 SHOT_LABELS: Dict[str, str] = {
     "FG_MAKE": "Field Goal Made", "FG_MISS": "Field Goal Missed",
@@ -38,22 +36,6 @@ try:
     from agx_pipeline.side_attribution import scoring_hoop_side as _scoring_hoop_side
 except Exception:  # pragma: no cover - legacy env without agx_pipeline
     _scoring_hoop_side = None
-
-
-def _cv_plays_enabled() -> bool:
-    """Feature gate for CV-emitted plays reaching the annotation tool.
-
-    V1 far-angle model under-detects shots in production (~3-12 detections per
-    game vs an expected 70+), driven by a training-distribution mismatch with
-    production cameras.  Until the far-angle retrain lands and validates on
-    real games, CV-emitted events (those with `payload.source == "cv"`) are
-    filtered out by `plays_sync` even if they end up in Firebase `logs[]`.
-
-    Set CV_PLAYS_ENABLED=true on the Jetson .env to allow CV-source events to
-    become Supabase plays.  Operator-entered scoreboard events are unaffected
-    by this flag and always create plays.
-    """
-    return os.getenv("CV_PLAYS_ENABLED", "false").strip().lower() in ("true", "1", "yes", "on")
 
 
 def create_plays_from_firebase_logs(
@@ -107,23 +89,12 @@ def create_plays_from_firebase_logs(
     right_name = firebase_game.get("rightTeam", {}).get("name", "Team 2")
 
     created = 0
-    cv_skipped = 0
     with_players = 0
     by_label: Dict[str, int] = {}
-    cv_enabled = _cv_plays_enabled()
     for log in logs:
         action = log.get("actionType", "")
         payload = log.get("payload", {}) or {}
         team_side = log.get("team")
-
-        # Feature gate: CV-source events (payload.source == "cv") are filtered
-        # out until CV_PLAYS_ENABLED=true.  Defense-in-depth with cv-merge's
-        # emit_target=cv_logs_staging shadow gate — even if CV events end up
-        # in logs[] somehow, plays_sync still won't promote them while the
-        # far-angle model is under-detecting on production cameras.
-        if payload.get("source") == "cv" and not cv_enabled:
-            cv_skipped += 1
-            continue
 
         # Player pre-fill: only a player tap (player_score_added) carries a
         # player; a team-button score (score_added) does not, and the annotator
@@ -137,13 +108,6 @@ def create_plays_from_firebase_logs(
             if action == "player_score_added":
                 player_id = payload.get("playerId")
                 player_name = payload.get("playerName")
-        elif action == "shot_missed":
-            # UBA-237: V1 missed shots via the CV pipeline. `payload.points`
-            # chooses the distance bucket (V1 always sets 2).
-            classification = _MISS_BY_POINTS.get(payload.get("points", 2))
-            if not classification:
-                logger.warning(f"[PlaysSync] shot_missed log has invalid points: {payload}")
-                continue
         elif action == "foul_added":
             classification = "FOUL"
         elif action == "game_started":
@@ -169,7 +133,6 @@ def create_plays_from_firebase_logs(
         start_ts = max(0.0, ts - 5.0)
         end_ts = ts + 3.0
 
-        is_cv = payload.get("source") == "cv"
         label = SHOT_LABELS.get(classification, classification)
 
         # Camera side (LEFT/RIGHT) the play happened at — flips at halftime.
@@ -182,17 +145,7 @@ def create_plays_from_firebase_logs(
             angle = hoop.upper() if hoop else None
 
         confidence = 1.0  # operator-entered scoreboard truth
-        if is_cv:
-            c = payload.get("confidence")
-            confidence = float(c) if c is not None else None
-
-        if is_cv:
-            # V1 CV is distance-blind — don't claim a specific shot value.
-            cv_word = ("Made" if classification.endswith("_MAKE")
-                       else "Missed" if classification.endswith("_MISS") else label)
-            note = f"{team_name} — {cv_word} (CV)"
-        else:
-            note = f"{player_name or team_name} — {label}"
+        note = f"{player_name or team_name} — {label}"
 
         play_data: Dict[str, Any] = {
             "game_id": uball_game_id,
@@ -202,8 +155,8 @@ def create_plays_from_firebase_logs(
             "start_timestamp": start_ts,
             "end_timestamp": end_ts,
             # source tags the card's origin so annotators can tell auto-seeded
-            # scoreboard plays ("firebase") from CV ("cv") and their own ("manual").
-            "source": "cv" if is_cv else "firebase",
+            # scoreboard plays ("firebase") from their own ("manual").
+            "source": "firebase",
             "events": [{
                 "label": classification,
                 "playerA": player_name, "playerAId": player_id,
@@ -233,13 +186,7 @@ def create_plays_from_firebase_logs(
                 f"for game {uball_game_id}: {exc}"
             )
 
-    if cv_skipped:
-        logger.info(
-            f"[PlaysSync] Created {created}/{len(logs)} plays for game {uball_game_id} "
-            f"(skipped {cv_skipped} CV-source event(s); CV_PLAYS_ENABLED={cv_enabled})"
-        )
-    else:
-        logger.info(f"[PlaysSync] Created {created}/{len(logs)} plays for game {uball_game_id}")
+    logger.info(f"[PlaysSync] Created {created}/{len(logs)} plays for game {uball_game_id}")
     if summary is not None:
         summary.update({"created": created, "with_players": with_players,
                         "by_label": by_label, "skipped_existing": False})
