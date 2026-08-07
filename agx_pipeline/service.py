@@ -402,14 +402,21 @@ def _do_highlight(cmd: Dict):
     # Route the cut to the camera on the scoring team's current hoop side
     # (issue #4): team+period ride on the command, startingSideTeam1 is on the
     # game doc. Unknown side → left recorder (the prior single-buffer default).
-    side = scoring_hoop_side(cmd.get("team"), cmd.get("period"),
-                             _starting_side_team1(game_id))
+    sst = _starting_side_team1(game_id)
+    side = scoring_hoop_side(cmd.get("team"), cmd.get("period"), sst)
     recorder = HIGHLIGHT.recorder_for(side)
     req = {"game_id": game_id, "log_id": str(log_id), "ts_epoch": t_epoch,
            "label": label or recorder.status().get("label"),
            "pre": cmd.get("pre"), "post": cmd.get("post")}
     threading.Thread(target=cut_highlight, args=(FB, CFG, recorder, req),
                      name=f"highlight-{str(log_id)[:8]}", daemon=True).start()
+    # Env-gated shadow shot-detection validation (SHOT_VALIDATION_ENABLED, default
+    # OFF). Best-effort on its own daemon thread — never affects the clip above.
+    try:
+        from agx_pipeline.shot_detect.node import validate_async
+        validate_async(FB, CFG, cmd, game_id, label, sst)
+    except Exception:  # noqa: BLE001
+        pass
     return {"success": True, "queued": True, "logId": str(log_id),
             "side": side, "angle": recorder.angle()}, 202
 

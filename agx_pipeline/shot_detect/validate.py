@@ -28,7 +28,7 @@ def shot_cam_for(team: Optional[str], period: Optional[str],
 def validate_shot(detector, sidecar: dict, video_for: Callable[[str], str],
                   trigger: dict, starting_side_team1: Optional[str],
                   rims: dict, n_before_s: float = 8.0, m_after_s: float = 2.0,
-                  pipeline_latency_s: float = 0.0) -> Optional[dict]:
+                  pipeline_latency_s: float = 0.0, reader=None) -> Optional[dict]:
     """Validate one score trigger against the high-fps footage.
 
     detector:  a ShotDetector (lazily holds torch/ultralytics).
@@ -39,6 +39,8 @@ def validate_shot(detector, sidecar: dict, video_for: Callable[[str], str],
     Returns a validation dict, or None when the side/anchor/footage is missing.
     """
     from agx_pipeline.shot_detect.detect import read_window
+    if reader is None:
+        reader = read_window
     t0 = time.time()
     cam, side = shot_cam_for(trigger.get("team"), trigger.get("period"),
                              starting_side_team1)
@@ -48,7 +50,7 @@ def validate_shot(detector, sidecar: dict, video_for: Callable[[str], str],
                        pipeline_latency_s)
     if win is None:
         return None
-    frames = read_window(video_for(cam), win["frame_lo"], win["frame_hi"])
+    frames = reader(video_for(cam), win["frame_lo"], win["frame_hi"], win["fps"])
     if not frames:
         return None
     rim = (rims or {}).get(cam)

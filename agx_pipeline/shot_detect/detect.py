@@ -99,12 +99,14 @@ class ShotDetector:
         }
 
 
-def read_window(video_path: str, frame_lo: int, frame_hi: int) -> List[np.ndarray]:
-    """Sequentially decode frames [frame_lo, frame_hi] from an mp4.
+def read_window(video_path: str, frame_lo: int, frame_hi: int,
+                fps: float = 120.0) -> List[np.ndarray]:
+    """Sequentially decode frames [frame_lo, frame_hi] from an mp4 (fps ignored;
+    kept for a uniform reader signature).
 
     NEVER uses CAP_PROP_POS_FRAMES — seeks land ~13 frames early on this 120fps
-    H.264 (documented trap). Decodes forward from 0 and keeps the window. For a
-    live recording, frame_hi should be a frame already flushed to disk.
+    H.264 (documented trap). Decodes forward from 0 and keeps the window. Correct
+    but O(frame_hi) — for real-time use read_window_fast.
     """
     import cv2
     cap = cv2.VideoCapture(video_path)
@@ -119,3 +121,29 @@ def read_window(video_path: str, frame_lo: int, frame_hi: int) -> List[np.ndarra
         i += 1
     cap.release()
     return frames
+
+
+def read_window_fast(video_path: str, frame_lo: int, frame_hi: int,
+                     fps: float = 120.0, margin_s: float = 1.0,
+                     size=(720, 540)) -> List[np.ndarray]:
+    """Decode ONLY the window via an ffmpeg keyframe seek — O(window), not
+    O(frame_hi). ffmpeg `-ss` before `-i` seeks to the nearest keyframe <= t_lo
+    then decodes forward, so returned frames span ~[frame_lo/fps - margin_s,
+    frame_hi/fps + margin_s]; the exact start is keyframe-approximate (fine —
+    the window has margin and make/miss is decided by ball geometry, not the
+    boundary). This is the real-time path; the shot cams are a fixed 720x540.
+    """
+    import subprocess
+
+    W, H = size
+    t_lo = max(0.0, frame_lo / fps - margin_s)
+    dur = (frame_hi - frame_lo) / fps + 2.0 * margin_s
+    cmd = ["ffmpeg", "-nostdin", "-loglevel", "error",
+           "-ss", f"{t_lo:.3f}", "-i", video_path, "-t", f"{dur:.3f}",
+           "-f", "rawvideo", "-pix_fmt", "bgr24", "-"]
+    proc = subprocess.run(cmd, capture_output=True)
+    raw = proc.stdout
+    stride = W * H * 3
+    n = len(raw) // stride
+    return [np.frombuffer(raw, np.uint8, count=stride, offset=i * stride).reshape(H, W, 3)
+            for i in range(n)]
