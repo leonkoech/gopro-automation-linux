@@ -136,14 +136,30 @@ def read_window_fast(video_path: str, frame_lo: int, frame_hi: int,
     import subprocess
 
     W, H = size
+    stride = W * H * 3
     t_lo = max(0.0, frame_lo / fps - margin_s)
     dur = (frame_hi - frame_lo) / fps + 2.0 * margin_s
     cmd = ["ffmpeg", "-nostdin", "-loglevel", "error",
            "-ss", f"{t_lo:.3f}", "-i", video_path, "-t", f"{dur:.3f}",
            "-f", "rawvideo", "-pix_fmt", "bgr24", "-"]
-    proc = subprocess.run(cmd, capture_output=True)
-    raw = proc.stdout
-    stride = W * H * 3
-    n = len(raw) // stride
-    return [np.frombuffer(raw, np.uint8, count=stride, offset=i * stride).reshape(H, W, 3)
-            for i in range(n)]
+    # Stream frame-by-frame off the pipe — never buffer the whole raw window in
+    # RAM (a 10s window is ~1.4GB). Only the decoded frame list is held.
+    frames: List[np.ndarray] = []
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                            bufsize=stride)
+    try:
+        while True:
+            buf = b""
+            while len(buf) < stride:                 # a pipe read may be partial
+                chunk = proc.stdout.read(stride - len(buf))
+                if not chunk:
+                    break
+                buf += chunk
+            if len(buf) < stride:
+                break
+            frames.append(np.frombuffer(buf, np.uint8).reshape(H, W, 3).copy())
+    finally:
+        if proc.stdout:
+            proc.stdout.close()
+        proc.wait()
+    return frames
