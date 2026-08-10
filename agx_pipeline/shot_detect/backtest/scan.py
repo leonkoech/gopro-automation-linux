@@ -76,11 +76,13 @@ def estimate_rim(model, video_path: str, device: str, fps: float = 120.0,
 def scan_track(model, video_path: str, device: str, stride: int = 4,
                conf: float = 0.20, imgsz: int = 1280, size=(720, 540),
                progress_every: int = 5000, limit_s: Optional[float] = None,
-               batch: int = 16) -> Tuple[List[tuple], int]:
+               batch: int = 16, keep_going=None) -> Tuple[List[tuple], int]:
     """Full-video coarse ball track: the highest-conf class-0 box every `stride`
     frames -> (true_idx, x, y, rb, conf). stride=4 ≈ 30fps spot pass on 120fps
     footage. `limit_s` caps the scan to the first N seconds (bounded smoke).
     Inference is batched on the GPU (`batch`) — identical results, faster.
+    `keep_going()` is polled during the scan — if it returns False (a game started
+    recording), the scan stops early so the GPU frees immediately.
     Returns (track, n_frames_scanned)."""
     track: List[tuple] = []
     scanned = 0
@@ -104,6 +106,8 @@ def scan_track(model, video_path: str, device: str, stride: int = 4,
         scanned += 1
         if len(buf_fr) >= batch:
             _flush()
+            if keep_going is not None and not keep_going():
+                break                       # a game started recording -> yield GPU
         if progress_every and scanned % progress_every == 0:
             print(f"  scan {video_path.split('/')[-1]}: {scanned} sampled, "
                   f"{len(track)} ball frames, last_idx={idx}", flush=True)
@@ -113,13 +117,15 @@ def scan_track(model, video_path: str, device: str, stride: int = 4,
 
 def scan_shots(model, video_path: str, device: str, fps: float,
                rim: Dict, stride: int = 4, limit_s: Optional[float] = None,
-               **kw) -> List[Dict]:
+               keep_going=None, **kw) -> List[Dict]:
     """Coarse automated shot list for a whole video: scan -> logic.decide.
 
     Each returned dict is a crossing verdict with `t_shot` (seconds on the shot-cam
     clock) and `made`. These are approximate (coarse track); run.confirm() refines
-    the ones we care about at full fps. `limit_s` caps the scan (bounded smoke)."""
-    track, scanned = scan_track(model, video_path, device, stride=stride, limit_s=limit_s, **{
+    the ones we care about at full fps. `limit_s` caps the scan (bounded smoke).
+    `keep_going()` aborts the scan early if a game starts recording."""
+    track, scanned = scan_track(model, video_path, device, stride=stride, limit_s=limit_s,
+                                keep_going=keep_going, **{
         k: v for k, v in kw.items() if k in {"conf", "imgsz", "size", "progress_every", "batch"}})
     G = logic.Geo.from_rim(rim, float(fps))
     shots = []

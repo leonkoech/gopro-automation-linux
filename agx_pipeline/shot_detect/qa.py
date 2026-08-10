@@ -221,10 +221,20 @@ def _process_job(fb, cfg, job: dict, is_gpu_free: Callable[[], bool]) -> None:
         work, video_for = _download_footage(cfg, job["s3_prefix"], job["date"], job["folder"])
         summary = _qa_core(fb, gid, job.get("sidecar") or {}, video_for,
                            job.get("starting_side"), keep_going=is_gpu_free)
+        # Phase 2 (dormant unless SHOT_AUTO_ENABLED): auto-detect ALL shots on the
+        # same footage while we have it + the GPU is free. Also abortable.
+        auto = None
+        try:
+            from agx_pipeline.shot_detect.autodetect import auto_enabled, run_autodetect
+            if auto_enabled() and summary is not None and not summary.get("aborted"):
+                auto = run_autodetect(fb, cfg, gid, job.get("sidecar") or {}, video_for,
+                                      job.get("starting_side"), keep_going=is_gpu_free)
+        except Exception as e:  # noqa: BLE001 — Phase-2 never breaks the QA worker
+            logger.warning("shot-auto step failed for %s: %s", gid, e)
         if summary is None:
             _ingestion_ms(fb, pid, status="skipped", n_scored=n_scored)
             _q(fb, gid, {"status": "skipped"})
-        elif summary.get("aborted"):
+        elif summary.get("aborted") or (auto is not None and auto.get("aborted")):
             # a game started recording — yield the GPU, retry this job later
             logger.info("shot-qa %s: aborted mid-job for recording — re-queued", gid)
             _q(fb, gid, {"status": "queued"})
