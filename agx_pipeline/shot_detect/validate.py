@@ -59,9 +59,10 @@ def validate_shot(detector, sidecar: dict, video_for: Callable[[str], str],
     if stream:
         from agx_pipeline.shot_detect.detect import iter_frames
         ss = win["frame_lo"] / fps
-        dur = (win["frame_hi"] - win["frame_lo"]) / fps
-        v = detector.detect_stream(iter_frames(video_for(cam), ss=ss, t=dur),
-                                   rim, fps=fps, target_idx=target)
+        nframes = int(win["frame_hi"] - win["frame_lo"]) + 1  # bound by COUNT, not -t
+        v = detector.detect_stream(
+            iter_frames(video_for(cam), ss=ss, max_frames=nframes),
+            rim, fps=fps, target_idx=target)
     else:
         from agx_pipeline.shot_detect.detect import read_window
         frames = (reader or read_window)(

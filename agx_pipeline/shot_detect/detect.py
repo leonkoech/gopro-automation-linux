@@ -52,6 +52,12 @@ class ShotDetector:
     def __init__(self, weight_path: str, device: Optional[str] = None):
         import torch
         from ultralytics import YOLO
+        # cuDNN autotune (benchmark=True, which ultralytics sets) re-probes
+        # algorithms on the first inference of EVERY new batch shape — minutes
+        # each on Jetson, and its workspace probing can OOM. We call predict with
+        # varying batch sizes (window vs partial batch), so disable it: use the
+        # default heuristic algorithm — fast + consistent first call, no re-tune.
+        torch.backends.cudnn.benchmark = False
         self.device = device or (
             "cuda" if torch.cuda.is_available()
             else "mps" if torch.backends.mps.is_available() else "cpu")
@@ -211,11 +217,19 @@ def read_window_fast(video_path: str, frame_lo: int, frame_hi: int,
 
 
 def iter_frames(video_path: str, size=(720, 540), select_stride: int = 1,
-                ss: Optional[float] = None, t: Optional[float] = None):
+                ss: Optional[float] = None, t: Optional[float] = None,
+                max_frames: Optional[int] = None):
     """Yield (index, BGR frame) streamed from ffmpeg — never materializes the
-    whole window (feed straight into ShotDetector.detect_stream). ss/t (seconds)
-    seek + limit; select_stride>1 emits only every Nth frame (the yielded index
-    is still the true frame number). The shot cams are a fixed 720x540 H.264."""
+    whole window (feed straight into ShotDetector.detect_stream). ss (seconds)
+    seeks; select_stride>1 emits only every Nth frame (the yielded index is still
+    the true frame number). The shot cams are a fixed 720x540 H.264.
+
+    Window length is bounded by `max_frames` (a COUNT), NOT `-t` (seconds): the
+    FLIR recordings carry a bogus timebase (r_frame_rate=12000) that makes
+    ffmpeg's `-t` fail to stop, so a "10s window" would otherwise decode the whole
+    file (-> detector over the whole game -> OOM). `-frames:v` + a hard Python cap
+    are timebase-independent. `t` is kept only as a soft hint for well-formed files.
+    """
     import subprocess
 
     W, H = size
@@ -224,10 +238,12 @@ def iter_frames(video_path: str, size=(720, 540), select_stride: int = 1,
     if ss is not None:
         cmd += ["-ss", f"{ss:.3f}"]
     cmd += ["-i", video_path]
-    if t is not None:
-        cmd += ["-t", f"{t:.3f}"]
     if select_stride > 1:
         cmd += ["-vf", f"select=not(mod(n\\,{select_stride}))", "-vsync", "0"]
+    if max_frames is not None:
+        cmd += ["-frames:v", str(int(max_frames))]   # robust: count, not duration
+    elif t is not None:
+        cmd += ["-t", f"{t:.3f}"]
     cmd += ["-f", "rawvideo", "-pix_fmt", "bgr24", "-"]
 
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
@@ -235,6 +251,8 @@ def iter_frames(video_path: str, size=(720, 540), select_stride: int = 1,
     rank = 0
     try:
         while True:
+            if max_frames is not None and rank >= max_frames:
+                break                                # hard cap (belt-and-suspenders)
             buf = b""
             while len(buf) < stride_bytes:
                 chunk = proc.stdout.read(stride_bytes - len(buf))
@@ -248,4 +266,8 @@ def iter_frames(video_path: str, size=(720, 540), select_stride: int = 1,
     finally:
         if proc.stdout:
             proc.stdout.close()
+        try:
+            proc.terminate()                         # stop ffmpeg if we broke early
+        except Exception:  # noqa: BLE001
+            pass
         proc.wait()
