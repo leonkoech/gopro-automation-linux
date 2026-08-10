@@ -22,6 +22,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import threading
 import time
 from datetime import datetime, timedelta, timezone
@@ -146,11 +147,16 @@ class LiveShotScorer:
                                           scored, shadow, game_id)
                     if hasattr(detector, "empty_cache"):
                         detector.empty_cache()
+                    try:
+                        os.unlink(path)   # processed once; the master is the durable copy
+                    except OSError:
+                        pass
                 self._write_shadow(game_id, shadow, n_seg, t0, status="running")
             except Exception as e:  # noqa: BLE001 — a bad segment must not kill the loop
                 logger.warning("shot-live segment pass failed: %s", e)
 
         self._write_shadow(game_id, shadow, n_seg, t0, status="stopped")
+        shutil.rmtree(seg_dir, ignore_errors=True)   # segments are ephemeral; master is durable
         logger.info("shot-live stopped game=%s segments=%d shots=%d",
                     game_id, n_seg, len(shadow))
 
