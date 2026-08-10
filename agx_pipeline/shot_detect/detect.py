@@ -239,7 +239,12 @@ def iter_frames(video_path: str, size=(720, 540), select_stride: int = 1,
         cmd += ["-ss", f"{ss:.3f}"]
     cmd += ["-i", video_path]
     if select_stride > 1:
-        cmd += ["-vf", f"select=not(mod(n\\,{select_stride}))", "-vsync", "0"]
+        cmd += ["-vf", f"select=not(mod(n\\,{select_stride}))"]
+    # -vsync 0 (passthrough) ALWAYS: without it, ffmpeg's default frame-rate sync
+    # drops/duplicates frames based on the FLIR files' bogus timebase, which over a
+    # longer decode-after-seek silently corrupts frames so the ball vanishes (window
+    # then finds an empty track). Passthrough emits each decoded frame as-is.
+    cmd += ["-vsync", "0"]
     if max_frames is not None:
         cmd += ["-frames:v", str(int(max_frames))]   # robust: count, not duration
     elif t is not None:
