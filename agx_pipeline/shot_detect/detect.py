@@ -28,7 +28,22 @@ from agx_pipeline.shot_detect import logic
 
 DET_CONF = float(os.environ.get("SHOT_DET_CONF", "0.20"))
 DET_IMGSZ = int(os.environ.get("SHOT_DET_IMGSZ", "1280"))
+DET_BATCH = int(os.environ.get("SHOT_DET_BATCH", "16"))  # GPU batch for inference
 BALL_CLASS = 0  # detector classes: 0 = Basketball, 1 = Basketball Hoop
+
+
+def _best_ball(boxes):
+    """Highest-conf Basketball box -> (cx, cy, rb, conf), or None."""
+    best = None
+    for b in boxes:
+        if int(b.cls.item()) != BALL_CLASS:
+            continue
+        x1, y1, x2, y2 = (float(v) for v in b.xyxy[0])
+        cfd = float(b.conf.item())
+        if best is None or cfd > best[3]:
+            best = ((x1 + x2) / 2.0, (y1 + y2) / 2.0,
+                    max(x2 - x1, y2 - y1) / 2.0, cfd)
+    return best
 
 
 class ShotDetector:
@@ -42,49 +57,54 @@ class ShotDetector:
             else "mps" if torch.backends.mps.is_available() else "cpu")
         self.model = YOLO(weight_path)
 
-    def _ball_track(self, frames) -> List[tuple]:
-        """Per frame, the highest-conf Basketball box -> (idx, x, y, rb, conf).
+    def _infer_batch(self, chunk, base_idx: int, track: List[tuple]) -> None:
+        """Run one GPU batch and append any ball boxes to `track` (idx=base+j)."""
+        results = self.model.predict(chunk, imgsz=DET_IMGSZ, conf=DET_CONF,
+                                     verbose=False, device=self.device)
+        for j, r in enumerate(results):
+            ball = _best_ball(r.boxes)
+            if ball is not None:
+                track.append((base_idx + j, *ball))
 
-        Mirrors makemiss_v2.py's per-frame selection: full-frame inference at
-        imgsz=1280, class 0 only, keep the top-confidence box; rb = half the
-        box's larger side. Frames with no ball are simply absent from the track.
-        """
+    def _ball_track(self, frames) -> List[tuple]:
+        """Ball track over a materialized frame list (batched GPU inference).
+
+        Per-image detection is independent of the batch, so results are identical
+        to per-frame calls, just faster. For large windows prefer _ball_track_stream
+        (this holds the whole list in RAM)."""
         track: List[tuple] = []
-        for idx, fr in enumerate(frames):
-            r = self.model.predict(fr, imgsz=DET_IMGSZ, conf=DET_CONF,
-                                   verbose=False, device=self.device)[0]
-            best = None
-            for b in r.boxes:
-                if int(b.cls.item()) != BALL_CLASS:
-                    continue
-                x1, y1, x2, y2 = (float(v) for v in b.xyxy[0])
-                cfd = float(b.conf.item())
-                if best is None or cfd > best[3]:
-                    best = ((x1 + x2) / 2.0, (y1 + y2) / 2.0,
-                            max(x2 - x1, y2 - y1) / 2.0, cfd)
-            if best is not None:
-                track.append((idx, *best))
+        for start in range(0, len(frames), DET_BATCH):
+            self._infer_batch(frames[start:start + DET_BATCH], start, track)
         return track
 
-    def detect(self, frames, rim, fps: float = 120.0,
-               target_idx: Optional[int] = None) -> Optional[dict]:
-        """Decide make/miss for a window. Returns None when no shot event.
+    def _ball_track_stream(self, frame_iter) -> tuple:
+        """Ball track from an iterator of (local_idx, BGR frame) — never holds
+        more than one batch in RAM (fixes the whole-window OOM). Returns
+        (track, n_frames_seen)."""
+        track: List[tuple] = []
+        buf: List = []
+        base = 0
+        n = 0
+        for _idx, fr in frame_iter:
+            buf.append(fr)
+            n += 1
+            if len(buf) >= DET_BATCH:
+                self._infer_batch(buf, base, track)
+                base += len(buf)
+                buf = []
+        if buf:
+            self._infer_batch(buf, base, track)
+        return track, n
 
-        frames:     list of BGR np.ndarray (the window, one per frame, in order).
-        rim:        {"center":[x,y], "semi_axes":[a,b], "angle":deg}.
-        fps:        frame rate of the window (SHOT_FPS, ~120).
-        target_idx: window frame nearest the trigger; picks the primary crossing
-                    when several are found. Defaults to the window middle.
-        """
+    def _decide(self, track: List[tuple], rim, fps: float,
+                target_idx: Optional[int], n_frames: int) -> Optional[dict]:
         G = logic.Geo.from_rim(rim, float(fps))
-        track = self._ball_track(frames)
         verdicts = [v for v in logic.decide(G, track) if "verdict" in v]
         if not verdicts:
             return None
         if target_idx is None:
-            target_idx = len(frames) // 2
-        primary = min(verdicts,
-                      key=lambda d: abs(d.get("t", 0.0) * fps - target_idx))
+            target_idx = n_frames // 2
+        primary = min(verdicts, key=lambda d: abs(d.get("t", 0.0) * fps - target_idx))
         return {
             "made": primary["verdict"] == "MAKE",
             "verdict": primary["verdict"],
@@ -97,6 +117,31 @@ class ShotDetector:
             "n_track": len(track),
             "all": verdicts,
         }
+
+    def detect(self, frames, rim, fps: float = 120.0,
+               target_idx: Optional[int] = None) -> Optional[dict]:
+        """Decide make/miss for a materialized window. Returns None when no shot
+        event. frames: list of BGR np.ndarray in order. target_idx: window frame
+        nearest the trigger (picks the primary crossing); defaults to the middle."""
+        track = self._ball_track(frames)
+        return self._decide(track, rim, fps, target_idx, len(frames))
+
+    def detect_stream(self, frame_iter, rim, fps: float = 120.0,
+                      target_idx: Optional[int] = None) -> Optional[dict]:
+        """Streaming make/miss over an iterator of (idx, BGR frame) — memory is
+        capped at one batch, so a full 120fps window never balloons RAM. Same
+        verdict as detect() on the same frames."""
+        track, n = self._ball_track_stream(frame_iter)
+        return self._decide(track, rim, fps, target_idx, n)
+
+    def empty_cache(self) -> None:
+        """Release torch's CUDA cache (unified memory on Tegra = system RAM)."""
+        try:
+            import torch
+            if str(self.device).startswith("cuda"):
+                torch.cuda.empty_cache()
+        except Exception:  # noqa: BLE001
+            pass
 
 
 def read_window(video_path: str, frame_lo: int, frame_hi: int,
@@ -163,3 +208,44 @@ def read_window_fast(video_path: str, frame_lo: int, frame_hi: int,
             proc.stdout.close()
         proc.wait()
     return frames
+
+
+def iter_frames(video_path: str, size=(720, 540), select_stride: int = 1,
+                ss: Optional[float] = None, t: Optional[float] = None):
+    """Yield (index, BGR frame) streamed from ffmpeg — never materializes the
+    whole window (feed straight into ShotDetector.detect_stream). ss/t (seconds)
+    seek + limit; select_stride>1 emits only every Nth frame (the yielded index
+    is still the true frame number). The shot cams are a fixed 720x540 H.264."""
+    import subprocess
+
+    W, H = size
+    stride_bytes = W * H * 3
+    cmd = ["ffmpeg", "-nostdin", "-loglevel", "error"]
+    if ss is not None:
+        cmd += ["-ss", f"{ss:.3f}"]
+    cmd += ["-i", video_path]
+    if t is not None:
+        cmd += ["-t", f"{t:.3f}"]
+    if select_stride > 1:
+        cmd += ["-vf", f"select=not(mod(n\\,{select_stride}))", "-vsync", "0"]
+    cmd += ["-f", "rawvideo", "-pix_fmt", "bgr24", "-"]
+
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                            stderr=subprocess.DEVNULL, bufsize=stride_bytes)
+    rank = 0
+    try:
+        while True:
+            buf = b""
+            while len(buf) < stride_bytes:
+                chunk = proc.stdout.read(stride_bytes - len(buf))
+                if not chunk:
+                    break
+                buf += chunk
+            if len(buf) < stride_bytes:
+                break
+            yield rank * select_stride, np.frombuffer(buf, np.uint8).reshape(H, W, 3).copy()
+            rank += 1
+    finally:
+        if proc.stdout:
+            proc.stdout.close()
+        proc.wait()

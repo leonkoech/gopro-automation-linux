@@ -28,7 +28,8 @@ def shot_cam_for(team: Optional[str], period: Optional[str],
 def validate_shot(detector, sidecar: dict, video_for: Callable[[str], str],
                   trigger: dict, starting_side_team1: Optional[str],
                   rims: dict, n_before_s: float = 8.0, m_after_s: float = 2.0,
-                  pipeline_latency_s: float = 0.0, reader=None) -> Optional[dict]:
+                  pipeline_latency_s: float = 0.0, reader=None,
+                  stream: bool = True) -> Optional[dict]:
     """Validate one score trigger against the high-fps footage.
 
     detector:  a ShotDetector (lazily holds torch/ultralytics).
@@ -36,11 +37,11 @@ def validate_shot(detector, sidecar: dict, video_for: Callable[[str], str],
     video_for: angle ("SL"/"SR") -> path to that cam's mp4 for this game.
     trigger:   {"ts": iso, "team": "left"|"right", "period": str}.
     rims:      {"SL": {...}, "SR": {...}} rim ellipses.
+    stream:    True (default) streams the window through the detector one batch at
+               a time (memory capped ~one batch — safe under load). False uses
+               `reader` (or read_window) to materialize the whole window (legacy).
     Returns a validation dict, or None when the side/anchor/footage is missing.
     """
-    from agx_pipeline.shot_detect.detect import read_window
-    if reader is None:
-        reader = read_window
     t0 = time.time()
     cam, side = shot_cam_for(trigger.get("team"), trigger.get("period"),
                              starting_side_team1)
@@ -50,14 +51,24 @@ def validate_shot(detector, sidecar: dict, video_for: Callable[[str], str],
                        pipeline_latency_s)
     if win is None:
         return None
-    frames = reader(video_for(cam), win["frame_lo"], win["frame_hi"], win["fps"])
-    if not frames:
-        return None
     rim = (rims or {}).get(cam)
     if rim is None:
         return None
+    fps = win["fps"]
     target = win["trigger_frame"] - win["frame_lo"]
-    v = detector.detect(frames, rim, fps=win["fps"], target_idx=target)
+    if stream:
+        from agx_pipeline.shot_detect.detect import iter_frames
+        ss = win["frame_lo"] / fps
+        dur = (win["frame_hi"] - win["frame_lo"]) / fps
+        v = detector.detect_stream(iter_frames(video_for(cam), ss=ss, t=dur),
+                                   rim, fps=fps, target_idx=target)
+    else:
+        from agx_pipeline.shot_detect.detect import read_window
+        frames = (reader or read_window)(
+            video_for(cam), win["frame_lo"], win["frame_hi"], fps)
+        if not frames:
+            return None
+        v = detector.detect(frames, rim, fps=fps, target_idx=target)
     crossings = (v or {}).get("all") or []
     n_make = sum(1 for c in crossings if c.get("verdict") == "MAKE")
     n_miss = sum(1 for c in crossings if c.get("verdict") == "MISS")

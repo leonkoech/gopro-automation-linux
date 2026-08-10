@@ -496,6 +496,16 @@ def run_ingestion(fb, cfg, pipeline_id: str, state: Dict, stopped: Dict, tracker
         # are moved out of the session dir first (survive the rmtree below).
         if shot_files:
             _ingest_shot(run, cfg, shot_files, date, folder)
+            # STAGE 4.5 — QA the scorekeeper's scored makes against the high-fps SL/SR
+            # footage (best-effort, gated by SHOT_QA_ENABLED). Runs here because the
+            # finalized SL/SR mp4s + the timing sidecar are still in the session dir,
+            # before the cleanup rmtree below. Must NEVER break ingestion.
+            try:
+                from agx_pipeline.shot_detect.qa import run_qa
+                run_qa(fb, cfg, firebase_game_id, label,
+                       game.get("startingSideTeam1"))
+            except Exception as e:  # noqa: BLE001
+                run.log("warn", f"shot-qa skipped: {str(e)[:150]}")
 
         # audio cross-correlation sync (FL<->FR) from the host-captured side-files;
         # runs before cleanup so the session-dir .m4a files still exist.
