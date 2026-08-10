@@ -71,6 +71,15 @@ _current: Dict[str, object] = {}   # {label, firebase_game_id, container, output
 _last_pipeline: Optional[Dict] = None
 _RELAY = None                      # Firebase relay (status heartbeat + command consumer)
 _auto_recorded: set = set()        # firebase_game_ids already auto-handled (avoid re-recording)
+_active_ingests = 0                # in-flight ingestion threads (GPU HW-transcode)
+
+
+def is_gpu_free() -> bool:
+    """True only when nothing is recording AND no ingestion is transcoding — the
+    gate the deferred shot-QA worker honors so it NEVER competes with a live game
+    for the GPU. Recording + live highlights always win."""
+    with _lock:
+        return not _current and _active_ingests == 0
 AUTO_RECORD = os.getenv("AUTO_RECORD_ON_GAME", "true").lower() in ("1", "true", "yes")
 AUTO_MAX_AGE_MIN = int(os.getenv("AUTO_RECORD_MAX_AGE_MIN", "45"))       # ignore games older than this
 AUTO_MAX_DURATION_MIN = int(os.getenv("AUTO_RECORD_MAX_DURATION_MIN", "180"))  # safety auto-stop
@@ -489,10 +498,16 @@ def _create_pipeline_run(pipeline_id: str, state: Dict, stopped: Dict) -> None:
 def _start_ingestion(pipeline_id: str, state: Dict, stopped: Dict) -> None:
     """Run P1 ingestion (transcode → upload → register), driving the ingestion-runs doc."""
     from agx_pipeline.ingest import run_ingestion
+    global _active_ingests
+    with _lock:
+        _active_ingests += 1                  # gate the shot-QA worker off the GPU
     try:
         run_ingestion(FB, CFG, pipeline_id, state, stopped, TRACKER)
     except Exception as e:  # noqa: BLE001
         logger.error("ingestion %s crashed: %s", pipeline_id, e)
+    finally:
+        with _lock:
+            _active_ingests = max(0, _active_ingests - 1)
 
 
 if __name__ == "__main__":
@@ -509,6 +524,10 @@ if __name__ == "__main__":
         if os.getenv("COURTSIDE_SCRAPE", "true").lower() in ("1", "true", "yes"):
             from agx_pipeline.courtside import start_refresh
             start_refresh(FB, int(os.getenv("COURTSIDE_REFRESH_MIN", "30")))
+        # Deferred shot-detection QA worker: drains the shot-qa-queue only while
+        # is_gpu_free() (nothing recording/ingesting). Dormant unless SHOT_QA_ENABLED.
+        from agx_pipeline.shot_detect.qa import start_worker as _start_qa_worker
+        _start_qa_worker(FB, CFG, is_gpu_free)
     logger.info("AGX service starting on :%d (firebase=%s, cameras=%d, relay=%s, auto_record=%s)",
                 port, FB is not None, len(CFG.cameras), _RELAY is not None, AUTO_RECORD)
     app.run(host="0.0.0.0", port=port)

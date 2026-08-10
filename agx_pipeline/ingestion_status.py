@@ -68,6 +68,11 @@ class IngestionRun:
             "register_game": {"status": "pending", "error": None},
             "register_plays": {"status": "pending", "created": 0,
                                "with_players": 0, "by_label": {}, "error": None},
+            # shot-detection QA (SHOT_QA_ENABLED): the scorekeeper's scored makes
+            # checked against the high-fps SL/SR CV; flags scored-but-CV-says-miss.
+            # Its own node on the card. status: pending|running|done|failed|disabled.
+            "shot_qa": {"status": "pending", "n_scored": 0, "n_confirmed": 0,
+                        "n_disagree": 0, "secs": None, "error": None},
             # shot-detection (FLIR) footage — outcome per SL/SR angle. Separate
             # from the transcode/upload/register stages, which shot footage skips.
             "shots": {},
@@ -131,6 +136,25 @@ class IngestionRun:
             self.log("info", f"register plays: {created} card(s), {with_players} with players")
         else:
             self.log("error", f"register plays: {error}")
+
+    def set_shot_qa(self, status: str, n_scored: int = 0, n_confirmed: int = 0,
+                    n_disagree: int = 0, secs: Optional[float] = None,
+                    error: Optional[str] = None) -> None:
+        """Milestone: post-game QA of the scorekeeper's scored makes against the
+        high-fps shot cams. status: running|done|failed|disabled|skipped. Shadow
+        only — never mutates scores/cards; `n_disagree` = scored-but-CV-says-miss."""
+        self.doc["shot_qa"] = {"status": status, "n_scored": n_scored,
+                               "n_confirmed": n_confirmed, "n_disagree": n_disagree,
+                               "secs": secs, "error": error}
+        if status == "done":
+            self.log("info", f"shot QA: {n_confirmed}/{n_scored} makes CV-confirmed, "
+                             f"{n_disagree} flagged for review")
+        elif status == "failed":
+            self.log("error", f"shot QA: {error}")
+        elif status == "running":
+            self.log("info", f"shot QA: validating {n_scored} scored makes…")
+        else:
+            self.log("info", f"shot QA: {status}")
 
     def set_s3(self, bucket: str, prefix: str) -> None:
         """Record the S3 folder this run uploads into (shown in the UI)."""

@@ -496,16 +496,18 @@ def run_ingestion(fb, cfg, pipeline_id: str, state: Dict, stopped: Dict, tracker
         # are moved out of the session dir first (survive the rmtree below).
         if shot_files:
             _ingest_shot(run, cfg, shot_files, date, folder)
-            # STAGE 4.5 — QA the scorekeeper's scored makes against the high-fps SL/SR
-            # footage (best-effort, gated by SHOT_QA_ENABLED). Runs here because the
-            # finalized SL/SR mp4s + the timing sidecar are still in the session dir,
-            # before the cleanup rmtree below. Must NEVER break ingestion.
+            # STAGE 4.5 — ENQUEUE the scorekeeper's scored makes for DEFERRED QA
+            # (gated by SHOT_QA_ENABLED). Reads the timing sidecar (still local) +
+            # writes a shot-qa-queue job; the GPU work runs later in the shot-qa
+            # worker, only when nothing is recording/ingesting. No GPU here, and it
+            # must NEVER block or break ingestion.
             try:
-                from agx_pipeline.shot_detect.qa import run_qa
-                run_qa(fb, cfg, firebase_game_id, label,
-                       game.get("startingSideTeam1"))
+                from agx_pipeline.shot_detect.qa import enqueue as qa_enqueue
+                qa_enqueue(fb, cfg, firebase_game_id, label,
+                           f"{LOCATION}/{date}/{folder}", date, folder,
+                           game.get("startingSideTeam1"), pipeline_id, run=run)
             except Exception as e:  # noqa: BLE001
-                run.log("warn", f"shot-qa skipped: {str(e)[:150]}")
+                run.log("warn", f"shot-qa enqueue skipped: {str(e)[:150]}")
 
         # audio cross-correlation sync (FL<->FR) from the host-captured side-files;
         # runs before cleanup so the session-dir .m4a files still exist.
