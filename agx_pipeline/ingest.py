@@ -34,6 +34,7 @@ import concurrent.futures
 import logging
 import os
 import subprocess
+import threading
 from datetime import datetime, timezone
 from typing import Dict, Optional
 
@@ -59,6 +60,32 @@ MAX_PARALLEL = int(os.getenv("TRANSCODE_PARALLEL", "2"))
 UBALL_ANGLE = {"FL": "LEFT", "FR": "RIGHT"}  # registered angles (annotation is 2-angle today)
 SETTINGS_COLLECTION = "agx-settings"
 TRANSCODE_DEFAULT = os.getenv("TRANSCODE_ENABLED", "true").lower() in ("1", "true", "yes")
+
+# GPU-transcode activity gate. `_active_ingests` (in service.py) is True for the
+# WHOLE ~30min ingest lifecycle (transcode + the long S3 upload + register); the
+# live shot loop only needs to yield during the ACTUAL GPU transcode (~7-15min),
+# so it can keep detecting through a prior game's upload window. This counter is
+# raised only around the transcode stage and read via is_transcoding().
+_transcode_lock = threading.Lock()
+_transcoding = 0
+
+
+def is_transcoding() -> bool:
+    """True while any ingestion is in its GPU transcode stage (NOT upload/register)."""
+    with _transcode_lock:
+        return _transcoding > 0
+
+
+def _transcode_begin() -> None:
+    global _transcoding
+    with _transcode_lock:
+        _transcoding += 1
+
+
+def _transcode_end() -> None:
+    global _transcoding
+    with _transcode_lock:
+        _transcoding = max(0, _transcoding - 1)
 
 
 def _transcode_enabled(fb, jetson_id: str) -> bool:
@@ -364,7 +391,9 @@ def run_ingestion(fb, cfg, pipeline_id: str, state: Dict, stopped: Dict, tracker
         run.set_s3(BUCKET, f"{LOCATION}/{date}/{folder}/")
         work_dir = os.path.join(cfg.output_dir, label, "1080p")
 
-        # STAGE 1 — transcode (parallel, bounded); mark each angle as it finishes
+        # STAGE 1 — transcode (parallel, bounded); mark each angle as it finishes.
+        # _transcode_begin/end flag the GPU-busy window so the live shot loop yields
+        # only for the transcode, not the whole (upload-heavy) ingest.
         run.start_stage("transcode")
 
         def _do(f: Dict) -> tuple:
@@ -377,13 +406,17 @@ def run_ingestion(fb, cfg, pipeline_id: str, state: Dict, stopped: Dict, tracker
                                 "size": os.path.getsize(dst) if ok and os.path.exists(dst) else 0,
                                 "uploaded": False}
         tr: Dict[str, Dict] = {}
-        with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_PARALLEL) as ex:
-            futs = [ex.submit(_do, f) for f in files]
-            for fut in concurrent.futures.as_completed(futs):
-                angle, r = fut.result()
-                tr[angle] = r
-                run.angle_done("transcode", angle) if r["ok"] else \
-                    run.angle_failed("transcode", angle, "ffmpeg failed")
+        _transcode_begin()
+        try:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_PARALLEL) as ex:
+                futs = [ex.submit(_do, f) for f in files]
+                for fut in concurrent.futures.as_completed(futs):
+                    angle, r = fut.result()
+                    tr[angle] = r
+                    run.angle_done("transcode", angle) if r["ok"] else \
+                        run.angle_failed("transcode", angle, "ffmpeg failed")
+        finally:
+            _transcode_end()
         run.finish_stage("transcode")
 
         # STAGE 2 — upload 1080p to S3

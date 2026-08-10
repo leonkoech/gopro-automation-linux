@@ -23,6 +23,7 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import threading
 import time
 from datetime import datetime, timedelta, timezone
@@ -40,6 +41,15 @@ _HOOP_SIDE = {"SL": "left", "SR": "right"}      # near-rim cam -> which hoop it 
 POLL_SEC = float(os.getenv("SHOT_LIVE_POLL_SEC", "2"))
 DEDUP_SEC = float(os.getenv("SHOT_LIVE_DEDUP_SEC", "2.5"))   # same-side makes within this window = one shot
 SHADOW_CAP = int(os.getenv("SHOT_LIVE_SHADOW_CAP", "500"))   # max shots kept in the shadow doc
+# Recall fixes (raise live recall from the fragmented-segment baseline):
+#  - WINDOW: scan [prev_segment + current] so a shot straddling a 4s boundary is
+#    whole in one window (dedup collapses the overlap). Off => per-segment only.
+#  - RIM accumulation: grow hoop samples across segments and take a running median
+#    (whole-game-quality rim) instead of trusting one 4s segment's estimate;
+#    canonical rims.json is the fallback until MIN samples are seen.
+SHOT_LIVE_WINDOW = os.getenv("SHOT_LIVE_WINDOW", "true").strip().lower() in ("1", "true", "yes", "on")
+RIM_MIN_SAMPLES = int(os.getenv("SHOT_LIVE_RIM_MIN", "8"))
+HOOP_ACC_CAP = int(os.getenv("SHOT_LIVE_HOOP_CAP", "5000"))
 
 
 def live_enabled() -> bool:
@@ -52,6 +62,13 @@ def autoscore_enabled() -> bool:
 
 def _utcnow_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _rm(path: str) -> None:
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
 
 
 class LiveShotScorer:
@@ -119,10 +136,11 @@ class LiveShotScorer:
 
         detector = None
         rims: Dict = {}
-        rim_cache: Dict[str, Optional[Dict]] = {}
+        hoop_acc: Dict[str, Dict] = {}   # angle -> {cx,cy,w,h} accumulated hoop samples (rim)
+        prev_seg: Dict[str, tuple] = {}  # angle -> (idx, path) kept for the sliding window
         processed: set = set()
-        scored: List[Dict] = []         # {wallclock_epoch, side} — dedup ledger
-        shadow: List[Dict] = []         # detections for the shadow field
+        scored: List[Dict] = []          # {wallclock_epoch, side} — dedup ledger
+        shadow: List[Dict] = []          # detections for the shadow field
         n_seg = 0
         t0 = time.time()
         self._write_shadow(game_id, shadow, n_seg, t0, status="running")
@@ -141,17 +159,16 @@ class LiveShotScorer:
                         break
                     processed.add(os.path.basename(path))
                     n_seg += 1
-                    self._process_segment(scan, detector, rims, rim_cache, path,
-                                          idx, angle, fps, imgsz, stride,
-                                          spawned.get(angle), starting_side,
-                                          scored, shadow, game_id)
+                    self._process_window(scan, detector, rims, path, idx, angle,
+                                         fps, imgsz, stride, spawned.get(angle),
+                                         starting_side, scored, shadow, game_id,
+                                         prev_seg, hoop_acc)
                     if hasattr(detector, "empty_cache"):
                         detector.empty_cache()
-                    try:
-                        os.unlink(path)   # processed once; the master is the durable copy
-                    except OSError:
-                        pass
-                self._write_shadow(game_id, shadow, n_seg, t0, status="running")
+                    # publish after EACH segment so a fresh make reaches the shadow
+                    # (and, in Phase C, the scoreboard) within a segment of the
+                    # shot — not in a burst after a whole backlog drains.
+                    self._write_shadow(game_id, shadow, n_seg, t0, status="running")
             except Exception as e:  # noqa: BLE001 — a bad segment must not kill the loop
                 logger.warning("shot-live segment pass failed: %s", e)
 
@@ -160,40 +177,97 @@ class LiveShotScorer:
         logger.info("shot-live stopped game=%s segments=%d shots=%d",
                     game_id, n_seg, len(shadow))
 
-    # ---- per-segment ------------------------------------------------------- #
-    def _process_segment(self, scan, detector, rims, rim_cache, path, idx, angle,
-                         fps, imgsz, stride, spawned_iso, starting_side,
-                         scored, shadow, game_id) -> None:
-        if angle not in rim_cache:
-            rim_cache[angle] = (
-                scan.estimate_rim(detector.model, path, detector.device,
-                                  fps=fps, imgsz=imgsz)
-                or (rims or {}).get(angle))
-        rim = rim_cache[angle]
+    # ---- per-window (recall fixes: sliding window + rim accumulation) ------- #
+    def _process_window(self, scan, detector, rims, path, idx, angle, fps, imgsz,
+                        stride, spawned_iso, starting_side, scored, shadow, game_id,
+                        prev_seg, hoop_acc) -> None:
+        from agx_pipeline.shot_detect import logic
+        # 1. Build the scan window. With SHOT_LIVE_WINDOW, prepend the previous
+        #    segment so a shot straddling the 4s boundary is whole in one window;
+        #    else scan just this segment. `base_idx` = footage-offset of the
+        #    window's first segment.
+        prev = prev_seg.get(angle)
+        window, base_idx, tmp = path, idx, None
+        if SHOT_LIVE_WINDOW and prev and os.path.exists(prev[1]):
+            tmp = self._concat(prev[1], path)
+            if tmp:
+                window, base_idx = tmp, prev[0]
+        # 2. One pass: coarse ball track + hoop samples.
+        try:
+            track, hoops = scan.scan_ball_and_hoops(
+                detector.model, window, detector.device, stride=stride, imgsz=imgsz)
+        finally:
+            if tmp:
+                _rm(tmp)
+        # 3. Accumulate hoop samples -> running-median rim (whole-game quality),
+        #    canonical rims.json until we have enough.
+        acc = hoop_acc.setdefault(angle, {"cx": [], "cy": [], "w": [], "h": []})
+        for (cx, cy, w, h) in hoops:
+            acc["cx"].append(cx); acc["cy"].append(cy); acc["w"].append(w); acc["h"].append(h)
+        if len(acc["cx"]) > HOOP_ACC_CAP:
+            for k in acc:
+                acc[k] = acc[k][-HOOP_ACC_CAP:]
+        rim = None
+        if len(acc["cx"]) >= RIM_MIN_SAMPLES:
+            rim = scan.rim_from_hoops(acc["cx"], acc["cy"], acc["w"], acc["h"])
         if rim is None:
+            rim = (rims or {}).get(angle)
+        if rim is None:
+            self._advance_prev(prev_seg, angle, idx, path)
             return
-        found = scan.scan_shots(detector.model, path, detector.device, fps, rim,
-                                stride=stride, imgsz=imgsz, progress_every=0)
-        # Each segment's footage starts ~idx*SHOT_SEGMENT_SEC after the camera
-        # spawned; t_shot is seconds into THIS segment. (±~1.5s spawn/negotiation
-        # slack — fine for a ~15-25s-latency live scoreboard.)
-        seg_base = idx * SHOT_SEGMENT_SEC
+        # 4. Decide crossings on the (windowed) track; map window-relative t to
+        #    footage seconds via the window's first-segment offset.
+        G = logic.Geo.from_rim(rim, float(fps))
+        window_base = base_idx * SHOT_SEGMENT_SEC
         side = _HOOP_SIDE.get(angle)
-        for s in found:
-            wc_iso = self._wallclock(spawned_iso, seg_base + s["t_shot"])
+        for v in logic.decide(G, track):
+            if "verdict" not in v:
+                continue
+            t_shot = float(v.get("t", 0.0))
+            wc_iso = self._wallclock(spawned_iso, window_base + t_shot)
             wc_epoch = self._epoch(wc_iso)
             if self._is_dup(scored, wc_epoch, side):
-                continue
+                continue   # overlap between consecutive windows -> one shot
             scored.append({"wc": wc_epoch, "side": side})
-            rec = {"cam": angle, "side": side, "seg": idx,
-                   "t_shot": s["t_shot"], "made": s["made"], "verdict": s["verdict"],
-                   "rho": s.get("rho"), "wallclock": wc_iso,
-                   "detected_at": _utcnow_iso()}
+            rec = {"cam": angle, "side": side, "seg": base_idx,
+                   "t_shot": round(t_shot, 3), "made": v["verdict"] == "MAKE",
+                   "verdict": v["verdict"], "rho": v.get("rho"),
+                   "wallclock": wc_iso, "detected_at": _utcnow_iso()}
             shadow.append(rec)
-            logger.info("shot-live %s %s seg=%d t=%.2f -> %s", game_id, angle, idx,
-                        s["t_shot"], s["verdict"])
-            if s["made"] and autoscore_enabled():
+            logger.info("shot-live %s %s win@%d t=%.2f -> %s", game_id, angle,
+                        base_idx, t_shot, v["verdict"])
+            if rec["made"] and autoscore_enabled():
                 self._maybe_autoscore(game_id, rec, starting_side)
+        self._advance_prev(prev_seg, angle, idx, path)
+
+    def _concat(self, a: str, b: str) -> Optional[str]:
+        """Stream-copy concat [a, b] -> temp mp4 for one scan window. None on error
+        (caller falls back to scanning the current segment alone)."""
+        tmp = a[:-4] + "_win.mp4"
+        lst = a + ".txt"
+        try:
+            with open(lst, "w") as f:
+                f.write("file '%s'\nfile '%s'\n" % (a, b))
+            subprocess.run(["ffmpeg", "-nostdin", "-loglevel", "error", "-y",
+                            "-f", "concat", "-safe", "0", "-i", lst, "-c", "copy",
+                            "-map", "0:v", tmp], check=True, stdin=subprocess.DEVNULL,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return tmp
+        except Exception:  # noqa: BLE001
+            _rm(tmp)
+            return None
+        finally:
+            _rm(lst)
+
+    @staticmethod
+    def _advance_prev(prev_seg: Dict, angle: str, idx: int, path: str) -> None:
+        """Delete the segment that just aged out of the window (fully consumed —
+        it led one window; the master is the durable copy) and keep the current
+        one as the next window's lead."""
+        old = prev_seg.get(angle)
+        if old and old[1] != path:
+            _rm(old[1])
+        prev_seg[angle] = (idx, path)
 
     # ---- Phase C seam (NOT yet wired to the visible scoreboard) ------------- #
     def _maybe_autoscore(self, game_id: str, shot: Dict, starting_side: Optional[str]) -> None:

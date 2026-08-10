@@ -83,18 +83,24 @@ def is_gpu_free() -> bool:
         return not _current and _active_ingests == 0
 
 
-def ingest_busy() -> bool:
-    """True while an ingestion HW-transcode is in flight. The LIVE shot loop
-    pauses on this — it runs DURING recording (that's the point) but must still
-    step aside for the heavier transcode. Recording (NVENC) is unaffected either way."""
-    with _lock:
-        return _active_ingests > 0
+def transcode_active() -> bool:
+    """True only while an ingestion is in its GPU TRANSCODE stage — NOT its long
+    upload/register phases. The LIVE shot loop pauses on this so it yields the GPU
+    for the actual transcode but keeps detecting through a prior game's upload
+    window (ingests run ~30min but only ~7-15min is transcode; games are ~10min
+    apart, so the coarse whole-ingest gate would starve games 2/3 of live data).
+    It runs DURING recording by design; recording (NVENC) is unaffected regardless."""
+    try:
+        from agx_pipeline.ingest import is_transcoding
+        return is_transcoding()
+    except Exception:  # noqa: BLE001
+        return False
 
 
 # Real-time shot detector over the live SL/SR segments (shadow-first, off unless
 # SHOT_LIVE_ENABLED). Reads only the segments produced when SHOT_SEGMENT_ENABLED
-# is on; pauses on ingest_busy so it never competes with a transcode.
-LIVE = (LiveShotScorer(CFG, FB, should_pause=ingest_busy)
+# is on; pauses on transcode_active so it never competes with a live transcode.
+LIVE = (LiveShotScorer(CFG, FB, should_pause=transcode_active)
         if SHOT and live_enabled() else None)
 AUTO_RECORD = os.getenv("AUTO_RECORD_ON_GAME", "true").lower() in ("1", "true", "yes")
 AUTO_MAX_AGE_MIN = int(os.getenv("AUTO_RECORD_MAX_AGE_MIN", "45"))       # ignore games older than this

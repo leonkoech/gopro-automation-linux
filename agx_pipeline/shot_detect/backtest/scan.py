@@ -42,6 +42,66 @@ def _best_box(boxes, want_cls: int):
     return best
 
 
+def rim_from_hoops(cxs, cys, ws, hs) -> Optional[Dict]:
+    """Robust rim ellipse (rims.json-shaped) from accumulated hoop-box samples:
+    component-wise median center + semi-axes, angle fixed ~90 (level cams). None
+    if no samples. Shared by estimate_rim (batch, whole-game) and the LIVE rim
+    accumulator (which grows these lists segment by segment)."""
+    if not cxs:
+        return None
+    cx, cy = float(np.median(cxs)), float(np.median(cys))
+    a = float(np.median(ws)) / 2.0 if ws else 100.0
+    b = float(np.median(hs)) / 2.0 if hs else 100.0
+    return {"center": [round(cx, 1), round(cy, 1)],
+            "semi_axes": [round(a, 1), round(b, 1)], "angle": 90.0,
+            "n_hoop_samples": len(cxs)}
+
+
+def scan_ball_and_hoops(model, video_path: str, device: str, stride: int = 4,
+                        conf: float = 0.20, imgsz: int = 640, size=(720, 540),
+                        batch: int = 16, keep_going=None,
+                        limit_s: Optional[float] = None) -> Tuple[List[tuple], List[tuple]]:
+    """One streaming pass returning BOTH the coarse ball track (for logic.decide)
+    AND the per-frame best hoop box (cx, cy, w, h) samples. The live path needs
+    both from one inference so it can accumulate a whole-game-quality rim over
+    segments instead of trusting a single 4s segment's estimate."""
+    track: List[tuple] = []
+    hoops: List[tuple] = []
+    buf_idx: List[int] = []
+    buf_fr: List[np.ndarray] = []
+
+    def _flush():
+        if not buf_fr:
+            return
+        results = model.predict(buf_fr, imgsz=imgsz, conf=conf, verbose=False, device=device)
+        for j, r in enumerate(results):
+            ball = _best_box(r.boxes, BALL_CLASS)
+            if ball is not None:
+                track.append((buf_idx[j], *ball))
+            best = None
+            for b in r.boxes:
+                if int(b.cls.item()) != HOOP_CLASS:
+                    continue
+                x1, y1, x2, y2 = (float(v) for v in b.xyxy[0])
+                cfd = float(b.conf.item())
+                if best is None or cfd > best[4]:
+                    best = ((x1 + x2) / 2.0, (y1 + y2) / 2.0, x2 - x1, y2 - y1, cfd)
+            if best is not None:
+                hoops.append(best[:4])
+        buf_idx.clear()
+        buf_fr.clear()
+
+    for idx, fr in iter_frames(video_path, size=size, select_stride=stride, t=limit_s):
+        buf_idx.append(idx)
+        buf_fr.append(fr)
+        if len(buf_fr) >= batch:
+            _flush()
+            if keep_going is not None and not keep_going():
+                break
+    _flush()
+    return track, hoops
+
+
 def estimate_rim(model, video_path: str, device: str, fps: float = 120.0,
                  sample_stride: int = 240, max_samples: int = 200,
                  conf: float = 0.20, imgsz: int = 1280, size=(720, 540)) -> Optional[Dict]:
@@ -63,14 +123,7 @@ def estimate_rim(model, video_path: str, device: str, fps: float = 120.0,
                 ws.append(x2 - x1); hs.append(y2 - y1)
         if len(cxs) >= max_samples:
             break
-    if not cxs:
-        return None
-    cx, cy = float(np.median(cxs)), float(np.median(cys))
-    a = float(np.median(ws)) / 2.0 if ws else 100.0
-    b = float(np.median(hs)) / 2.0 if hs else 100.0
-    return {"center": [round(cx, 1), round(cy, 1)],
-            "semi_axes": [round(a, 1), round(b, 1)], "angle": 90.0,
-            "n_hoop_samples": len(cxs)}
+    return rim_from_hoops(cxs, cys, ws, hs)
 
 
 def scan_track(model, video_path: str, device: str, stride: int = 4,
