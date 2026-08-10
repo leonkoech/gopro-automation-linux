@@ -266,7 +266,9 @@ class LiveShotScorer:
             "updated_at": _utcnow_iso(),
         }
         try:
-            self.fb.db.collection("basketball-games").document(game_id).update(
-                {"shot_live": doc})
+            # set(merge=True), not update(): create-or-merge so a not-yet-created
+            # game doc never throws NOT_FOUND; only the shot_live key is replaced.
+            self.fb.db.collection("basketball-games").document(game_id).set(
+                {"shot_live": doc}, merge=True)
         except Exception as e:  # noqa: BLE001
             logger.warning("shot-live shadow write failed (%s): %s", game_id, e)

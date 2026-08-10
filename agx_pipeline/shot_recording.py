@@ -145,8 +145,10 @@ class AravisRecorder:
         seg_pattern = os.path.join(seg_dir, f"seg_%05d_{cam.angle}.mp4")
         return [
             "!", "tee", "name=shottee",
-            # master branch — identical output to the non-segmented pipeline
-            "shottee.", *master,
+            # master branch — a queue (canonical tee pattern: every branch needs
+            # one, else the tee src can't link the mux request pad) then the SAME
+            # mux+file, so the master stays identical to the non-segmented output.
+            "shottee.", "!", "queue", *master,
             # live-segment branch — leaky so it can't back-pressure the master
             "shottee.", "!", "queue", "leaky=downstream",
             "max-size-buffers=400", "max-size-time=0", "max-size-bytes=0",
