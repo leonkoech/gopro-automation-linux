@@ -67,6 +67,7 @@ def run_autodetect(fb, cfg, game_id: str, sidecar: dict,
         fps = float((sidecar or {}).get("fps_lock") or 119.9)
         imgsz = int(os.getenv("SHOT_DET_IMGSZ", "640"))
         stride = int(os.getenv("SHOT_AUTO_STRIDE", "4"))     # ~30fps spot pass
+        limit_s = float(os.getenv("SHOT_AUTO_LIMIT_S", "0")) or None  # cap scan length
         t0 = time.time()
         shots: List[dict] = []
         for cam in ("SL", "SR"):
@@ -81,8 +82,8 @@ def run_autodetect(fb, cfg, game_id: str, sidecar: dict,
             if rim is None:
                 continue
             found = scan.scan_shots(detector.model, video, detector.device, fps, rim,
-                                    stride=stride, imgsz=imgsz, progress_every=0,
-                                    keep_going=keep_going)
+                                    stride=stride, imgsz=imgsz, limit_s=limit_s,
+                                    progress_every=0, keep_going=keep_going)
             if keep_going is not None and not keep_going():
                 return {"aborted": True}     # aborted mid-scan -> re-queue
             spawned = _spawned_at(sidecar, cam)

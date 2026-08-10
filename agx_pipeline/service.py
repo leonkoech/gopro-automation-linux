@@ -36,6 +36,7 @@ from agx_pipeline.recording import RecordingController, load_config
 from agx_pipeline.camrec_controller import CamrecController
 from agx_pipeline.shot_recording import AravisRecorder
 from agx_pipeline.highlight import HighlightBuffer, cut_highlight
+from agx_pipeline.shot_detect.live import LiveShotScorer, live_enabled
 from agx_pipeline.side_attribution import scoring_hoop_side
 from agx_pipeline.sessions import AgxSessionTracker, get_active_game
 from agx_pipeline.notifier import CameraAlerter
@@ -80,6 +81,21 @@ def is_gpu_free() -> bool:
     for the GPU. Recording + live highlights always win."""
     with _lock:
         return not _current and _active_ingests == 0
+
+
+def ingest_busy() -> bool:
+    """True while an ingestion HW-transcode is in flight. The LIVE shot loop
+    pauses on this — it runs DURING recording (that's the point) but must still
+    step aside for the heavier transcode. Recording (NVENC) is unaffected either way."""
+    with _lock:
+        return _active_ingests > 0
+
+
+# Real-time shot detector over the live SL/SR segments (shadow-first, off unless
+# SHOT_LIVE_ENABLED). Reads only the segments produced when SHOT_SEGMENT_ENABLED
+# is on; pauses on ingest_busy so it never competes with a transcode.
+LIVE = (LiveShotScorer(CFG, FB, should_pause=ingest_busy)
+        if SHOT and live_enabled() else None)
 AUTO_RECORD = os.getenv("AUTO_RECORD_ON_GAME", "true").lower() in ("1", "true", "yes")
 AUTO_MAX_AGE_MIN = int(os.getenv("AUTO_RECORD_MAX_AGE_MIN", "45"))       # ignore games older than this
 AUTO_MAX_DURATION_MIN = int(os.getenv("AUTO_RECORD_MAX_DURATION_MIN", "180"))  # safety auto-stop
@@ -163,6 +179,7 @@ def _device_state() -> Dict:
         },
         "current_ingestion": (_last_pipeline or {}).get("pipeline_id"),
         "highlight": HIGHLIGHT.status() if HIGHLIGHT else None,
+        "shot_live": LIVE.status() if LIVE else None,
         "location": CFG.location,
     }
 
@@ -287,6 +304,11 @@ def _do_start(game_id=None, label=None, force=False):
                 HIGHLIGHT.start(label)
             except Exception as e:  # noqa: BLE001
                 logger.warning("highlight recorder failed to start: %s", e)
+        if LIVE:
+            try:
+                LIVE.start(label, game_id, _starting_side_team1(game_id))
+            except Exception as e:  # noqa: BLE001
+                logger.warning("shot-live failed to start: %s", e)
     logger.info("recording started label=%s game=%s force=%s angles=%s",
                 label, game_id, bool(force), [o["angle"] for o in outputs])
     _publish()
@@ -333,6 +355,11 @@ def _do_stop():
                 HIGHLIGHT.stop()
             except Exception as e:  # noqa: BLE001
                 logger.warning("highlight recorder stop failed: %s", e)
+        if LIVE:
+            try:
+                LIVE.stop()
+            except Exception as e:  # noqa: BLE001
+                logger.warning("shot-live stop failed: %s", e)
     if track_err is not None:
         return {"success": False, "error": track_err}, 500
     if TRACKER:
