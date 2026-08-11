@@ -9,11 +9,27 @@ import threading
 import os
 import json
 
-LOCALSENSE_IP = "127.0.0.1"
-PORT = 48300
-USERNAME = "admin"
-PASSWORD = "Uball_Tracking"
-SALT = "abcdefghijklmnopqrstuvwxyz20191107salt"
+from dotenv import load_dotenv
+
+load_dotenv()
+
+
+def _require_env(name):
+    """Fetch a required secret from the environment, failing loudly if unset."""
+    value = os.getenv(name)
+    if not value:
+        raise RuntimeError(
+            f"Missing required environment variable {name!r}. "
+            f"Set it in your .env file (see .env.example)."
+        )
+    return value
+
+
+LOCALSENSE_IP = os.getenv("LOCALSENSE_IP", "127.0.0.1")
+PORT = int(os.getenv("LOCALSENSE_PORT", "48300"))
+USERNAME = os.getenv("TRACKER_USERNAME", "admin")
+PASSWORD = _require_env("TRACKER_PASSWORD")
+SALT = _require_env("TRACKER_SALT")
 LOGS_DIR = "tracker_logs"
 SESSIONS_FILE = "sessions.json"
 
