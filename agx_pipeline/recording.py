@@ -372,19 +372,37 @@ class RecordingController:
         if t and t.is_alive():
             t.join(timeout=self.wd_poll + 3)
 
+    def _seg_ok(self, path: str) -> bool:
+        """A segment is usable only if ffprobe can read a positive duration — a
+        crashed (SIGKILL'd) container leaves an unfinalized mp4 with no moov, which
+        must be DROPPED, not fed to concat (it would break the whole concat)."""
+        if not (os.path.isfile(path) and os.path.getsize(path) > 0):
+            return False
+        r = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                            "-of", "csv=p=0", path], capture_output=True, text=True,
+                           stdin=subprocess.DEVNULL)
+        try:
+            return float(r.stdout.strip()) > 0
+        except (ValueError, TypeError):
+            return False
+
     def _concat_segments(self, label: str) -> None:
-        """After stop: for any camera the watchdog restarted, concat its segments
-        [master + _wd/.rN] back into the single master {label}_{angle}.mp4 so ingest
-        sees one file per camera (a ~stall-window gap between segments, no full loss)."""
+        """After stop: for any camera the watchdog restarted, concat its READABLE
+        segments [master + _wd/.rN] back into the single master {label}_{angle}.mp4
+        so ingest sees one file per camera (a ~stall-window gap between segments;
+        an unfinalized crashed segment is dropped, the recovery kept)."""
         with self._wd_lock:
             sess = self._sessions.get(label)
         if not sess:
             return
         for run in sess["runs"]:
-            segs = [p for p in run["segments"] if os.path.isfile(p) and os.path.getsize(p) > 0]
-            if len(segs) <= 1:
-                continue
+            if len(run["segments"]) <= 1:
+                continue                       # never restarted — master is fine as-is
+            segs = [p for p in run["segments"] if self._seg_ok(p)]
             master = os.path.join(run["session_dir"], f"{label}_{run['angle']}.mp4")
+            if not segs:
+                logger.error("watchdog: no readable segments for %s — footage lost", run["angle"])
+                continue
             tmp, lst = master + ".concat.mp4", master + ".concat.txt"
             try:
                 with open(lst, "w") as f:
