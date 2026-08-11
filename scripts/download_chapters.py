@@ -267,7 +267,9 @@ def main():
 
     try:
         for i, file_info in enumerate(mp4_files):
-            filename = file_info['filename']
+            # filename comes from the GoPro media-list API; strip any path
+            # components so a crafted name cannot traverse out of session_dir.
+            filename = os.path.basename(file_info['filename'])
             directory = file_info['directory']
             expected_size = file_info['size']
 
