@@ -1,0 +1,517 @@
+UAI Camera System — Video Inventory & Status Report
+Generated: 2026-03-13 (UTC)
+====================================================================================================
+
+SYSTEM OVERVIEW
+--------------------------------------------------
+Cameras: 4 GoPro cameras across 2 Jetson Nano devices
+  Jetson Nano 1 (End A): FR (Far Right), NL (Near Left)
+  Jetson Nano 2 (End B): FL (Far Left), NR (Near Right)
+Storage: AWS S3 (uball-videos-production)
+Resolution: Source 4K, stored as raw chapters
+
+Total Games Recorded: 38
+Complete (all 4 angles): 17
+Incomplete (missing angles): 21
+
+====================================================================================================
+DATE: 2026-01-20  |  4 game(s)  |  1/4 complete
+====================================================================================================
+
+  Game: unknown-2026-01-20
+  Game ID: unknown-2026-01-20
+  Status: INCOMPLETE
+  Angles Present: FR, NL, NR
+  Angles Missing: FL
+  Reason: Jetson Nano 2 did not capture: FL
+  Available Angles:
+    FR:   5683.1 MB  |  court-a/2026-01-20/unknown-2026-01-20/2026-01-20_FR.mp4
+    NL:   2144.2 MB  |  court-a/2026-01-20/unknown-2026-01-20/2026-01-20_NL.mp4
+    NR:   2037.8 MB  |  court-a/2026-01-20/unknown-2026-01-20/2026-01-20_NR.mp4
+
+  Game: ALPHA WOLVES vs BETA HAWKS
+  Game ID: ac650a1d-1594-4759-839d
+  Status: COMPLETE
+  Angles: FL, FR, NL, NR (all present)
+  Total Size: 3876 MB (3.8 GB)
+    FL:    106.2 MB  |  court-a/2026-01-20/ac650a1d-1594-4759-839d/2026-01-20_ac650a1d-1594-4759-839d_FL.mp4
+    FR:   1247.7 MB  |  court-a/2026-01-20/ac650a1d-1594-4759-839d/2026-01-20_ac650a1d-1594-4759-839d_FR.mp4
+    NL:   1084.8 MB  |  court-a/2026-01-20/ac650a1d-1594-4759-839d/2026-01-20_ac650a1d-1594-4759-839d_NL.mp4
+    NR:   1436.9 MB  |  court-a/2026-01-20/ac650a1d-1594-4759-839d/2026-01-20_ac650a1d-1594-4759-839d_NR.mp4
+
+  Game: 3cdc8667-bc9c-4bf6-9050
+  Game ID: 3cdc8667-bc9c-4bf6-9050
+  Status: INCOMPLETE
+  Angles Present: FR, NL, NR
+  Angles Missing: FL
+  Reason: Jetson Nano 2 did not capture: FL
+  Available Angles:
+    FR:   2196.5 MB  |  court-a/2026-01-20/3cdc8667-bc9c-4bf6-9050/2026-01-20_3cdc8667-bc9c-4bf6-9050_FR.mp4
+    NL:   2109.5 MB  |  court-a/2026-01-20/3cdc8667-bc9c-4bf6-9050/2026-01-20_3cdc8667-bc9c-4bf6-9050_NL.mp4
+    NR:   2005.7 MB  |  court-a/2026-01-20/3cdc8667-bc9c-4bf6-9050/2026-01-20_3cdc8667-bc9c-4bf6-9050_NR.mp4
+
+  Game: EPSILON LIONS vs ZETA EAGLES
+  Game ID: f2004cdf-ba96-4977-8cf6
+  Status: INCOMPLETE
+  Angles Present: FR, NL, NR
+  Angles Missing: FL
+  Reason: Jetson Nano 2 did not capture: FL
+  Available Angles:
+    FR:   1329.2 MB  |  court-a/2026-01-20/f2004cdf-ba96-4977-8cf6/2026-01-20_f2004cdf-ba96-4977-8cf6_FR.mp4
+    NL:   1248.8 MB  |  court-a/2026-01-20/f2004cdf-ba96-4977-8cf6/2026-01-20_f2004cdf-ba96-4977-8cf6_NL.mp4
+    NR:    158.0 MB  |  court-a/2026-01-20/f2004cdf-ba96-4977-8cf6/2026-01-20_f2004cdf-ba96-4977-8cf6_NR.mp4
+====================================================================================================
+DATE: 2026-01-28  |  3 game(s)  |  0/3 complete
+====================================================================================================
+
+  Game: unknown-2026-01-28
+  Game ID: unknown-2026-01-28
+  Status: INCOMPLETE
+  Angles Present: NR
+  Angles Missing: FL, FR, NL
+  Reason: Jetson Nano 1 did not capture: FR, NL
+  Reason: Jetson Nano 2 did not capture: FL
+  Available Angles:
+    NR:    324.1 MB  |  court-a/2026-01-28/unknown-2026-01-28/2026-01-28_NR.mp4
+
+  Game: Test Team Alpha vs Test Team Beta
+  Game ID: 8fe8d121-ac5c-4538-9dbe
+  Status: INCOMPLETE
+  Angles Present: NR
+  Angles Missing: FL, FR, NL
+  Reason: Jetson Nano 1 did not capture: FR, NL
+  Reason: Jetson Nano 2 did not capture: FL
+  Available Angles:
+    NR:    279.2 MB  |  court-a/2026-01-28/8fe8d121-ac5c-4538-9dbe/2026-01-28_8fe8d121-ac5c-4538-9dbe_NR.mp4
+
+  Game: BAR vs REAL
+  Game ID: 10dcc254-2cb7-473c-a209
+  Status: INCOMPLETE
+  Angles Present: NR
+  Angles Missing: FL, FR, NL
+  Reason: Jetson Nano 1 did not capture: FR, NL
+  Reason: Jetson Nano 2 did not capture: FL
+  Available Angles:
+    NR:    257.5 MB  |  court-a/2026-01-28/10dcc254-2cb7-473c-a209/2026-01-28_10dcc254-2cb7-473c-a209_NR.mp4
+====================================================================================================
+DATE: 2026-01-29  |  4 game(s)  |  3/4 complete
+====================================================================================================
+
+  Game: unknown-2026-01-29
+  Game ID: unknown-2026-01-29
+  Status: INCOMPLETE
+  Angles Present: FR
+  Angles Missing: FL, NL, NR
+  Reason: Jetson Nano 1 did not capture: NL
+  Reason: Jetson Nano 2 did not capture: FL, NR
+  Available Angles:
+    FR:   2465.8 MB  |  court-a/2026-01-29/unknown-2026-01-29/2026-01-29_FR.mp4
+
+  Game: LOS ACRES vs AKATSUKI
+  Game ID: 31bbd85a-a736-4665-bfd2
+  Status: COMPLETE
+  Angles: FL, FR, NL, NR (all present)
+  Total Size: 14409 MB (14.1 GB)
+    FL:   4049.1 MB  |  court-a/2026-01-29/31bbd85a-a736-4665-bfd2/2026-01-29_31bbd85a-a736-4665-bfd2_FL.mp4
+    FR:   3329.5 MB  |  court-a/2026-01-29/31bbd85a-a736-4665-bfd2/2026-01-29_31bbd85a-a736-4665-bfd2_FR.mp4
+    NL:   3119.4 MB  |  court-a/2026-01-29/31bbd85a-a736-4665-bfd2/2026-01-29_31bbd85a-a736-4665-bfd2_NL.mp4
+    NR:   3911.4 MB  |  court-a/2026-01-29/31bbd85a-a736-4665-bfd2/2026-01-29_31bbd85a-a736-4665-bfd2_NR.mp4
+
+  Game: BIG BAWLZ vs UPTOWN 66
+  Game ID: 50950797-22a5-4129-a2f4
+  Status: COMPLETE
+  Angles: FL, FR, NL, NR (all present)
+  Total Size: 15261 MB (14.9 GB)
+    FL:   4503.1 MB  |  court-a/2026-01-29/50950797-22a5-4129-a2f4/2026-01-29_50950797-22a5-4129-a2f4_FL.mp4
+    FR:   3195.6 MB  |  court-a/2026-01-29/50950797-22a5-4129-a2f4/2026-01-29_50950797-22a5-4129-a2f4_FR.mp4
+    NL:   3010.6 MB  |  court-a/2026-01-29/50950797-22a5-4129-a2f4/2026-01-29_50950797-22a5-4129-a2f4_NL.mp4
+    NR:   4551.6 MB  |  court-a/2026-01-29/50950797-22a5-4129-a2f4/2026-01-29_50950797-22a5-4129-a2f4_NR.mp4
+
+  Game: HOOP DREAMS vs OUT OF RETIREMENT
+  Game ID: 89b61e9b-d07b-4431-be56
+  Status: COMPLETE
+  Angles: FL, FR, NL, NR (all present)
+  Total Size: 6821 MB (6.7 GB)
+    FL:   3076.4 MB  |  court-a/2026-01-29/89b61e9b-d07b-4431-be56/2026-01-29_89b61e9b-d07b-4431-be56_FL.mp4
+    FR:    161.4 MB  |  court-a/2026-01-29/89b61e9b-d07b-4431-be56/2026-01-29_89b61e9b-d07b-4431-be56_FR.mp4
+    NL:    192.7 MB  |  court-a/2026-01-29/89b61e9b-d07b-4431-be56/2026-01-29_89b61e9b-d07b-4431-be56_NL.mp4
+    NR:   3390.7 MB  |  court-a/2026-01-29/89b61e9b-d07b-4431-be56/2026-01-29_89b61e9b-d07b-4431-be56_NR.mp4
+====================================================================================================
+DATE: 2026-01-30  |  5 game(s)  |  5/5 complete
+====================================================================================================
+
+  Game: Team 1 vs Team 2
+  Game ID: d8ebeb20-ada3-4f52-bb33
+  Status: COMPLETE
+  Angles: FL, FR, NL, NR (all present)
+  Total Size: 14937 MB (14.6 GB)
+    FL:   4233.1 MB  |  court-a/2026-01-30/d8ebeb20-ada3-4f52-bb33/2026-01-30_d8ebeb20-ada3-4f52-bb33_FL.mp4
+    FR:   3434.2 MB  |  court-a/2026-01-30/d8ebeb20-ada3-4f52-bb33/2026-01-30_d8ebeb20-ada3-4f52-bb33_FR.mp4
+    NL:   3204.2 MB  |  court-a/2026-01-30/d8ebeb20-ada3-4f52-bb33/2026-01-30_d8ebeb20-ada3-4f52-bb33_NL.mp4
+    NR:   4065.6 MB  |  court-a/2026-01-30/d8ebeb20-ada3-4f52-bb33/2026-01-30_d8ebeb20-ada3-4f52-bb33_NR.mp4
+
+  Game: RONSELLI B vs CODE BLUE
+  Game ID: 02c2f5f3-d8d1-4182-b165
+  Status: COMPLETE
+  Angles: FL, FR, NL, NR (all present)
+  Total Size: 15865 MB (15.5 GB)
+    FL:   4652.0 MB  |  court-a/2026-01-30/02c2f5f3-d8d1-4182-b165/2026-01-30_02c2f5f3-d8d1-4182-b165_FL.mp4
+    FR:   3528.2 MB  |  court-a/2026-01-30/02c2f5f3-d8d1-4182-b165/2026-01-30_02c2f5f3-d8d1-4182-b165_FR.mp4
+    NL:   3343.7 MB  |  court-a/2026-01-30/02c2f5f3-d8d1-4182-b165/2026-01-30_02c2f5f3-d8d1-4182-b165_NL.mp4
+    NR:   4341.4 MB  |  court-a/2026-01-30/02c2f5f3-d8d1-4182-b165/2026-01-30_02c2f5f3-d8d1-4182-b165_NR.mp4
+
+  Game: LOS GALLOS vs AKATSUKI
+  Game ID: 5e4357e2-3def-4c5d-be89
+  Status: COMPLETE
+  Angles: FL, FR, NL, NR (all present)
+  Total Size: 13768 MB (13.4 GB)
+    FL:   4033.2 MB  |  court-a/2026-01-30/5e4357e2-3def-4c5d-be89/2026-01-30_5e4357e2-3def-4c5d-be89_FL.mp4
+    FR:   2918.6 MB  |  court-a/2026-01-30/5e4357e2-3def-4c5d-be89/2026-01-30_5e4357e2-3def-4c5d-be89_FR.mp4
+    NL:   2672.6 MB  |  court-a/2026-01-30/5e4357e2-3def-4c5d-be89/2026-01-30_5e4357e2-3def-4c5d-be89_NL.mp4
+    NR:   4143.1 MB  |  court-a/2026-01-30/5e4357e2-3def-4c5d-be89/2026-01-30_5e4357e2-3def-4c5d-be89_NR.mp4
+
+  Game: MOONLIGHT vs BORN READY
+  Game ID: 63bbe980-06cc-445c-9ebc
+  Status: COMPLETE
+  Angles: FL, FR, NL, NR (all present)
+  Total Size: 8790 MB (8.6 GB)
+    FL:   3597.6 MB  |  court-a/2026-01-30/63bbe980-06cc-445c-9ebc/2026-01-30_63bbe980-06cc-445c-9ebc_FL.mp4
+    FR:    672.6 MB  |  court-a/2026-01-30/63bbe980-06cc-445c-9ebc/2026-01-30_63bbe980-06cc-445c-9ebc_FR.mp4
+    NL:    723.5 MB  |  court-a/2026-01-30/63bbe980-06cc-445c-9ebc/2026-01-30_63bbe980-06cc-445c-9ebc_NL.mp4
+    NR:   3796.3 MB  |  court-a/2026-01-30/63bbe980-06cc-445c-9ebc/2026-01-30_63bbe980-06cc-445c-9ebc_NR.mp4
+
+  Game: PATAGONIA vs SONS OF A
+  Game ID: c76f67a8-4285-47c9-8264
+  Status: COMPLETE
+  Angles: FL, FR, NL, NR (all present)
+  Total Size: 15426 MB (15.1 GB)
+    FL:   4562.2 MB  |  court-a/2026-01-30/c76f67a8-4285-47c9-8264/2026-01-30_c76f67a8-4285-47c9-8264_FL.mp4
+    FR:   3513.6 MB  |  court-a/2026-01-30/c76f67a8-4285-47c9-8264/2026-01-30_c76f67a8-4285-47c9-8264_FR.mp4
+    NL:   3208.5 MB  |  court-a/2026-01-30/c76f67a8-4285-47c9-8264/2026-01-30_c76f67a8-4285-47c9-8264_NL.mp4
+    NR:   4141.4 MB  |  court-a/2026-01-30/c76f67a8-4285-47c9-8264/2026-01-30_c76f67a8-4285-47c9-8264_NR.mp4
+====================================================================================================
+DATE: 2026-01-31  |  4 game(s)  |  4/4 complete
+====================================================================================================
+
+  Game: Team 1 vs Team 2
+  Game ID: 6b59309d-1add-472f-8f52
+  Status: COMPLETE
+  Angles: FL, FR, NL, NR (all present)
+  Total Size: 10390 MB (10.1 GB)
+    FL:   3075.8 MB  |  court-a/2026-01-31/6b59309d-1add-472f-8f52/2026-01-31_6b59309d-1add-472f-8f52_FL.mp4
+    FR:   2256.7 MB  |  court-a/2026-01-31/6b59309d-1add-472f-8f52/2026-01-31_6b59309d-1add-472f-8f52_FR.mp4
+    NL:   2011.0 MB  |  court-a/2026-01-31/6b59309d-1add-472f-8f52/2026-01-31_6b59309d-1add-472f-8f52_NL.mp4
+    NR:   3046.5 MB  |  court-a/2026-01-31/6b59309d-1add-472f-8f52/2026-01-31_6b59309d-1add-472f-8f52_NR.mp4
+
+  Game: Team 1 vs Team 2
+  Game ID: 13e1ffad-e08b-4e1e-84bf
+  Status: COMPLETE
+  Angles: FL, FR, NL, NR (all present)
+  Total Size: 16018 MB (15.6 GB)
+    FL:   4540.0 MB  |  court-a/2026-01-31/13e1ffad-e08b-4e1e-84bf/2026-01-31_13e1ffad-e08b-4e1e-84bf_FL.mp4
+    FR:   3531.3 MB  |  court-a/2026-01-31/13e1ffad-e08b-4e1e-84bf/2026-01-31_13e1ffad-e08b-4e1e-84bf_FR.mp4
+    NL:   3319.0 MB  |  court-a/2026-01-31/13e1ffad-e08b-4e1e-84bf/2026-01-31_13e1ffad-e08b-4e1e-84bf_NL.mp4
+    NR:   4627.5 MB  |  court-a/2026-01-31/13e1ffad-e08b-4e1e-84bf/2026-01-31_13e1ffad-e08b-4e1e-84bf_NR.mp4
+
+  Game: BALL DON'T LIE vs LOST BOYS
+  Game ID: 3e193690-99a0-4bad-b411
+  Status: COMPLETE
+  Angles: FL, FR, NL, NR (all present)
+  Total Size: 12530 MB (12.2 GB)
+    FL:   3579.2 MB  |  court-a/2026-01-31/3e193690-99a0-4bad-b411/2026-01-31_3e193690-99a0-4bad-b411_FL.mp4
+    FR:   2781.1 MB  |  court-a/2026-01-31/3e193690-99a0-4bad-b411/2026-01-31_3e193690-99a0-4bad-b411_FR.mp4
+    NL:   2513.0 MB  |  court-a/2026-01-31/3e193690-99a0-4bad-b411/2026-01-31_3e193690-99a0-4bad-b411_NL.mp4
+    NR:   3656.8 MB  |  court-a/2026-01-31/3e193690-99a0-4bad-b411/2026-01-31_3e193690-99a0-4bad-b411_NR.mp4
+
+  Game: MIAMI IGNITE vs BUCKETS & BRO
+  Game ID: 237157c3-7fb5-49f7-b869
+  Status: COMPLETE
+  Angles: FL, FR, NL, NR (all present)
+  Total Size: 8645 MB (8.4 GB)
+    FL:   2440.7 MB  |  court-a/2026-01-31/237157c3-7fb5-49f7-b869/2026-01-31_237157c3-7fb5-49f7-b869_FL.mp4
+    FR:   1725.7 MB  |  court-a/2026-01-31/237157c3-7fb5-49f7-b869/2026-01-31_237157c3-7fb5-49f7-b869_FR.mp4
+    NL:   1741.2 MB  |  court-a/2026-01-31/237157c3-7fb5-49f7-b869/2026-01-31_237157c3-7fb5-49f7-b869_NL.mp4
+    NR:   2737.2 MB  |  court-a/2026-01-31/237157c3-7fb5-49f7-b869/2026-01-31_237157c3-7fb5-49f7-b869_NR.mp4
+====================================================================================================
+DATE: 2026-02-03  |  6 game(s)  |  4/6 complete
+====================================================================================================
+
+  Game: game1-8f87bdb8-6b13-4642
+  Game ID: game1-8f87bdb8-6b13-4642
+  Status: INCOMPLETE
+  Angles Present: FR
+  Angles Missing: FL, NL, NR
+  Reason: Jetson Nano 1 did not capture: NL
+  Reason: Jetson Nano 2 did not capture: FL, NR
+  Available Angles:
+    FR:      0.0 MB  |  court-a/2026-02-03/game1-8f87bdb8-6b13-4642/2026-02-03_game1_FR.mp4  *** SUSPECT (very small file)
+
+  Game: The Fundamentals vs Scumbags Anonymous
+  Game ID: 8f87bdb8-6b13-4642-8ea8
+  Status: COMPLETE
+  Angles: FL, FR, NL, NR (all present)
+  Total Size: 15812 MB (15.4 GB)
+    FL:   4585.4 MB  |  court-a/2026-02-03/8f87bdb8-6b13-4642-8ea8/2026-02-03_8f87bdb8-6b13-4642-8ea8_FL.mp4
+    FR:   3543.8 MB  |  court-a/2026-02-03/8f87bdb8-6b13-4642-8ea8/2026-02-03_8f87bdb8-6b13-4642-8ea8_FR.mp4
+    NL:   3226.9 MB  |  court-a/2026-02-03/8f87bdb8-6b13-4642-8ea8/2026-02-03_8f87bdb8-6b13-4642-8ea8_NL.mp4
+    NR:   4456.1 MB  |  court-a/2026-02-03/8f87bdb8-6b13-4642-8ea8/2026-02-03_8f87bdb8-6b13-4642-8ea8_NR.mp4
+
+  Game: Uptown 66ers vs Moonlight Elite
+  Game ID: 9a2adbcc-df96-41c0-9c86
+  Status: COMPLETE
+  Angles: FL, FR, NL, NR (all present)
+  Total Size: 14846 MB (14.5 GB)
+    FL:   4378.8 MB  |  court-a/2026-02-03/9a2adbcc-df96-41c0-9c86/2026-02-03_9a2adbcc-df96-41c0-9c86_FL.mp4
+    FR:   3280.4 MB  |  court-a/2026-02-03/9a2adbcc-df96-41c0-9c86/2026-02-03_9a2adbcc-df96-41c0-9c86_FR.mp4
+    NL:   2916.6 MB  |  court-a/2026-02-03/9a2adbcc-df96-41c0-9c86/2026-02-03_9a2adbcc-df96-41c0-9c86_NL.mp4
+    NR:   4269.7 MB  |  court-a/2026-02-03/9a2adbcc-df96-41c0-9c86/2026-02-03_9a2adbcc-df96-41c0-9c86_NR.mp4
+
+  Game: A Day in Miami vs Premier Mtg
+  Game ID: 2f019bd5-6ca2-4d05-b768
+  Status: COMPLETE
+  Angles: FL, FR, NL, NR (all present)
+  Total Size: 16019 MB (15.6 GB)
+    FL:   4634.2 MB  |  court-a/2026-02-03/2f019bd5-6ca2-4d05-b768/2026-02-03_2f019bd5-6ca2-4d05-b768_FL.mp4
+    FR:   3520.1 MB  |  court-a/2026-02-03/2f019bd5-6ca2-4d05-b768/2026-02-03_2f019bd5-6ca2-4d05-b768_FR.mp4
+    NL:   3316.1 MB  |  court-a/2026-02-03/2f019bd5-6ca2-4d05-b768/2026-02-03_2f019bd5-6ca2-4d05-b768_NL.mp4
+    NR:   4548.5 MB  |  court-a/2026-02-03/2f019bd5-6ca2-4d05-b768/2026-02-03_2f019bd5-6ca2-4d05-b768_NR.mp4
+
+  Game: 03a71d90-1456-4a40-840e
+  Game ID: 03a71d90-1456-4a40-840e
+  Status: INCOMPLETE
+  Angles Present: NL, NR
+  Angles Missing: FL, FR
+  Reason: Jetson Nano 1 did not capture: FR
+  Reason: Jetson Nano 2 did not capture: FL
+  Available Angles:
+    NL:   4269.4 MB  |  court-a/2026-02-03/03a71d90-1456-4a40-840e/2026-02-03_03a71d90-1456-4a40-840e_NL.mp4
+    NR:   4930.3 MB  |  court-a/2026-02-03/03a71d90-1456-4a40-840e/2026-02-03_03a71d90-1456-4a40-840e_NR.mp4
+
+  Game: Miracle Leaf vs Team Music
+  Game ID: bbecd8c2-f9e7-4868-9b91
+  Status: COMPLETE
+  Angles: FL, FR, NL, NR (all present)
+  Total Size: 19903 MB (19.4 GB)
+    FL:   6119.0 MB  |  court-a/2026-02-03/bbecd8c2-f9e7-4868-9b91/2026-02-03_bbecd8c2-f9e7-4868-9b91_FL.mp4
+    FR:   4584.7 MB  |  court-a/2026-02-03/bbecd8c2-f9e7-4868-9b91/2026-02-03_bbecd8c2-f9e7-4868-9b91_FR.mp4
+    NL:   4269.4 MB  |  court-a/2026-02-03/bbecd8c2-f9e7-4868-9b91/2026-02-03_bbecd8c2-f9e7-4868-9b91_NL.mp4
+    NR:   4930.3 MB  |  court-a/2026-02-03/bbecd8c2-f9e7-4868-9b91/2026-02-03_bbecd8c2-f9e7-4868-9b91_NR.mp4
+====================================================================================================
+DATE: 2026-02-08  |  1 game(s)  |  0/1 complete
+====================================================================================================
+
+  Game: cd3d85aa-2388-45d1-996f
+  Game ID: cd3d85aa-2388-45d1-996f
+  Status: INCOMPLETE
+  Angles Present: FL, NR
+  Angles Missing: FR, NL
+  Reason: Jetson Nano 1 did not capture: FR, NL
+  Available Angles:
+    FL:     10.6 MB  |  court-a/2026-02-08/cd3d85aa-2388-45d1-996f/2026-02-08_cd3d85aa-2388-45d1-996f_FL.mp4
+    NR:      1.8 MB  |  court-a/2026-02-08/cd3d85aa-2388-45d1-996f/2026-02-08_cd3d85aa-2388-45d1-996f_NR.mp4  *** SUSPECT (very small file)
+====================================================================================================
+DATE: 2026-02-11  |  5 game(s)  |  0/5 complete
+====================================================================================================
+
+  Game: TEAM 15 vs TEAM 16
+  Game ID: f4d41102-ef35-4c97-ab04
+  Status: INCOMPLETE
+  Angles Present: FL, NR
+  Angles Missing: FR, NL
+  Reason: Jetson Nano 1 did not capture: FR, NL
+  Available Angles:
+    FL:     68.3 MB  |  court-a/2026-02-11/f4d41102-ef35-4c97-ab04/2026-02-11_f4d41102-ef35-4c97-ab04_FL.mp4
+    NR:      1.2 MB  |  court-a/2026-02-11/f4d41102-ef35-4c97-ab04/2026-02-11_f4d41102-ef35-4c97-ab04_NR.mp4  *** SUSPECT (very small file)
+
+  Game: TEAM 17 vs TEAM 18
+  Game ID: 89cfa1bc-3464-4f6d-9830
+  Status: INCOMPLETE
+  Angles Present: FL, NR
+  Angles Missing: FR, NL
+  Reason: Jetson Nano 1 did not capture: FR, NL
+  Available Angles:
+    FL:     95.2 MB  |  court-a/2026-02-11/89cfa1bc-3464-4f6d-9830/2026-02-11_89cfa1bc-3464-4f6d-9830_FL.mp4
+    NR:      1.6 MB  |  court-a/2026-02-11/89cfa1bc-3464-4f6d-9830/2026-02-11_89cfa1bc-3464-4f6d-9830_NR.mp4  *** SUSPECT (very small file)
+
+  Game: TEAM 19 vs TEAM 20
+  Game ID: 6c087101-896a-44f3-a360
+  Status: INCOMPLETE
+  Angles Present: FL, NR
+  Angles Missing: FR, NL
+  Reason: Jetson Nano 1 did not capture: FR, NL
+  Available Angles:
+    FL:    111.7 MB  |  court-a/2026-02-11/6c087101-896a-44f3-a360/2026-02-11_6c087101-896a-44f3-a360_FL.mp4
+    NR:      1.8 MB  |  court-a/2026-02-11/6c087101-896a-44f3-a360/2026-02-11_6c087101-896a-44f3-a360_NR.mp4  *** SUSPECT (very small file)
+
+  Game: TEAM 21 vs TEAM 22
+  Game ID: d519c319-3a9f-4bc7-ae72
+  Status: INCOMPLETE
+  Angles Present: FL, NR
+  Angles Missing: FR, NL
+  Reason: Jetson Nano 1 did not capture: FR, NL
+  Available Angles:
+    FL:     72.0 MB  |  court-a/2026-02-11/d519c319-3a9f-4bc7-ae72/2026-02-11_d519c319-3a9f-4bc7-ae72_FL.mp4
+    NR:      1.3 MB  |  court-a/2026-02-11/d519c319-3a9f-4bc7-ae72/2026-02-11_d519c319-3a9f-4bc7-ae72_NR.mp4  *** SUSPECT (very small file)
+
+  Game: TEAM 23 vs TEAM 24
+  Game ID: b6a8c51a-6f79-4afc-b9ea
+  Status: INCOMPLETE
+  Angles Present: FL, NR
+  Angles Missing: FR, NL
+  Reason: Jetson Nano 1 did not capture: FR, NL
+  Available Angles:
+    FL:    103.2 MB  |  court-a/2026-02-11/b6a8c51a-6f79-4afc-b9ea/2026-02-11_b6a8c51a-6f79-4afc-b9ea_FL.mp4
+    NR:      1.7 MB  |  court-a/2026-02-11/b6a8c51a-6f79-4afc-b9ea/2026-02-11_b6a8c51a-6f79-4afc-b9ea_NR.mp4  *** SUSPECT (very small file)
+====================================================================================================
+DATE: 2026-02-15  |  2 game(s)  |  0/2 complete
+====================================================================================================
+
+  Game: TEAM 1 vs TEAM 2
+  Game ID: ea96cd1a-cb05-47e1-bcf3
+  Status: INCOMPLETE
+  Angles Present: FL, NR
+  Angles Missing: FR, NL
+  Reason: Jetson Nano 1 did not capture: FR, NL
+  Available Angles:
+    FL:    385.8 MB  |  court-a/2026-02-15/ea96cd1a-cb05-47e1-bcf3/2026-02-15_ea96cd1a-cb05-47e1-bcf3_FL.mp4
+    NR:      6.2 MB  |  court-a/2026-02-15/ea96cd1a-cb05-47e1-bcf3/2026-02-15_ea96cd1a-cb05-47e1-bcf3_NR.mp4
+
+  Game: TEAM 1 vs TEAM 2
+  Game ID: 311a810c-10c1-4b4c-a626
+  Status: INCOMPLETE
+  Angles Present: FL, NR
+  Angles Missing: FR, NL
+  Reason: Jetson Nano 1 did not capture: FR, NL
+  Available Angles:
+    FL:   3180.5 MB  |  court-a/2026-02-15/311a810c-10c1-4b4c-a626/2026-02-15_311a810c-10c1-4b4c-a626_FL.mp4
+    NR:     52.7 MB  |  court-a/2026-02-15/311a810c-10c1-4b4c-a626/2026-02-15_311a810c-10c1-4b4c-a626_NR.mp4
+====================================================================================================
+DATE: 2026-02-19  |  1 game(s)  |  0/1 complete
+====================================================================================================
+
+  Game: Thunder 2034 vs St. Thomas
+  Game ID: d4d8c369-d735-458b-b8a1
+  Status: INCOMPLETE
+  Angles Present: FL, FR, NL
+  Angles Missing: NR
+  Reason: Jetson Nano 2 did not capture: NR
+  Available Angles:
+    FL:   3052.1 MB  |  court-a/2026-02-19/d4d8c369-d735-458b-b8a1/2026-02-19_d4d8c369-d735-458b-b8a1_FL.mp4
+    FR:   2651.2 MB  |  court-a/2026-02-19/d4d8c369-d735-458b-b8a1/2026-02-19_d4d8c369-d735-458b-b8a1_FR.mp4
+    NL:   2642.9 MB  |  court-a/2026-02-19/d4d8c369-d735-458b-b8a1/2026-02-19_d4d8c369-d735-458b-b8a1_NL.mp4
+====================================================================================================
+DATE: 2026-02-20  |  2 game(s)  |  0/2 complete
+====================================================================================================
+
+  Game: Testing-team-1 vs Testing-Team-2
+  Game ID: 00ec5ee4-34c9-4bb8-8416
+  Status: INCOMPLETE
+  Angles Present: FR, NL
+  Angles Missing: FL, NR
+  Reason: Jetson Nano 2 did not capture: FL, NR
+  Available Angles:
+    FR:     62.2 MB  |  court-a/2026-02-20/00ec5ee4-34c9-4bb8-8416/2026-02-20_00ec5ee4-34c9-4bb8-8416_FR.mp4
+    NL:     62.5 MB  |  court-a/2026-02-20/00ec5ee4-34c9-4bb8-8416/2026-02-20_00ec5ee4-34c9-4bb8-8416_NL.mp4
+
+  Game: Testing team 3 vs Testing team 4
+  Game ID: dc84aa9d-78e9-44d8-811a
+  Status: INCOMPLETE
+  Angles Present: FR, NL
+  Angles Missing: FL, NR
+  Reason: Jetson Nano 2 did not capture: FL, NR
+  Available Angles:
+    FR:     56.6 MB  |  court-a/2026-02-20/dc84aa9d-78e9-44d8-811a/2026-02-20_dc84aa9d-78e9-44d8-811a_FR.mp4
+    NL:     56.1 MB  |  court-a/2026-02-20/dc84aa9d-78e9-44d8-811a/2026-02-20_dc84aa9d-78e9-44d8-811a_NL.mp4
+====================================================================================================
+DATE: 2026-03-05  |  1 game(s)  |  0/1 complete
+====================================================================================================
+
+  Game: Cm hoops vs East havana
+  Game ID: 53db2726-d2c1-4a1b-871b
+  Status: INCOMPLETE
+  Angles Present: FL, FR, NR
+  Angles Missing: NL
+  Reason: Jetson Nano 1 did not capture: NL
+  Available Angles:
+    FL:   4504.1 MB  |  court-a/2026-03-05/53db2726-d2c1-4a1b-871b/2026-03-05_53db2726-d2c1-4a1b-871b_FL.mp4
+    FR:   3502.4 MB  |  court-a/2026-03-05/53db2726-d2c1-4a1b-871b/2026-03-05_53db2726-d2c1-4a1b-871b_FR.mp4
+    NR:   2077.3 MB  |  court-a/2026-03-05/53db2726-d2c1-4a1b-871b/2026-03-05_53db2726-d2c1-4a1b-871b_NR.mp4
+
+====================================================================================================
+SUMMARY BY DATE
+====================================================================================================
+Date           Games    Complete   Incomplete   Missing Angles                
+--------------------------------------------------------------------------------
+2026-01-20     4        1          3            FL                            
+2026-01-28     3        0          3            FL, FR, NL                    
+2026-01-29     4        3          1            FL, NL, NR                    
+2026-01-30     5        5          0            -                             
+2026-01-31     4        4          0            -                             
+2026-02-03     6        4          2            FL, FR, NL, NR                
+2026-02-08     1        0          1            FR, NL                        
+2026-02-11     5        0          5            FR, NL                        
+2026-02-15     2        0          2            FR, NL                        
+2026-02-19     1        0          1            NR                            
+2026-02-20     2        0          2            FL, NR                        
+2026-03-05     1        0          1            NL                            
+
+====================================================================================================
+ROOT CAUSE ANALYSIS
+====================================================================================================
+
+The incomplete games fall into the following categories:
+
+1. JETSON NANO 1 NOT RECORDING (Feb 8 - Feb 15)
+   Affected: 8 games on Feb 8, Feb 11, Feb 15
+   Missing: FR (Far Right), NL (Near Left)
+   Cause: Jetson Nano 1 was not actively recording during these sessions.
+   Impact: Only FL and NR angles (from Jetson Nano 2) are available.
+   Note: Several NR files from Feb 11 are very small (1-2 MB), indicating
+         extremely short recordings or corrupted captures.
+
+2. JETSON NANO 2 NOT RECORDING (Feb 20)
+   Affected: 2 games on Feb 20
+   Missing: FL (Far Left), NR (Near Right)
+   Cause: Jetson Nano 2 was not actively recording during these sessions.
+   Impact: Only FR and NL angles (from Jetson Nano 1) are available.
+
+3. SINGLE ANGLE MISSING (Feb 19, Mar 5)
+   Affected: 2 games
+   Feb 19 - missing NR: NR camera on Jetson Nano 2 was not recording.
+   Mar 5 - missing NL: NL camera on Jetson Nano 1 was not recording.
+   Impact: 3 of 4 angles available; usable but not complete.
+
+4. EARLY RECORDINGS - LEGACY FORMAT (Jan 20)
+   Affected: 3 games
+   Missing: FL
+   Cause: These were among the first recordings. The FL session was stored
+          under an older naming convention (without angle code in the session
+          identifier), so the pipeline could not match it to these games.
+   Impact: Raw chapter data exists in S3 but was not linked to games.
+
+5. PARTIAL CAPTURE (Jan 28, Jan 29, Feb 3)
+   Affected: 6 games
+   Missing: Varies (1-3 angles per game)
+   Cause: Recording sessions did not fully overlap with game timestamps,
+          or chapters were not available on one or both Jetsons at the
+          time of processing.
+
+====================================================================================================
+RECOMMENDATIONS
+====================================================================================================
+
+1. For games missing angles due to a Jetson not recording:
+   These angles cannot be recovered as the video was never captured.
+
+2. For Jan 20 legacy format games (missing FL):
+   The raw FL chapter data exists in S3 under the old session naming.
+   A one-time re-extraction script can recover these FL angles.
+
+3. For Feb 11 games with tiny NR files (1-2 MB):
+   These NR captures are likely corrupt or incomplete. The FL angles
+   from these games are valid and usable.
+
+4. Going forward:
+   The pipeline now stores exact chapter filenames during recording,
+   ensuring correct file-to-session mapping. The skip logic has been
+   verified to work correctly, preventing redundant re-uploads.
