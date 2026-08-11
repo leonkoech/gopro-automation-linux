@@ -53,6 +53,11 @@ DELETE_RAW = os.getenv("DELETE_RAW_AFTER_TRANSCODE", "true").lower() in ("1", "t
 # pipeline against real footage). Flip to false later to process it locally on
 # the AGX only — one env change, no code change.
 SHOTDET_UPLOAD_S3 = os.getenv("SHOTDET_UPLOAD_S3", "true").lower() in ("1", "true", "yes")
+# Auto-seed annotation cards from the CV's shot_live detections (one card per shot
+# the SL/SR detector saw), so a game is carded even when the scorekeeper didn't
+# score. Off by default — it seeds ~150-200 review-flagged (source="cv") cards per
+# game into the annotators' workflow, so it's an explicit opt-in.
+SHOT_CARDS_ENABLED = os.getenv("SHOT_CARDS_ENABLED", "false").lower() in ("1", "true", "yes")
 CRF = os.getenv("TRANSCODE_CRF", "23")
 PRESET = os.getenv("TRANSCODE_PRESET", "veryfast")
 HW_BITRATE = os.getenv("TRANSCODE_HW_BITRATE", "8000000")  # NVENC bits/sec for 1080p
@@ -542,23 +547,31 @@ def run_ingestion(fb, cfg, pipeline_id: str, state: Dict, stopped: Dict, tracker
             except Exception as e:  # noqa: BLE001
                 run.log("warn", f"shot-qa enqueue skipped: {str(e)[:150]}")
 
-        # STAGE 4.6 — surface the live CV's OWN shot count on the card (shadow):
-        # every make/miss the SL/SR detector saw during the game, independent of
-        # the scorekeeper. Read from the game doc (the live loop finalized it at
+        # STAGE 4.6 — the live CV's OWN shot detections (shadow): (a) surface the
+        # count on the card, and (b) SHOT_CARDS_ENABLED: seed one annotation card
+        # per detected shot (source="cv", review-flagged) so a game is carded even
+        # when nobody scored. Read the game doc fresh (the live loop finalized it at
         # game stop, before this ingest). Best-effort — never breaks ingestion.
         if fb and firebase_game_id:
             try:
                 gd = fb.db.collection("basketball-games").document(firebase_game_id).get()
-                live = (gd.to_dict() or {}).get("shot_live") if gd.exists else None
-                if live and live.get("n_shots"):
+                fresh = (gd.to_dict() or {}) if gd.exists else {}
+                live = fresh.get("shot_live") or {}
+                if live.get("n_shots"):
                     run.set_shot_detection(
                         n_shots=int(live.get("n_shots", 0)), n_make=int(live.get("n_make", 0)),
                         n_miss=int(live.get("n_miss", 0)), n_sl=int(live.get("n_sl", 0)),
                         n_sr=int(live.get("n_sr", 0)), source="live")
                 else:
                     run.set_shot_detection(0, 0, 0, 0, 0, source="live", status="none")
+                if SHOT_CARDS_ENABLED and client and game_uuid and live.get("shots"):
+                    from plays_sync import create_plays_from_shot_live
+                    csum: Dict = {}
+                    n_cv = create_plays_from_shot_live(client, game_uuid, fresh, summary=csum)
+                    run.log("info", f"CV cards: {n_cv} created"
+                            + (" (skipped — already carded)" if csum.get("skipped_existing") else ""))
             except Exception as e:  # noqa: BLE001
-                run.log("warn", f"shot-detection summary skipped: {str(e)[:120]}")
+                run.log("warn", f"shot-detection cards/summary skipped: {str(e)[:120]}")
 
         # audio cross-correlation sync (FL<->FR) from the host-captured side-files;
         # runs before cleanup so the session-dir .m4a files still exist.
