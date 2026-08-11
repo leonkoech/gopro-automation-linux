@@ -22,6 +22,7 @@
 #   Uploads 1080p MP4 to s3://${BUCKET}/${OUTPUT_S3_KEY}
 
 set -e
+set -o pipefail  # Ensure a failed ffmpeg (not tee) propagates through the pipe
 
 echo "=============================================="
 echo "Extract + Transcode Script (Batch-Only Pipeline)"
@@ -134,6 +135,11 @@ echo "  Duration: $TOTAL_DURATION seconds"
 echo "  Output: 1080p H.264"
 echo ""
 
+# Disable set -e around the pipeline so we can read ffmpeg's real exit code
+# (via PIPESTATUS) and print a diagnostic before exiting. Note: $? after a
+# pipe reflects the LAST command (tee, always 0), so PIPESTATUS[0] is required
+# to observe an ffmpeg failure (OOM, corrupt chapter, GPU fault).
+set +e
 if [ "$GPU_AVAILABLE" = true ]; then
     echo "Using NVIDIA NVENC GPU encoding..."
     ffmpeg -y \
@@ -146,6 +152,7 @@ if [ "$GPU_AVAILABLE" = true ]; then
         -c:a aac -b:a 128k \
         -movflags +faststart \
         "$OUTPUT_FILE" 2>&1 | tee ffmpeg.log
+    FFMPEG_EXIT=${PIPESTATUS[0]}
 else
     echo "Using CPU encoding (libx264)..."
     ffmpeg -y \
@@ -158,10 +165,11 @@ else
         -c:a aac -b:a 128k \
         -movflags +faststart \
         "$OUTPUT_FILE" 2>&1 | tee ffmpeg.log
+    FFMPEG_EXIT=${PIPESTATUS[0]}
 fi
+set -e
 
-FFMPEG_EXIT=$?
-if [ $FFMPEG_EXIT -ne 0 ]; then
+if [ "$FFMPEG_EXIT" -ne 0 ]; then
     echo "ERROR: FFmpeg failed with exit code $FFMPEG_EXIT"
     echo "FFmpeg log:"
     cat ffmpeg.log
@@ -171,7 +179,7 @@ fi
 echo ""
 echo "FFmpeg completed successfully"
 
-# Verify output file
+# Verify output file exists
 if [ ! -f "$OUTPUT_FILE" ]; then
     echo "ERROR: Output file not created"
     exit 1
@@ -180,6 +188,50 @@ fi
 OUTPUT_SIZE=$(stat -c%s "$OUTPUT_FILE" 2>/dev/null || stat -f%z "$OUTPUT_FILE")
 OUTPUT_SIZE_MB=$(echo "scale=2; $OUTPUT_SIZE / 1048576" | bc)
 echo "Output file size: ${OUTPUT_SIZE_MB} MB"
+echo ""
+
+# Sanity check: reject a zero/tiny output that would otherwise be treated as a
+# successful transcode. A partial file from a crashed encode can be non-empty
+# but truncated, so we also probe the actual playable duration below.
+MIN_OUTPUT_BYTES=$((100 * 1024))  # 100 KiB floor; a real 1080p clip is far larger
+if [ "$OUTPUT_SIZE" -lt "$MIN_OUTPUT_BYTES" ]; then
+    echo "ERROR: Output file is only ${OUTPUT_SIZE} bytes (< ${MIN_OUTPUT_BYTES}); transcode is not valid"
+    echo "FFmpeg log:"
+    cat ffmpeg.log
+    exit 1
+fi
+
+# Sanity check: probe the output duration with ffprobe. A failed/partial encode
+# often yields an unreadable or ~0s file. Require the playable duration to be a
+# meaningful fraction of what we asked ffmpeg to produce before declaring
+# success — otherwise the caller may delete the only raw 4K source (footage loss).
+echo "Verifying output with ffprobe..."
+OUTPUT_DURATION=$(ffprobe -v error -show_entries format=duration \
+    -of default=noprint_wrappers=1:nokey=1 "$OUTPUT_FILE" 2>/dev/null || echo "")
+
+if [ -z "$OUTPUT_DURATION" ] || [ "$OUTPUT_DURATION" = "N/A" ]; then
+    echo "ERROR: ffprobe could not read a duration from the output; file is corrupt or incomplete"
+    echo "FFmpeg log:"
+    cat ffmpeg.log
+    exit 1
+fi
+
+echo "Output duration: ${OUTPUT_DURATION} seconds"
+
+# Require at least 50% of the requested extract window (accounts for clips that
+# run slightly short at the tail of the source, while still catching a transcode
+# that died early). DURATION_SECONDS is the real content window (excludes buffer).
+MIN_DURATION=$(echo "scale=2; $DURATION_SECONDS * 0.5" | bc)
+DURATION_OK=$(echo "$OUTPUT_DURATION >= $MIN_DURATION" | bc)
+if [ "$DURATION_OK" -ne 1 ]; then
+    echo "ERROR: Output duration ${OUTPUT_DURATION}s is below the ${MIN_DURATION}s minimum (50% of requested ${DURATION_SECONDS}s)"
+    echo "The transcode likely failed partway through; refusing to report success so the raw source is preserved."
+    echo "FFmpeg log:"
+    cat ffmpeg.log
+    exit 1
+fi
+
+echo "Output validation passed"
 echo ""
 
 # Upload to S3
