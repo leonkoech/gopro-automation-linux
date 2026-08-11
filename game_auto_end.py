@@ -116,6 +116,11 @@ def evaluate_auto_end(game: Dict[str, Any], now: datetime,
     idle_minutes = int((now - last_activity).total_seconds() // 60)
 
     update: Dict[str, Any] = {
+        # UBA-306: mark the game completed, not just endedAt. The client
+        # (getUnendedGame → status=='active') otherwise keeps blocking the next
+        # game, and any TV Display / Admin Controls subscription never tears
+        # down (isGameActive stays true) — a frozen "live" scoreboard forever.
+        'status': 'completed',
         'endedAt': _iso_z(last_activity + timedelta(seconds=ENDED_AT_GRACE_SECONDS)),
         'finalPeriod': _latest_period(events, game),
         'autoEnded': True,

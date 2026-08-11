@@ -93,6 +93,9 @@ def test_idle_game_produces_full_payload():
     assert update['rightTeam.finalScore'] == 41
     assert update['rightTeam.finalFouls'] == 3
     assert update['autoEnded'] is True
+    # UBA-306: must mark completed so the client stops treating it as active
+    # (getUnendedGame gate) and the TV Display tears down.
+    assert update['status'] == 'completed'
     audit = update['autoEndAudit']
     assert audit['by'] == 'jetson-auto-end-guard'
     assert audit['jetsonId'] == 'jetson-1'
