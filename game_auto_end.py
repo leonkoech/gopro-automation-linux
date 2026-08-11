@@ -35,6 +35,18 @@ DEFAULT_LOOKBACK_HOURS = 36
 DEFAULT_LEADER = 'jetson-1'
 
 
+def _run_transaction(transaction: Any, fn: Any) -> Any:
+    """Run ``fn(transaction)`` under Firestore's transactional retry semantics.
+
+    Isolated at module scope (and importing firebase lazily) so the pure unit
+    tests can substitute a direct-call runner without pulling in Firebase.
+    Firestore aborts and retries ``fn`` if the doc it read changes before
+    commit, which is exactly what makes the auto-end guard race-safe.
+    """
+    from firebase_admin import firestore
+    return firestore.transactional(fn)(transaction)
+
+
 def _parse_iso(value: Any) -> Optional[datetime]:
     """Parse an ISO-8601 string (with optional trailing 'Z') to an aware UTC datetime."""
     if not value or not isinstance(value, str):
@@ -194,16 +206,30 @@ class AutoEndGuard:
 
         for doc in query.stream():
             try:
+                # Cheap pre-filter on the streamed snapshot to avoid opening a
+                # transaction for the many games that clearly don't need ending.
+                # The authoritative, race-safe check happens inside the
+                # transaction below (which re-reads the doc).
                 game = doc.to_dict() or {}
                 if game.get('endedAt'):
                     continue
-                update = evaluate_auto_end(
-                    game, now, self.idle_threshold, jetson_id=self.jetson_id)
-                if not update:
+                if not evaluate_auto_end(
+                        game, now, self.idle_threshold, jetson_id=self.jetson_id):
                     continue
-                doc.reference.update(update)
-                left = (game.get('leftTeam') or {}).get('displayName', '?')
-                right = (game.get('rightTeam') or {}).get('displayName', '?')
+
+                result = self._end_game_txn(doc.reference, now)
+                if result is None:
+                    # endedAt was set (real "End Game", UBA-269 auto-end, or
+                    # another guard) between the sweep read and the transaction
+                    # commit. Never clobber the real final score/period.
+                    logger.info(
+                        f"Skipped auto-end for game {doc.id}: ended concurrently "
+                        f"before the guard transaction committed")
+                    continue
+
+                update, fresh_game = result
+                left = (fresh_game.get('leftTeam') or {}).get('displayName', '?')
+                right = (fresh_game.get('rightTeam') or {}).get('displayName', '?')
                 logger.info(
                     f"AUTO-ENDED game {doc.id} ({left} vs {right}): timeline idle "
                     f"{update['autoEndAudit']['idleMinutes']}m, endedAt set to "
@@ -212,3 +238,37 @@ class AutoEndGuard:
                     f"period {update['finalPeriod']})")
             except Exception as e:
                 logger.error(f"Auto-end failed for game {doc.id}: {e}", exc_info=True)
+
+    def _end_game_txn(self, doc_ref: Any, now: datetime) -> Optional[Tuple[Dict[str, Any], Dict[str, Any]]]:
+        """Atomically auto-end ``doc_ref`` only if it is still un-ended.
+
+        Runs the read-check-write inside a Firestore transaction so a real
+        "End Game" (or UBA-269 auto-end, or another guard) that set ``endedAt``
+        after the sweep's initial read is never overwritten with values
+        reconstructed from a stale snapshot.
+
+        Returns ``(update, fresh_game)`` on commit, or ``None`` if the game no
+        longer needs ending.
+        """
+        transaction = self.firebase_service.db.transaction()
+        return _run_transaction(
+            transaction,
+            lambda txn: self._end_game_in_transaction(txn, doc_ref, now))
+
+    def _end_game_in_transaction(self, transaction: Any, doc_ref: Any,
+                                 now: datetime) -> Optional[Tuple[Dict[str, Any], Dict[str, Any]]]:
+        """Transaction body: re-read the doc, re-evaluate, write only if idle.
+
+        Kept free of any Firebase import so it can be unit-tested with a fake
+        transaction/doc reference (see tests for the write-race coverage).
+        """
+        snapshot = doc_ref.get(transaction=transaction)
+        game = snapshot.to_dict() or {}
+        if game.get('endedAt'):
+            return None
+        update = evaluate_auto_end(
+            game, now, self.idle_threshold, jetson_id=self.jetson_id)
+        if not update:
+            return None
+        transaction.update(doc_ref, update)
+        return update, game
