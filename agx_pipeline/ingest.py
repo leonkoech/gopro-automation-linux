@@ -542,6 +542,24 @@ def run_ingestion(fb, cfg, pipeline_id: str, state: Dict, stopped: Dict, tracker
             except Exception as e:  # noqa: BLE001
                 run.log("warn", f"shot-qa enqueue skipped: {str(e)[:150]}")
 
+        # STAGE 4.6 — surface the live CV's OWN shot count on the card (shadow):
+        # every make/miss the SL/SR detector saw during the game, independent of
+        # the scorekeeper. Read from the game doc (the live loop finalized it at
+        # game stop, before this ingest). Best-effort — never breaks ingestion.
+        if fb and firebase_game_id:
+            try:
+                gd = fb.db.collection("basketball-games").document(firebase_game_id).get()
+                live = (gd.to_dict() or {}).get("shot_live") if gd.exists else None
+                if live and live.get("n_shots"):
+                    run.set_shot_detection(
+                        n_shots=int(live.get("n_shots", 0)), n_make=int(live.get("n_make", 0)),
+                        n_miss=int(live.get("n_miss", 0)), n_sl=int(live.get("n_sl", 0)),
+                        n_sr=int(live.get("n_sr", 0)), source="live")
+                else:
+                    run.set_shot_detection(0, 0, 0, 0, 0, source="live", status="none")
+            except Exception as e:  # noqa: BLE001
+                run.log("warn", f"shot-detection summary skipped: {str(e)[:120]}")
+
         # audio cross-correlation sync (FL<->FR) from the host-captured side-files;
         # runs before cleanup so the session-dir .m4a files still exist.
         _ingest_audio_sync(run, date, folder, stopped.get("audio"))

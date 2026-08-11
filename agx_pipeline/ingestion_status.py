@@ -73,6 +73,12 @@ class IngestionRun:
             # Its own node on the card. status: pending|running|done|failed|disabled.
             "shot_qa": {"status": "pending", "n_scored": 0, "n_confirmed": 0,
                         "n_disagree": 0, "secs": None, "error": None},
+            # shot-detection (CV) — the high-fps SL/SR detector's OWN shot count for
+            # this game (shadow), independent of the scorekeeper: every make/miss it
+            # saw. Its own node on the card so operators see what the CV caught even
+            # when nobody scored. status: pending|done|none. Shadow only.
+            "shot_detection": {"status": "pending", "n_shots": 0, "n_make": 0,
+                               "n_miss": 0, "n_sl": 0, "n_sr": 0, "source": None},
             # shot-detection (FLIR) footage — outcome per SL/SR angle. Separate
             # from the transcode/upload/register stages, which shot footage skips.
             "shots": {},
@@ -155,6 +161,21 @@ class IngestionRun:
             self.log("info", f"shot QA: validating {n_scored} scored makes…")
         else:
             self.log("info", f"shot QA: {status}")
+
+    def set_shot_detection(self, n_shots: int, n_make: int, n_miss: int,
+                           n_sl: int, n_sr: int, source: str = "live",
+                           status: str = "done") -> None:
+        """Milestone: the high-fps CV's own shot count for this game (shadow) —
+        every make/miss it saw on SL/SR, independent of the scorekeeper. status:
+        done|none. `source` = live (real-time shadow) or auto (post-game scan)."""
+        self.doc["shot_detection"] = {"status": status, "n_shots": n_shots,
+                                      "n_make": n_make, "n_miss": n_miss,
+                                      "n_sl": n_sl, "n_sr": n_sr, "source": source}
+        if status == "done":
+            self.log("info", f"shot detection (CV): {n_shots} shots "
+                             f"({n_sl} SL / {n_sr} SR), {n_make} make / {n_miss} miss")
+        else:
+            self._write()
 
     def set_s3(self, bucket: str, prefix: str) -> None:
         """Record the S3 folder this run uploads into (shown in the UI)."""

@@ -191,3 +191,104 @@ def create_plays_from_firebase_logs(
         summary.update({"created": created, "with_players": with_players,
                         "by_label": by_label, "skipped_existing": False})
     return created
+
+
+_HOOP_ANGLE = {"left": "LEFT", "right": "RIGHT"}
+
+
+def create_plays_from_shot_live(
+    client: Any,
+    uball_game_id: str,
+    firebase_game: Dict[str, Any],
+    dry_run: bool = False,
+    summary: Optional[Dict[str, Any]] = None,
+) -> int:
+    """Create annotation cards from the CV's `shot_live` shadow — every make/miss
+    the high-fps SL/SR detector saw, independent of the scorekeeper.
+
+    Tagged `source="cv"` so annotators can tell these from scoreboard cards AND so
+    this is idempotent on CV cards (re-runs won't duplicate). The CV knows the hoop
+    (angle LEFT/RIGHT) and make/miss but NOT the point value (→ FG_MAKE/FG_MISS,
+    2pt assumed) or the team (left for the annotator). Low confidence (0.5) flags
+    them as CV-suggested + review-needed (~65% recall / ~80% precision shadow).
+
+    `dry_run` counts without writing. Returns the number created (or would create).
+    """
+    if not uball_game_id:
+        return 0
+    live = firebase_game.get("shot_live") or {}
+    shots = live.get("shots") or []
+    if not shots:
+        return 0
+
+    # Idempotency: skip if this game already has CV cards.
+    try:
+        existing = client.list_plays(uball_game_id)
+        if any((p.get("source") == "cv") for p in existing):
+            logger.info(f"[PlaysSync/CV] Game {uball_game_id} already has CV cards — skipping.")
+            if summary is not None:
+                summary.update({"created": 0, "by_label": {}, "skipped_existing": True})
+            return 0
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"[PlaysSync/CV] list_plays check failed for {uball_game_id}: {exc}")
+
+    created_at_raw = firebase_game.get("createdAt")
+    game_start = (datetime.fromisoformat(created_at_raw.replace("Z", "+00:00"))
+                  if created_at_raw else None)
+
+    created = 0
+    by_label: Dict[str, int] = {}
+    for s in shots:
+        classification = "FG_MAKE" if s.get("made") else "FG_MISS"
+        # Video-timeline seconds: prefer wallclock - game_start; fall back to the
+        # segment offset. Approximate (SL/SR vs tracking-cam sync) — the annotator
+        # nudges it; the card + rough position is what saves them the work.
+        ts = None
+        wc = s.get("wallclock")
+        if wc and game_start:
+            try:
+                ts = (datetime.fromisoformat(wc) - game_start).total_seconds()
+            except Exception:  # noqa: BLE001
+                ts = None
+        if ts is None:
+            ts = float(s.get("seg", 0)) * 4.0 + float(s.get("t_shot", 0.0))
+        ts = max(0.0, ts)
+        angle = _HOOP_ANGLE.get(s.get("side"))
+        label = SHOT_LABELS.get(classification, classification)
+        note = f"CV: {label}" + (f" ({s.get('cam')} · {s.get('side')} rim)" if s.get("cam") else "")
+
+        play_data: Dict[str, Any] = {
+            "game_id": uball_game_id,
+            "classification": classification,
+            "note": note,
+            "timestamp_seconds": ts,
+            "start_timestamp": max(0.0, ts - 5.0),
+            "end_timestamp": ts + 3.0,
+            "source": "cv",
+            "confidence": 0.5,
+            "events": [{
+                "label": classification,
+                "playerA": None, "playerAId": None,
+                "playerB": None, "playerBId": None,
+                "confidence": 0.5,
+            }],
+        }
+        if angle:
+            play_data["angle"] = angle
+
+        if dry_run:
+            created += 1
+            by_label[classification] = by_label.get(classification, 0) + 1
+            continue
+        try:
+            client.create_play(play_data)
+            created += 1
+            by_label[classification] = by_label.get(classification, 0) + 1
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"[PlaysSync/CV] create_play failed ({classification} @ {ts:.1f}s): {exc}")
+
+    logger.info(f"[PlaysSync/CV] {'(dry-run) ' if dry_run else ''}created {created}/{len(shots)} "
+                f"CV cards for game {uball_game_id}")
+    if summary is not None:
+        summary.update({"created": created, "by_label": by_label, "skipped_existing": False})
+    return created
