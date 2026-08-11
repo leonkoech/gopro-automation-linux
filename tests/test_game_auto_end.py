@@ -19,7 +19,10 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from game_auto_end import evaluate_auto_end  # noqa: E402
+from game_auto_end import (  # noqa: E402
+    evaluate_auto_end,
+    _has_active_recording,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -236,3 +239,75 @@ def test_out_of_order_logs_use_max_timestamp_for_idle():
         _event(minutes_ago=90),   # stale event last
     ])
     assert evaluate_auto_end(game, NOW, IDLE) is None
+
+
+# ---------------------------------------------------------------------------
+# Liveness gate (UBA-305): never auto-end while a camera is still recording
+# ---------------------------------------------------------------------------
+
+MAX_SESSION_AGE = timedelta(hours=6)
+
+
+def _session(*, status: str = 'recording', started_minutes_ago: float = 60,
+             ended_at=None) -> dict:
+    return {
+        'status': status,
+        'startedAt': _iso(NOW - timedelta(minutes=started_minutes_ago)),
+        'endedAt': ended_at,
+    }
+
+
+def test_active_recording_blocks_when_started_before_last_activity():
+    # Camera rolling since before the last logged event → still filming.
+    last_activity = NOW - timedelta(minutes=40)
+    sessions = [_session(status='recording', started_minutes_ago=120)]
+    assert _has_active_recording(sessions, last_activity, NOW, MAX_SESSION_AGE) is True
+
+
+def test_recording_started_after_last_activity_does_not_block():
+    # Open session belongs to a *later* game (started after this game's silence).
+    last_activity = NOW - timedelta(minutes=90)
+    sessions = [_session(status='recording', started_minutes_ago=30)]
+    assert _has_active_recording(sessions, last_activity, NOW, MAX_SESSION_AGE) is False
+
+
+def test_only_finished_sessions_do_not_block():
+    last_activity = NOW - timedelta(minutes=40)
+    sessions = [
+        _session(status='stopped', started_minutes_ago=120),
+        _session(status='cancelled', started_minutes_ago=120),
+        _session(status='failed', started_minutes_ago=120),
+        _session(status='uploaded', started_minutes_ago=120),
+    ]
+    assert _has_active_recording(sessions, last_activity, NOW, MAX_SESSION_AGE) is False
+
+
+def test_ghost_recording_older_than_max_age_does_not_block():
+    # 'recording' with no endedAt for >6h → crashed camera, must not block forever.
+    last_activity = NOW - timedelta(minutes=40)
+    sessions = [_session(status='recording', started_minutes_ago=7 * 60)]
+    assert _has_active_recording(sessions, last_activity, NOW, MAX_SESSION_AGE) is False
+
+
+def test_session_with_ended_at_does_not_block_even_if_status_recording():
+    # Stale status but endedAt set → recording is done.
+    last_activity = NOW - timedelta(minutes=40)
+    sessions = [_session(status='recording', started_minutes_ago=120,
+                         ended_at=_iso(NOW - timedelta(minutes=10)))]
+    assert _has_active_recording(sessions, last_activity, NOW, MAX_SESSION_AGE) is False
+
+
+def test_empty_and_malformed_sessions_do_not_block():
+    last_activity = NOW - timedelta(minutes=40)
+    assert _has_active_recording([], last_activity, NOW, MAX_SESSION_AGE) is False
+    assert _has_active_recording(None, last_activity, NOW, MAX_SESSION_AGE) is False
+    bad = ['not-a-dict', {}, {'status': 'recording', 'startedAt': 'garbage'}]
+    assert _has_active_recording(bad, last_activity, NOW, MAX_SESSION_AGE) is False
+
+
+def test_evaluate_auto_end_skips_when_active_recording():
+    # Idle well past threshold, but a camera is still rolling → no auto-end.
+    game = _game(logs=[_event(minutes_ago=90)])
+    assert evaluate_auto_end(game, NOW, IDLE, active_recording=True) is None
+    # Same game with no active recording still ends.
+    assert evaluate_auto_end(game, NOW, IDLE, active_recording=False) is not None
