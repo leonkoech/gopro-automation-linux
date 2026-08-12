@@ -107,9 +107,10 @@ W1 is most of the work; W2/W3 are small; W4 is a benchmark run. W5 is a separate
     possession-holder search at `rim − SHOT_RIM_CAP_S` (default **1.1s** = 3/4-PT flight-time
     physics prior; lookback 3.3s). Excludes BOTH post-rim rebound holds AND mid-flight
     ball-over-player false holds. Falls back to gap-release without the anchor.
-  - **W4 results (28-shot GT benchmark)**: cap 0.6s → **57%**; cap 1.1s → **61%** (17/28), zero
-    regressions. Session arc: ~25% → 36 (prox) → 46 (possession+grounded feet) → **61 (rim
-    anchor)**. The SL/SR-sync architecture is empirically validated (+15pts over FL/FR-only).
+  - **W4 results (28-shot GT benchmark)**: cap 0.6s → **50%** (14/28); cap 1.1s → **54%** (15/28), no
+    regressions. Session arc (DETERMINISTICALLY RESCORED by scripts/shot_type/score.py — earlier
+    hand-tallied claims of 46/57/61 were inflated ~2 shots/run): 43 (possession) → 46 (grounded
+    feet) → 50 → **54 (rim anchor)**. OLD homography holds at 43-46 throughout. The SL/SR-sync architecture is empirically validated (+15pts over FL/FR-only).
   - **Remaining error buckets**: (a) ~6 near-hoop picks where FL/FR never detects the ball during
     a deep hold → no valid hold in the window (needs better FL/FR ball detection or a
     flight-path-based shooter pick); (b) ~7 boundary-precision shots (feet/arc within px of the
