@@ -145,6 +145,39 @@ def _single_cam_gst(cam: Camera, cfg: Config, out_path: str) -> List[str]:
     ]
 
 
+_RTSP_TIMEOUT_FLAG: Optional[str] = None
+
+
+def _rtsp_timeout_flag() -> str:
+    """ffmpeg 4.x uses `-stimeout` for the RTSP socket I/O timeout; ffmpeg 5+ renamed
+    it to `-timeout` (and `-timeout` means LISTEN mode on 4.x). Detect once. This is
+    lifted from Geoff's camrec `rtsp_timeout_flag()`."""
+    global _RTSP_TIMEOUT_FLAG
+    if _RTSP_TIMEOUT_FLAG is None:
+        try:
+            out = subprocess.run(["ffmpeg", "-hide_banner", "-h", "demuxer=rtsp"],
+                                 capture_output=True, text=True, timeout=3).stdout
+            _RTSP_TIMEOUT_FLAG = "-stimeout" if "stimeout" in out else "-timeout"
+        except Exception:  # noqa: BLE001
+            _RTSP_TIMEOUT_FLAG = "-stimeout"   # safe on 4.x; harmless err on 5+
+    return _RTSP_TIMEOUT_FLAG
+
+
+def _single_cam_ffmpeg(cam: Camera, cfg: Config, out_path: str, stimeout_us: int) -> List[str]:
+    """Host ffmpeg RTSP recorder (bitstream copy) — the proven camrec engine.
+
+    Unlike gst `mp4mux`, ffmpeg `-c copy` SURFACES a stall instead of absorbing it:
+    frozen/duplicate PTS are non-monotonic DTS -> ffmpeg drops them and its `-progress`
+    `out_time` stops advancing (which the timeline watchdog catches); `-stimeout` exits
+    ffmpeg if the socket goes quiet. Video-only — audio is captured separately."""
+    url = f"rtsp://{cam.ip}:{cfg.rtsp_port}{cfg.rtsp_path}"
+    return ["ffmpeg", "-hide_banner", "-nostdin", "-loglevel", "warning",
+            "-progress", "pipe:1",
+            "-rtsp_transport", "udp",
+            _rtsp_timeout_flag(), str(stimeout_us),
+            "-i", url, "-map", "0:v", "-c", "copy", out_path]
+
+
 def _to_container_path(host_path: str, cfg: Config) -> str:
     """Map a host path under app_mount to the container's /app/data mount."""
     rel = os.path.relpath(host_path, cfg.app_mount)
@@ -193,6 +226,16 @@ class RecordingController:
         self.wd_max_restarts = int(os.getenv("REC_WATCHDOG_MAX_RESTARTS", "40"))
         self._sessions: Dict[str, Dict] = {}   # label -> {runs, stop_evt, thread}
         self._wd_lock = threading.Lock()
+        # ffmpeg engine (adopts Geoff's camrec RTSP recorder): host ffmpeg -c copy +
+        # -stimeout + a TIMELINE heartbeat (out_time_s must ADVANCE, not just bytes),
+        # replacing the gst+byte-growth path that missed the frozen-timeline stall that
+        # lost two games. REC_ENGINE=gst (default) = unchanged; =ffmpeg opts in. See
+        # docs/RECORDER_FFMPEG_WATCHDOG_FIX.md.
+        self.engine = os.getenv("REC_ENGINE", "gst").strip().lower()
+        self.ff_stimeout_us = int(os.getenv("REC_FFMPEG_STIMEOUT_US", "5000000"))   # 5s socket
+        self.ff_stall = float(os.getenv("REC_FFMPEG_STALL_SEC", "15"))              # timeline stall
+        self.ff_poll = float(os.getenv("REC_FFMPEG_POLL_SEC", "2"))
+        self.ff_stop_grace = float(os.getenv("REC_FFMPEG_STOP_GRACE_SEC", "15"))
 
     def _docker(self, *args: str) -> subprocess.CompletedProcess:
         return subprocess.run(list(self.cfg.docker_cmd) + list(args),
@@ -209,7 +252,23 @@ class RecordingController:
         return [n for n in self._running() if n.startswith(prefix)]
 
     def is_recording(self, label: str) -> bool:
+        if self.engine == "ffmpeg":
+            return self._ff_is_recording(label)
         return bool(self._session_containers(label))
+
+    def _ff_is_recording(self, label: str) -> bool:
+        """Any of this session's ffmpegs still alive — checked via the in-memory session
+        (current process) or, after a service restart, the pid journal."""
+        with self._wd_lock:
+            sess = self._sessions.get(label)
+        if sess:
+            return any(r.get("pid") and _pid_alive(r["pid"]) for r in sess["runs"])
+        try:
+            with open(self._ff_journal_path(label)) as f:
+                procs = json.load(f)
+            return any(pr.get("pid") and _pid_alive(pr["pid"]) for pr in procs)
+        except (OSError, ValueError):
+            return False
 
     def _docker_run_cmd(self, name: str, cam: Camera, host_path: str) -> List[str]:
         """The `docker run` for one camera writing to host_path."""
@@ -227,11 +286,16 @@ class RecordingController:
         stop() concats them back to one master); `cam`/`session_dir`/`label` let the
         watchdog relaunch it."""
         host_path = os.path.join(session_dir, f"{label}_{cam.angle}.mp4")
-        name = self._container_name(label, cam.angle)
-        return {"angle": cam.angle, "id": cam.id, "name": name, "path": host_path,
-                "cmd": self._docker_run_cmd(name, cam, host_path),
-                "cam": cam, "session_dir": session_dir, "label": label,
-                "restart": 0, "segments": [host_path]}
+        run: Dict[str, object] = {"angle": cam.angle, "id": cam.id, "path": host_path,
+                                  "cam": cam, "session_dir": session_dir, "label": label,
+                                  "restart": 0, "segments": [host_path]}
+        if self.engine == "ffmpeg":
+            # host ffmpeg subprocess: proc/pid + timeline heartbeat (out_time advancing)
+            run.update({"proc": None, "pid": None, "out_time": 0.0, "last_advance": 0.0})
+        else:
+            name = self._container_name(label, cam.angle)
+            run.update({"name": name, "cmd": self._docker_run_cmd(name, cam, host_path)})
+        return run
 
     def plan(self, label: str, camera_ids: Optional[List[str]] = None) -> Dict[str, object]:
         cams = self.cfg.cameras if not camera_ids else \
@@ -243,11 +307,118 @@ class RecordingController:
                 "runs": [self._run_cmd(c, session_dir, label) for c in cams]}
 
     def _launch(self, run: Dict) -> bool:
+        if self.engine == "ffmpeg":
+            return self._launch_ffmpeg(run)
         cp = subprocess.run(run["cmd"], capture_output=True, text=True, stdin=subprocess.DEVNULL)
         if cp.returncode != 0:
             logger.error("docker run failed for %s: %s", run["angle"], cp.stderr.strip()[-300:])
             return False
         return True
+
+    # ---- ffmpeg host-subprocess engine ---------------------------------------
+    def _launch_ffmpeg(self, run: Dict) -> bool:
+        """Spawn a host ffmpeg (RTSP -c copy) in its own session so it survives a
+        service restart (orphaned, keeps writing — matches the audio path), and a
+        reader thread parses `-progress` to track the encoded timeline."""
+        try:
+            p = subprocess.Popen(
+                _single_cam_ffmpeg(run["cam"], self.cfg, run["path"], self.ff_stimeout_us),
+                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                text=True, start_new_session=True)   # stderr->DEVNULL: no pipe-fill deadlock
+        except OSError as e:  # noqa: BLE001
+            logger.error("ffmpeg launch failed for %s: %s", run["angle"], e)
+            return False
+        run["proc"] = p
+        run["pid"] = p.pid
+        run["out_time"] = 0.0
+        run["last_advance"] = time.time()
+        threading.Thread(target=self._ff_read_progress, args=(run,),
+                         name=f"ffprog-{run['label']}-{run['angle']}", daemon=True).start()
+        return True
+
+    def _ff_read_progress(self, run: Dict) -> None:
+        """Drain ffmpeg `-progress`; advance the heartbeat ONLY when the encoded time
+        (out_time) INCREASES — not merely when a progress block is emitted. This is the
+        one place we harden beyond camrec: a frozen timeline no longer looks alive."""
+        p = run.get("proc")
+        if not p or not p.stdout:
+            return
+        try:
+            for line in p.stdout:
+                if run.get("proc") is not p:   # a watchdog restart replaced us — stop updating shared state
+                    break
+                if "=" not in line:
+                    continue
+                k, v = line.strip().split("=", 1)
+                if k in ("out_time_us", "out_time_ms"):
+                    try:
+                        t = int(v) / 1_000_000.0
+                    except ValueError:
+                        continue
+                    if t > run["out_time"]:
+                        run["out_time"] = t
+                        run["last_advance"] = time.time()
+        except (ValueError, OSError):
+            pass
+
+    def _ff_finalize(self, run: Dict) -> None:
+        """SIGINT the ffmpeg so it writes the moov (clean, playable mp4); force-kill if
+        it lingers past the grace window."""
+        p = run.get("proc")
+        if not p:
+            return
+        if p.poll() is None:
+            try:
+                p.send_signal(signal.SIGINT)
+                p.wait(timeout=self.ff_stop_grace)
+            except (OSError, subprocess.TimeoutExpired):
+                try:
+                    p.kill()
+                    p.wait(timeout=5)
+                except (OSError, subprocess.TimeoutExpired):
+                    pass
+
+    def _ff_journal_path(self, label: str) -> str:
+        return os.path.join(self.cfg.output_dir, label, "video_capture.json")
+
+    def _ff_write_journal(self, label: str, runs: List[Dict]) -> None:
+        """Journal current per-camera pids so stop()/is_recording work even after a
+        service restart (the in-memory session is gone but the orphaned ffmpegs run on).
+        Rewritten after start and on every watchdog restart so it holds the live pids."""
+        try:
+            with open(self._ff_journal_path(label), "w") as f:
+                json.dump([{"angle": r["angle"], "pid": r.get("pid")} for r in runs], f)
+        except OSError:
+            pass
+
+    def _ff_stop(self, label: str, finalize_timeout: float) -> None:
+        """SIGINT each ffmpeg for a clean moov, reap, force-kill stragglers. Uses the
+        in-memory session (current process) or the pid journal (after a service restart)."""
+        with self._wd_lock:
+            sess = self._sessions.get(label)
+        if sess:
+            for r in sess["runs"]:
+                self._ff_finalize(r)
+            return
+        try:
+            with open(self._ff_journal_path(label)) as f:
+                pids = [pr["pid"] for pr in json.load(f) if pr.get("pid")]
+        except (OSError, ValueError):
+            return
+        for pid in pids:
+            try:
+                os.kill(pid, signal.SIGINT)
+            except OSError:
+                pass
+        deadline = time.time() + finalize_timeout
+        while time.time() < deadline and any(_pid_alive(pid) for pid in pids):
+            time.sleep(0.5)
+        for pid in pids:
+            if _pid_alive(pid):
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except OSError:
+                    pass
 
     def start(self, label: str, camera_ids: Optional[List[str]] = None) -> Dict[str, object]:
         if self.is_recording(label):
@@ -256,9 +427,12 @@ class RecordingController:
         os.makedirs(p["session_dir"], exist_ok=True)  # host side (best-effort)
         live = [r for r in p["runs"] if self._launch(r)]
         if not live:
-            raise RuntimeError("no camera containers started")
-        self._verify_and_retry(live)
+            raise RuntimeError("no camera recorders started")
+        if self.engine != "ffmpeg":
+            self._verify_and_retry(live)   # docker preroll check; ffmpeg's watchdog+stimeout cover it
         self._start_watchdog(label, live)
+        if self.engine == "ffmpeg":
+            self._ff_write_journal(label, live)
         audio = self._start_audio(label, camera_ids, p["session_dir"])
         outputs = [{"angle": r["angle"], "id": r["id"], "path": r["path"]} for r in live]
         logger.info("recording started (per-camera) label=%s angles=%s",
@@ -296,7 +470,8 @@ class RecordingController:
 
     # ---- mid-recording watchdog (self-healing) -------------------------------
     def _start_watchdog(self, label: str, runs: List[Dict]) -> None:
-        if not self.watchdog_on:
+        ff = self.engine == "ffmpeg"
+        if not ff and not self.watchdog_on:   # ffmpeg's timeline watchdog is mandatory (the fix)
             return
         stop_evt = threading.Event()
         t = threading.Thread(target=self._watchdog, name=f"rec-wd-{label}",
@@ -304,8 +479,9 @@ class RecordingController:
         with self._wd_lock:
             self._sessions[label] = {"runs": runs, "stop_evt": stop_evt, "thread": t}
         t.start()
-        logger.info("recording watchdog on label=%s (poll=%.0fs stall=%.0fs)",
-                    label, self.wd_poll, self.wd_stall)
+        logger.info("recording watchdog on label=%s engine=%s (poll=%.0fs stall=%.0fs)",
+                    label, self.engine, self.ff_poll if ff else self.wd_poll,
+                    self.ff_stall if ff else self.wd_stall)
 
     def _seg_path(self, run: Dict, n: int) -> str:
         """Nth restart segment, under a `_wd` subdir so _scan_outputs ignores it."""
@@ -316,15 +492,44 @@ class RecordingController:
     def _watchdog(self, label: str, runs: List[Dict], stop_evt: threading.Event) -> None:
         """Restart any camera whose file stops growing (RTSP dropped, container
         alive-but-stalled) or whose container died — the others keep rolling."""
-        seen = {r["angle"]: (-1, time.time()) for r in runs}   # angle -> (last_size, last_grow_t)
-        while not stop_evt.wait(self.wd_poll):
+        poll = self.ff_poll if self.engine == "ffmpeg" else self.wd_poll
+        seen = {r["angle"]: (-1, time.time()) for r in runs}   # gst only: angle -> (last_size, last_grow_t)
+        while not stop_evt.wait(poll):
             for r in runs:
                 try:
                     self._watch_one(r, seen)
                 except Exception as e:  # noqa: BLE001 — a watchdog hiccup must never kill recording
                     logger.warning("watchdog error on %s: %s", r.get("angle"), e)
 
+    def _watch_one_ffmpeg(self, run: Dict) -> None:
+        """Restart a camera whose ffmpeg died OR whose encoded timeline stopped
+        advancing (the frozen-timeline stall the byte-growth watchdog missed)."""
+        angle = run["angle"]
+        p = run.get("proc")
+        alive = bool(p and p.poll() is None)
+        now = time.time()
+        stalled = alive and (now - run["last_advance"]) > self.ff_stall
+        if not (stalled or not alive) or run["restart"] >= self.wd_max_restarts:
+            return
+        n = run["restart"] + 1
+        logger.warning("watchdog: camera %s %s (out_time=%.1fs, idle=%.0fs) — restarting to segment r%d",
+                       angle, "died" if not alive else "timeline-stalled",
+                       run.get("out_time", 0.0), now - run["last_advance"], n)
+        self._ff_finalize(run)                     # SIGINT -> clean moov on the pre-stall file
+        run["path"] = self._seg_path(run, n)
+        run["restart"] = n
+        run["segments"].append(run["path"])
+        if not self._launch_ffmpeg(run):
+            logger.error("watchdog relaunch (ffmpeg) failed for %s", angle)
+            return
+        with self._wd_lock:
+            sess = self._sessions.get(run["label"])
+        self._ff_write_journal(run["label"], sess["runs"] if sess else [run])
+
     def _watch_one(self, run: Dict, seen: Dict) -> None:
+        if self.engine == "ffmpeg":
+            self._watch_one_ffmpeg(run)
+            return
         angle = run["angle"]
         alive = run["name"] in self._running()
         try:
@@ -437,20 +642,28 @@ class RecordingController:
             os.rmdir(os.path.join(self.cfg.output_dir, label, "_wd"))  # empty after concat
         except OSError:
             pass
+        if self.engine == "ffmpeg":
+            try:
+                os.unlink(self._ff_journal_path(label))
+            except OSError:
+                pass
 
     def stop(self, label: str, outputs: Optional[List[Dict]] = None,
              finalize_timeout: int = 30) -> Dict[str, object]:
         self._stop_watchdog(label)  # stop self-healing before teardown (no restarts mid-stop)
-        for name in self._session_containers(label):
-            self._docker("kill", "--signal=INT", name)  # clean per-camera EOS
-        deadline = time.monotonic() + finalize_timeout
-        while time.monotonic() < deadline:
-            if not self._session_containers(label):
-                break
-            time.sleep(1)
+        if self.engine == "ffmpeg":
+            self._ff_stop(label, finalize_timeout)
         else:
             for name in self._session_containers(label):
-                self._docker("kill", name)  # force
+                self._docker("kill", "--signal=INT", name)  # clean per-camera EOS
+            deadline = time.monotonic() + finalize_timeout
+            while time.monotonic() < deadline:
+                if not self._session_containers(label):
+                    break
+                time.sleep(1)
+            else:
+                for name in self._session_containers(label):
+                    self._docker("kill", name)  # force
         self._concat_segments(label)  # merge any watchdog restart segments -> one master
         # probe only what was actually recorded: caller-supplied outputs, else
         # scan the session dir (also catches a camera that dropped mid-recording).
@@ -586,7 +799,8 @@ def main() -> int:
         print("session_dir:", p["session_dir"])
         for r in p["runs"]:
             print(f"\n{r['angle']} ({r['id']}) -> {r['path']}")
-            print("  ", " ".join(shlex.quote(x) for x in r["cmd"]))
+            cmd = r.get("cmd") or _single_cam_ffmpeg(r["cam"], cfg, r["path"], ctl.ff_stimeout_us)
+            print("  ", " ".join(shlex.quote(x) for x in cmd))
     elif args.action == "start":
         print(json.dumps(ctl.start(args.label, cam_ids), indent=2))
     elif args.action == "stop":
