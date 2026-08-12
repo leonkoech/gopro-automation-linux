@@ -178,6 +178,32 @@ Capture pass/fail evidence (ffprobe durations, log lines) into this doc under a 
 - **Deploy safety:** never deploy/restart while a game records; user green-lights the window.
   Build on a branch → user reviews → then deploy (do not self-merge/deploy).
 
+## 9. Progress / results
+
+**Implemented** on `fix/recorder-ffmpeg-timeline-watchdog` (commit `d052bc6`): host ffmpeg RTSP
+engine + `out_time_s` timeline watchdog + backoff/restart + pid journal, env-gated
+`REC_ENGINE` (default `gst`, unchanged). Both engines' commands verified via `dry-run`; gst path
+byte-identical to production baseline (`b10f270`). Fixes applied: stderr→DEVNULL (no pipe deadlock),
+reader stops updating shared state after a restart (no stale-clock clobber).
+
+**Tests passed:**
+- **T2 (core logic)** ✅ committed `tests/test_recorder_ffmpeg_watchdog.py` (`ff09eb1`): frozen clock
+  (alive, 20s idle) → restart; healthy/advancing → no restart; below-threshold → no restart; process
+  death → restart; at max-restarts → stop. This is the exact decision the byte-growth watchdog got wrong.
+- **T1 (real camera)** ✅ ran the new engine standalone on the AGX against FL (10.1.10.142): recorded
+  a valid **19.8s** mp4 (fps 29.7, ~38 Mbps, `ok=True`), `stop()` finalized cleanly, output name/path
+  identical to gst. Test artifacts cleaned up; service untouched.
+  - NOTE for the standalone path: ffmpeg `-progress pipe:1` requires a **long-lived parent** (the
+    service). A CLI that exits mid-record would SIGPIPE ffmpeg — in production the service holds it open.
+
+**Remaining before deploy:**
+- **T4 (process death → restart → concat)** and **T3 (socket stall via iptables → -stimeout → restart)**
+  end-to-end on the AGX — paused (do not run kill/iptables tests on the box without an explicit OK).
+- **T2 (integration)** truest repro = a synthetic frozen-PTS RTSP source (mediamtx + crafted stream) so
+  ffmpeg stays responsive while `out_time` freezes and the pre-freeze segment is SIGINT-saved.
+- **T5 (regression)** confirm sidecar/ingest unaffected (recording.py outputs unchanged; the shot-timing
+  `spawned_at` sidecar is written by the shot recorder / service, not recording.py — not touched).
+
 ## 8. Client comms (done)
 An apology draft (2 games named, timelines, honest root cause, fix + testing commitment) was written
 and shortened for the user to send. The Aug-11 game recorded unnamed ("team 1 vs team 2") — real
