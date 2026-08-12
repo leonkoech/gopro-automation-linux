@@ -115,3 +115,20 @@ W1 is most of the work; W2/W3 are small; W4 is a benchmark run. W5 is a separate
     flight-path-based shooter pick); (b) ~7 boundary-precision shots (feet/arc within px of the
     line — some genuinely borderline). Next levers, in order: W5 production wiring of `rim_ts`
     onto CV cards; roster name→number map to score WHO; then bucket (a).
+- 2026-08-12 (W5 session start): **committed** — gopro `1b89c83` (this doc + `scripts/shot_type/`),
+  Tracking branch `feat/slsr-rim-anchor` `ba08ca1` (classifier + calibrator).
+  - **WHO scored (first number)** via the Supabase roster name→number map: **5/7 correct when OCR
+    reads (71% precision), 25% coverage**; FL produced ZERO reads (investigate crops/angle); the 2
+    wrong reads grabbed another player's jersey from the crop stack.
+  - **W5b DESIGN FINDING (decisive):** the LIVE shadow's `seg*4+t_shot` is NOT a usable rim anchor —
+    checked 0d96's Firebase `shot_live` (197 shots, `wallclock` absent in this deployed version)
+    against W1's footage-measured `rim_base`: only **6/27 matched within 6s** (live recall gap) and
+    the matched ones scatter **+1..+5.6s, growing over the game** (segment drift). The anchor needs
+    ±0.3s. **Production design therefore = INGEST-TIME RIM REFINEMENT**: after ingest packages the
+    per-game SL/SR files (same timeline as FL/FR masters), run the windowed detector around each
+    card's approximate ts (w1_release.py method — 27/28, ±0.05s) → write precise `rim_ts` into the
+    card's `events` payload (schema-safe, no migration) → enrich/classify consumes it as
+    `SHOT_RIM_TS`. Bonus: also corrects the card ts scatter annotators currently hand-nudge.
+    Cost: ~10 GPU-min/game at ingest. Integration point: `ingest.py` STAGE 4.6 (next to
+    `create_plays_from_shot_live`) on `feat/shot-detection-trigger`. NOT yet implemented — next
+    session's build; needs deploy green-light when ready.
