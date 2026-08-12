@@ -236,6 +236,12 @@ class RecordingController:
         self.ff_stall = float(os.getenv("REC_FFMPEG_STALL_SEC", "15"))              # timeline stall
         self.ff_poll = float(os.getenv("REC_FFMPEG_POLL_SEC", "2"))
         self.ff_stop_grace = float(os.getenv("REC_FFMPEG_STOP_GRACE_SEC", "15"))
+        # exponential restart backoff (camrec model): first retry immediate, then space
+        # repeated failures 5->10->20->40->60s so a permanently-broken cam doesn't hammer;
+        # reset once a run has recorded healthily (out_time past ff_healthy_s).
+        self.ff_healthy_s = float(os.getenv("REC_FFMPEG_HEALTHY_SEC", "30"))
+        self.ff_backoff_base = float(os.getenv("REC_FFMPEG_BACKOFF_BASE_SEC", "5"))
+        self.ff_backoff_max = float(os.getenv("REC_FFMPEG_BACKOFF_MAX_SEC", "60"))
 
     def _docker(self, *args: str) -> subprocess.CompletedProcess:
         return subprocess.run(list(self.cfg.docker_cmd) + list(args),
@@ -291,7 +297,8 @@ class RecordingController:
                                   "restart": 0, "segments": [host_path]}
         if self.engine == "ffmpeg":
             # host ffmpeg subprocess: proc/pid + timeline heartbeat (out_time advancing)
-            run.update({"proc": None, "pid": None, "out_time": 0.0, "last_advance": 0.0})
+            run.update({"proc": None, "pid": None, "out_time": 0.0, "last_advance": 0.0,
+                        "consec_fail": 0, "retry_after": 0.0})
         else:
             name = self._container_name(label, cam.angle)
             run.update({"name": name, "cmd": self._docker_run_cmd(name, cam, host_path)})
@@ -505,20 +512,29 @@ class RecordingController:
         """Restart a camera whose ffmpeg died OR whose encoded timeline stopped
         advancing (the frozen-timeline stall the byte-growth watchdog missed)."""
         angle = run["angle"]
+        now = time.time()
+        if now < run.get("retry_after", 0.0):      # in backoff after a recent restart — let it settle
+            return
         p = run.get("proc")
         alive = bool(p and p.poll() is None)
-        now = time.time()
         stalled = alive and (now - run["last_advance"]) > self.ff_stall
         if not (stalled or not alive) or run["restart"] >= self.wd_max_restarts:
             return
+        # exponential backoff: reset the failure streak once a run recorded healthily
+        # (out_time past ff_healthy_s), else grow it so a broken cam doesn't hammer.
+        healthy = run.get("out_time", 0.0) >= self.ff_healthy_s
+        run["consec_fail"] = 1 if healthy else run.get("consec_fail", 0) + 1
+        delay = min(self.ff_backoff_base * (2 ** (run["consec_fail"] - 1)), self.ff_backoff_max)
         n = run["restart"] + 1
-        logger.warning("watchdog: camera %s %s (out_time=%.1fs, idle=%.0fs) — restarting to segment r%d",
+        logger.warning("watchdog: camera %s %s (out_time=%.1fs, idle=%.0fs) — restart r%d, "
+                       "next retry backoff %.0fs (fail#%d)",
                        angle, "died" if not alive else "timeline-stalled",
-                       run.get("out_time", 0.0), now - run["last_advance"], n)
+                       run.get("out_time", 0.0), now - run["last_advance"], n, delay, run["consec_fail"])
         self._ff_finalize(run)                     # SIGINT -> clean moov on the pre-stall file
         run["path"] = self._seg_path(run, n)
         run["restart"] = n
         run["segments"].append(run["path"])
+        run["retry_after"] = time.time() + delay   # gate the NEXT restart, not this respawn
         if not self._launch_ffmpeg(run):
             logger.error("watchdog relaunch (ffmpeg) failed for %s", angle)
             return

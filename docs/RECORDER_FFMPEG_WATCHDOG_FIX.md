@@ -180,29 +180,39 @@ Capture pass/fail evidence (ffprobe durations, log lines) into this doc under a 
 
 ## 9. Progress / results
 
-**Implemented** on `fix/recorder-ffmpeg-timeline-watchdog` (commit `d052bc6`): host ffmpeg RTSP
-engine + `out_time_s` timeline watchdog + backoff/restart + pid journal, env-gated
-`REC_ENGINE` (default `gst`, unchanged). Both engines' commands verified via `dry-run`; gst path
-byte-identical to production baseline (`b10f270`). Fixes applied: stderr→DEVNULL (no pipe deadlock),
-reader stops updating shared state after a restart (no stale-clock clobber).
+**Implemented** on `fix/recorder-ffmpeg-timeline-watchdog`: host ffmpeg RTSP engine + `out_time_s`
+timeline watchdog + **exponential restart backoff (5→10→20→40→60s, reset after a healthy run)** +
+pid journal, env-gated `REC_ENGINE` (default `gst`, unchanged). gst path preserved by construction
+(all gst logic sits behind engine branches; `_verify_and_retry`, `watchdog_on` gating, and SIGINT
+finalize still run for gst — deploying with `REC_ENGINE` unset changes NOTHING). Fixes applied:
+stderr→DEVNULL (no pipe deadlock), reader stops updating shared state after a restart (no stale-clock
+clobber), backoff so a permanently-broken cam doesn't hammer.
 
-**Tests passed:**
-- **T2 (core logic)** ✅ committed `tests/test_recorder_ffmpeg_watchdog.py` (`ff09eb1`): frozen clock
-  (alive, 20s idle) → restart; healthy/advancing → no restart; below-threshold → no restart; process
-  death → restart; at max-restarts → stop. This is the exact decision the byte-growth watchdog got wrong.
-- **T1 (real camera)** ✅ ran the new engine standalone on the AGX against FL (10.1.10.142): recorded
-  a valid **19.8s** mp4 (fps 29.7, ~38 Mbps, `ok=True`), `stop()` finalized cleanly, output name/path
-  identical to gst. Test artifacts cleaned up; service untouched.
-  - NOTE for the standalone path: ffmpeg `-progress pipe:1` requires a **long-lived parent** (the
-    service). A CLI that exits mid-record would SIGPIPE ffmpeg — in production the service holds it open.
+**Tests — ALL PASS:**
+- **T2 (core logic)** ✅ `tests/test_recorder_ffmpeg_watchdog.py`: frozen clock (alive, 20s idle) →
+  restart; healthy/advancing → no restart; below-threshold → no restart; process death → restart; at
+  max-restarts → stop. The exact decision the byte-growth watchdog got wrong. Still green after backoff.
+- **T1 (real camera)** ✅ new engine standalone on the AGX vs FL (10.1.10.142): valid **19.8s** mp4
+  (fps 29.7, ~38 Mbps, `ok=True`), clean `stop()`, output name/path identical to gst.
+- **T2 (integration, frozen-PTS)** ✅ `tests/integration/test_recorder_frozen_pts_agx.py` — mediamtx RTSP
+  server + a `setpts=0` publisher (bytes flow, timeline frozen = the real bug) + the real
+  `RecordingController`. Result: `out_time` stayed **0.0** the whole run while bytes flowed, and the
+  watchdog **restarted** (backoff-spaced at t=6,12,22 → 5→10→20s). The byte-growth watchdog would have
+  called this "healthy" forever and written 40GB of garbage; the timeline watchdog catches it.
+- **SALVAGE / T3-T4 (normal → drop → recover)** ✅ `tests/integration/test_recorder_salvage_agx.py` —
+  record a NORMAL source ~12s, then drop the feed. Result: Phase A `out_time` advanced 1.8→11.8s with
+  **restart=0 (no false restart on a healthy stream)**; on drop the clock froze, watchdog fired at
+  +8s (=STALL), finalized the pre-drop segment; the concatenated master = **`('FL', 11.7s, ok=True)` —
+  a PLAYABLE file containing the footage recorded before the failure.** This is the client-facing
+  promise the old watchdog broke. Covers the death/stall→restart→concat paths without needing kill/iptables.
+- **T5 (regression)** ✅ diff vs deployed baseline `b10f270` = additive ffmpeg-gated code + engine
+  dispatch only; no gst-logic changed. Default engine `gst`; `_verify_and_retry` runs for non-ffmpeg;
+  watchdog gating reduces to the original for gst; sidecar (`spawned_at`, written by the shot recorder /
+  service, not recording.py) untouched.
 
-**Remaining before deploy:**
-- **T4 (process death → restart → concat)** and **T3 (socket stall via iptables → -stimeout → restart)**
-  end-to-end on the AGX — paused (do not run kill/iptables tests on the box without an explicit OK).
-- **T2 (integration)** truest repro = a synthetic frozen-PTS RTSP source (mediamtx + crafted stream) so
-  ffmpeg stays responsive while `out_time` freezes and the pre-freeze segment is SIGINT-saved.
-- **T5 (regression)** confirm sidecar/ingest unaffected (recording.py outputs unchanged; the shot-timing
-  `spawned_at` sidecar is written by the shot recorder / service, not recording.py — not touched).
+**Deploy-ready.** All planned tests pass. Awaiting user green-light on a no-game window (§6). Rollback =
+flip `REC_ENGINE=gst` + restart. AGX test sandbox `/tmp/rectest/` keeps `mediamtx` + the branch
+`recording.py` for re-runs; test recordings cleaned.
 
 ## 8. Client comms (done)
 An apology draft (2 games named, timelines, honest root cause, fix + testing commitment) was written
