@@ -210,9 +210,16 @@ clobber), backoff so a permanently-broken cam doesn't hammer.
   watchdog gating reduces to the original for gst; sidecar (`spawned_at`, written by the shot recorder /
   service, not recording.py) untouched.
 
-**Deploy-ready.** All planned tests pass. Awaiting user green-light on a no-game window (§6). Rollback =
-flip `REC_ENGINE=gst` + restart. AGX test sandbox `/tmp/rectest/` keeps `mediamtx` + the branch
-`recording.py` for re-runs; test recordings cleaned.
+**✅ DEPLOYED + LIVE-VALIDATED 2026-08-12 ~02:19 EDT** (no-game window, user green-light). Deployed
+`recording.py` (md5 `e306dc9e…`) to `dev@100.116.99.109`, set `REC_ENGINE=ffmpeg` in `.env.agx`,
+restarted `agx-ingestion` (PID 2026613). Pre-deploy box file was byte-identical to baseline `b10f270`
+(md5 `3e5c30f…`, no drift); backup at `agx_pipeline/recording.py.bak-20260812-114812`. **Live smoke on
+the real FL/NL/FR cameras (~77s each):** all three masters valid+playable (FL 77.8s / NL 77.5s / FR 77.5s,
+~375MB each, `ok=True`), `out_time` tracked wall-clock 1:1, **zero false restarts on healthy cameras**,
+engine confirmed `ffmpeg`. Note: `RECORDING_BACKEND` (service.py) stays unset → `gstreamer` = our
+`RecordingController` (NOT the `camrec`/`CamrecController` FastAPI path); `REC_ENGINE=ffmpeg` selects the
+timeline-watchdog engine WITHIN it. **Rollback (instant):** set `REC_ENGINE=gst` (or restore the `.bak`)
++ restart. Validate on the next real game and confirm to the client.
 
 ## 8. Client comms (done)
 An apology draft (2 games named, timelines, honest root cause, fix + testing commitment) was written
