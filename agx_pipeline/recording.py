@@ -31,6 +31,7 @@ import shlex
 import signal
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
@@ -181,6 +182,17 @@ class RecordingController:
         self.verify_settle = float(os.getenv("REC_VERIFY_SETTLE_SEC", "4"))
         self.verify_retries = int(os.getenv("REC_VERIFY_RETRIES", "2"))
         self.verify_min_bytes = int(os.getenv("REC_VERIFY_MIN_BYTES", str(64 * 1024)))
+        # Mid-recording watchdog: a per-session thread that restarts a camera whose
+        # file stops growing (RTSP dropped, container alive-but-stalled) or whose
+        # container died — the self-healing our own backend lacked (camrec has it).
+        # Gated OFF by default so deploying the code changes nothing until enabled
+        # and tested on-box. Restart writes a new `.rN` segment; stop() concats.
+        self.watchdog_on = os.getenv("REC_WATCHDOG", "false").lower() in ("1", "true", "yes", "on")
+        self.wd_poll = float(os.getenv("REC_WATCHDOG_POLL_SEC", "20"))
+        self.wd_stall = float(os.getenv("REC_WATCHDOG_STALL_SEC", "45"))
+        self.wd_max_restarts = int(os.getenv("REC_WATCHDOG_MAX_RESTARTS", "40"))
+        self._sessions: Dict[str, Dict] = {}   # label -> {runs, stop_evt, thread}
+        self._wd_lock = threading.Lock()
 
     def _docker(self, *args: str) -> subprocess.CompletedProcess:
         return subprocess.run(list(self.cfg.docker_cmd) + list(args),
@@ -199,18 +211,27 @@ class RecordingController:
     def is_recording(self, label: str) -> bool:
         return bool(self._session_containers(label))
 
-    def _run_cmd(self, cam: Camera, session_dir: str, label: str) -> Dict[str, object]:
-        """One camera's {angle, id, name, path, cmd} (cmd = full docker run)."""
-        host_path = os.path.join(session_dir, f"{label}_{cam.angle}.mp4")
+    def _docker_run_cmd(self, name: str, cam: Camera, host_path: str) -> List[str]:
+        """The `docker run` for one camera writing to host_path."""
         container_path = _to_container_path(host_path, self.cfg)
-        name = self._container_name(label, cam.angle)
-        cmd = list(self.cfg.docker_cmd) + [
+        return list(self.cfg.docker_cmd) + [
             "run", "-d", "--name", name, "--rm",
             "--privileged", "--runtime", "nvidia", "--net=host",
             "-v", f"{self.cfg.app_mount}:/app/data", "--workdir", "/app/data",
             self.cfg.docker_image,
         ] + _single_cam_gst(cam, self.cfg, container_path)
-        return {"angle": cam.angle, "id": cam.id, "name": name, "path": host_path, "cmd": cmd}
+
+    def _run_cmd(self, cam: Camera, session_dir: str, label: str) -> Dict[str, object]:
+        """One camera's run dict. `path` = its current segment file; `segments` =
+        every segment written so far (the watchdog appends `.rN` files on restart,
+        stop() concats them back to one master); `cam`/`session_dir`/`label` let the
+        watchdog relaunch it."""
+        host_path = os.path.join(session_dir, f"{label}_{cam.angle}.mp4")
+        name = self._container_name(label, cam.angle)
+        return {"angle": cam.angle, "id": cam.id, "name": name, "path": host_path,
+                "cmd": self._docker_run_cmd(name, cam, host_path),
+                "cam": cam, "session_dir": session_dir, "label": label,
+                "restart": 0, "segments": [host_path]}
 
     def plan(self, label: str, camera_ids: Optional[List[str]] = None) -> Dict[str, object]:
         cams = self.cfg.cameras if not camera_ids else \
@@ -237,6 +258,7 @@ class RecordingController:
         if not live:
             raise RuntimeError("no camera containers started")
         self._verify_and_retry(live)
+        self._start_watchdog(label, live)
         audio = self._start_audio(label, camera_ids, p["session_dir"])
         outputs = [{"angle": r["angle"], "id": r["id"], "path": r["path"]} for r in live]
         logger.info("recording started (per-camera) label=%s angles=%s",
@@ -272,8 +294,153 @@ class RecordingController:
                 time.sleep(1)
                 self._launch(r)
 
+    # ---- mid-recording watchdog (self-healing) -------------------------------
+    def _start_watchdog(self, label: str, runs: List[Dict]) -> None:
+        if not self.watchdog_on:
+            return
+        stop_evt = threading.Event()
+        t = threading.Thread(target=self._watchdog, name=f"rec-wd-{label}",
+                             args=(label, runs, stop_evt), daemon=True)
+        with self._wd_lock:
+            self._sessions[label] = {"runs": runs, "stop_evt": stop_evt, "thread": t}
+        t.start()
+        logger.info("recording watchdog on label=%s (poll=%.0fs stall=%.0fs)",
+                    label, self.wd_poll, self.wd_stall)
+
+    def _seg_path(self, run: Dict, n: int) -> str:
+        """Nth restart segment, under a `_wd` subdir so _scan_outputs ignores it."""
+        wd = os.path.join(run["session_dir"], "_wd")
+        os.makedirs(wd, exist_ok=True)
+        return os.path.join(wd, f"{run['label']}_{run['angle']}.r{n}.mp4")
+
+    def _watchdog(self, label: str, runs: List[Dict], stop_evt: threading.Event) -> None:
+        """Restart any camera whose file stops growing (RTSP dropped, container
+        alive-but-stalled) or whose container died — the others keep rolling."""
+        seen = {r["angle"]: (-1, time.time()) for r in runs}   # angle -> (last_size, last_grow_t)
+        while not stop_evt.wait(self.wd_poll):
+            for r in runs:
+                try:
+                    self._watch_one(r, seen)
+                except Exception as e:  # noqa: BLE001 — a watchdog hiccup must never kill recording
+                    logger.warning("watchdog error on %s: %s", r.get("angle"), e)
+
+    def _watch_one(self, run: Dict, seen: Dict) -> None:
+        angle = run["angle"]
+        alive = run["name"] in self._running()
+        try:
+            size = os.path.getsize(run["path"])
+        except OSError:
+            size = -1
+        last_size, last_grow = seen[angle]
+        now = time.time()
+        if size > last_size:                      # growing normally
+            seen[angle] = (size, now)
+            return
+        stalled = alive and (now - last_grow) > self.wd_stall
+        if not (stalled or not alive) or run["restart"] >= self.wd_max_restarts:
+            return
+        n = run["restart"] + 1
+        logger.warning("watchdog: camera %s %s — restarting to segment r%d",
+                       angle, "died" if not alive else "stalled", n)
+        if alive:   # SIGINT -> gst `-e` EOS -> mp4mux finalizes the pre-drop file
+            self._docker("kill", "--signal=INT", run["name"])
+            for _ in range(8):
+                if run["name"] not in self._running():
+                    break
+                time.sleep(1)
+        self._docker("kill", run["name"])          # force-remove if it lingered (--rm cleans)
+        new_path = self._seg_path(run, n)
+        new_name = f"{self._container_name(run['label'], angle)}_r{n}"
+        cp = subprocess.run(self._docker_run_cmd(new_name, run["cam"], new_path),
+                            capture_output=True, text=True, stdin=subprocess.DEVNULL)
+        if cp.returncode != 0:
+            logger.error("watchdog relaunch failed for %s: %s", angle, cp.stderr.strip()[-200:])
+            return
+        run["restart"] = n
+        run["name"] = new_name
+        run["path"] = new_path
+        run["segments"].append(new_path)
+        seen[angle] = (-1, time.time())
+
+    def _stop_watchdog(self, label: str) -> None:
+        with self._wd_lock:
+            sess = self._sessions.get(label)
+        if not sess:
+            return
+        sess["stop_evt"].set()
+        t = sess.get("thread")
+        if t and t.is_alive():
+            t.join(timeout=self.wd_poll + 3)
+
+    def _seg_ok(self, path: str) -> bool:
+        """A segment is usable only if ffprobe can read a positive duration — a
+        crashed (SIGKILL'd) container leaves an unfinalized mp4 with no moov, which
+        must be DROPPED, not fed to concat (it would break the whole concat)."""
+        if not (os.path.isfile(path) and os.path.getsize(path) > 0):
+            return False
+        r = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                            "-of", "csv=p=0", path], capture_output=True, text=True,
+                           stdin=subprocess.DEVNULL)
+        try:
+            return float(r.stdout.strip()) > 0
+        except (ValueError, TypeError):
+            return False
+
+    def _concat_segments(self, label: str) -> None:
+        """After stop: for any camera the watchdog restarted, concat its READABLE
+        segments [master + _wd/.rN] back into the single master {label}_{angle}.mp4
+        so ingest sees one file per camera (a ~stall-window gap between segments;
+        an unfinalized crashed segment is dropped, the recovery kept)."""
+        with self._wd_lock:
+            sess = self._sessions.get(label)
+        if not sess:
+            return
+        for run in sess["runs"]:
+            if len(run["segments"]) <= 1:
+                continue                       # never restarted — master is fine as-is
+            segs = [p for p in run["segments"] if self._seg_ok(p)]
+            master = os.path.join(run["session_dir"], f"{label}_{run['angle']}.mp4")
+            if not segs:
+                logger.error("watchdog: no readable segments for %s — footage lost", run["angle"])
+                continue
+            tmp, lst = master + ".concat.mp4", master + ".concat.txt"
+            try:
+                with open(lst, "w") as f:
+                    f.writelines(f"file '{p}'\n" for p in segs)
+                cp = subprocess.run(["ffmpeg", "-nostdin", "-loglevel", "error", "-y",
+                                     "-f", "concat", "-safe", "0", "-i", lst, "-c", "copy", tmp],
+                                    capture_output=True, text=True, stdin=subprocess.DEVNULL)
+                if cp.returncode == 0 and os.path.isfile(tmp) and os.path.getsize(tmp) > 0:
+                    for p in segs:
+                        if p != master:
+                            try:
+                                os.unlink(p)
+                            except OSError:
+                                pass
+                    os.replace(tmp, master)
+                    logger.info("watchdog: concatenated %d segments for %s", len(segs), run["angle"])
+                else:
+                    logger.error("watchdog concat failed for %s: %s", run["angle"],
+                                 cp.stderr.strip()[-200:])
+            except Exception as e:  # noqa: BLE001
+                logger.error("watchdog concat error %s: %s", run["angle"], e)
+            finally:
+                try:
+                    os.unlink(lst)
+                except OSError:
+                    pass
+
+    def _cleanup_session(self, label: str) -> None:
+        with self._wd_lock:
+            self._sessions.pop(label, None)
+        try:
+            os.rmdir(os.path.join(self.cfg.output_dir, label, "_wd"))  # empty after concat
+        except OSError:
+            pass
+
     def stop(self, label: str, outputs: Optional[List[Dict]] = None,
              finalize_timeout: int = 30) -> Dict[str, object]:
+        self._stop_watchdog(label)  # stop self-healing before teardown (no restarts mid-stop)
         for name in self._session_containers(label):
             self._docker("kill", "--signal=INT", name)  # clean per-camera EOS
         deadline = time.monotonic() + finalize_timeout
@@ -284,12 +451,14 @@ class RecordingController:
         else:
             for name in self._session_containers(label):
                 self._docker("kill", name)  # force
+        self._concat_segments(label)  # merge any watchdog restart segments -> one master
         # probe only what was actually recorded: caller-supplied outputs, else
         # scan the session dir (also catches a camera that dropped mid-recording).
         if outputs is None:
             outputs = self._scan_outputs(label)
         results = [{**o, **_probe(o["path"])} for o in outputs]
         audio = self._stop_audio(os.path.join(self.cfg.output_dir, label))
+        self._cleanup_session(label)
         return {"label": label, "stopped_at": _utcnow(), "files": results,
                 "audio": audio}
 
