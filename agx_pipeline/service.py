@@ -100,7 +100,8 @@ def transcode_active() -> bool:
 # Real-time shot detector over the live SL/SR segments (shadow-first, off unless
 # SHOT_LIVE_ENABLED). Reads only the segments produced when SHOT_SEGMENT_ENABLED
 # is on; pauses on transcode_active so it never competes with a live transcode.
-LIVE = (LiveShotScorer(CFG, FB, should_pause=transcode_active)
+LIVE = (LiveShotScorer(CFG, FB, should_pause=transcode_active,
+                       on_make=lambda cmd: _do_highlight(cmd))
         if SHOT and live_enabled() else None)
 AUTO_RECORD = os.getenv("AUTO_RECORD_ON_GAME", "true").lower() in ("1", "true", "yes")
 AUTO_MAX_AGE_MIN = int(os.getenv("AUTO_RECORD_MAX_AGE_MIN", "45"))       # ignore games older than this
@@ -445,7 +446,10 @@ def _do_highlight(cmd: Dict):
     # (issue #4): team+period ride on the command, startingSideTeam1 is on the
     # game doc. Unknown side → left recorder (the prior single-buffer default).
     sst = _starting_side_team1(game_id)
-    side = scoring_hoop_side(cmd.get("team"), cmd.get("period"), sst)
+    # CV-triggered cuts carry the hoop side directly (SL=left / SR=right);
+    # scorekeeper cuts derive it from team+period as before.
+    side = (cmd.get("side") if cmd.get("side") in ("left", "right")
+            else scoring_hoop_side(cmd.get("team"), cmd.get("period"), sst))
     recorder = HIGHLIGHT.recorder_for(side)
     req = {"game_id": game_id, "log_id": str(log_id), "ts_epoch": t_epoch,
            "label": label or recorder.status().get("label"),

@@ -56,6 +56,12 @@ def live_enabled() -> bool:
     return os.getenv("SHOT_LIVE_ENABLED", "false").strip().lower() in ("1", "true", "yes", "on")
 
 
+def autohighlight_enabled() -> bool:
+    """CV make -> auto highlight clip (same pipeline as scorekeeper clips).
+    Default OFF; flip SHOT_AUTO_HIGHLIGHT=true on the box when ready."""
+    return os.getenv("SHOT_AUTO_HIGHLIGHT", "false").lower() in ("1", "true", "yes", "on")
+
+
 def autoscore_enabled() -> bool:
     return os.getenv("SHOT_AUTOSCORE_ENABLED", "false").strip().lower() in ("1", "true", "yes", "on")
 
@@ -75,10 +81,14 @@ class LiveShotScorer:
     """Per-game live reader over the SL/SR segments. start()/stop() mirror the
     HighlightBuffer so service.py drives it exactly alongside the recorders."""
 
-    def __init__(self, cfg, fb, should_pause: Optional[Callable[[], bool]] = None):
+    def __init__(self, cfg, fb, should_pause: Optional[Callable[[], bool]] = None,
+                 on_make: Optional[Callable[[Dict], object]] = None):
         self.cfg = cfg
         self.fb = fb
         self._should_pause = should_pause or (lambda: False)
+        # Called with a highlight-cut cmd for every CV MAKE (service wires this to
+        # the same handler the scorekeeper's relay command uses).
+        self._on_make = on_make
         self._lock = threading.Lock()
         self._stop_evt = threading.Event()
         self._thread: Optional[threading.Thread] = None
@@ -238,6 +248,8 @@ class LiveShotScorer:
                         base_idx, t_shot, v["verdict"])
             if rec["made"] and autoscore_enabled():
                 self._maybe_autoscore(game_id, rec, starting_side)
+            if rec["made"] and autohighlight_enabled():
+                self._maybe_highlight(game_id, rec)
         self._advance_prev(prev_seg, angle, idx, path)
 
     def _concat(self, a: str, b: str) -> Optional[str]:
@@ -270,6 +282,28 @@ class LiveShotScorer:
         prev_seg[angle] = (idx, path)
 
     # ---- Phase C seam (NOT yet wired to the visible scoreboard) ------------- #
+    def _maybe_highlight(self, game_id: str, shot: Dict) -> None:
+        """Cut a highlight clip for a CV-detected make — the SAME pipeline as a
+        scorekeeper score row (buffer -> transcode -> S3 -> highlights.{id} on the
+        game doc), keyed `cv_<epoch>_<side>` so the frontend's CV timeline rows can
+        grow the green play button. Best-effort: a failed cut never affects
+        detection. Side comes straight from the shot cam (SL=left / SR=right)."""
+        if self._on_make is None:
+            return
+        wc = shot.get("wallclock")
+        side = shot.get("side")
+        if not wc or side not in ("left", "right"):
+            logger.info("shot-live highlight skipped (wc=%s side=%s)", wc, side)
+            return
+        epoch = self._epoch(wc)
+        cmd = {"logId": f"cv_{int(epoch)}_{side}" if epoch else f"cv_{wc}_{side}",
+               "ts": wc, "side": side, "firebase_game_id": game_id}
+        try:
+            resp = self._on_make(cmd)
+            logger.info("shot-live AUTO-HIGHLIGHT %s -> %s", cmd["logId"], resp)
+        except Exception as e:  # noqa: BLE001 — never break the detector
+            logger.warning("shot-live auto-highlight failed for %s: %s", cmd["logId"], e)
+
     def _maybe_autoscore(self, game_id: str, shot: Dict, starting_side: Optional[str]) -> None:
         """Phase C: turn a CV make into +2 on the live scoreboard. Deliberately a
         no-op write for now — it needs team attribution (side+period -> team) and
