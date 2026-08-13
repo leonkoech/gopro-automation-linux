@@ -402,6 +402,16 @@ def cut_highlight(fb, cfg, recorder: HighlightRecorder, req: Dict) -> None:
                                     "s3_key": key, "angle": angle,
                                     "duration": pre + post})
         logger.info("highlight ready %s/%s angle=%s key=%s", game_id, log_id, angle, key)
+        # CV makes: queue the finished clip for live shot-value typing (2/3/4pt
+        # onto cv_points.{logId} -> the CV scorecard). After the ready-mark so
+        # the green button is never delayed; best-effort, never fails the cut.
+        if log_id.startswith("cv_"):
+            try:
+                from agx_pipeline.shot_typing_live import get_typer, typing_enabled
+                if typing_enabled():
+                    get_typer(fb).enqueue(game_id, log_id, angle, final, pre)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("typing enqueue failed for %s: %s", log_id, e)
         for p in (merged, hd, lst):
             try:
                 os.unlink(p)
