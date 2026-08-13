@@ -365,7 +365,12 @@ class LiveShotScorer:
     @staticmethod
     def _wallclock(spawned_iso: Optional[str], t: float) -> Optional[str]:
         try:
-            return (datetime.fromisoformat(spawned_iso) + timedelta(seconds=float(t))).isoformat()
+            # The sidecar's spawned_at ends in "Z"; py3.10 fromisoformat can't
+            # parse that suffix. Without this, wallclock is None for EVERY shot
+            # and _maybe_highlight silently never fires (the 2026-08-12 games'
+            # shadow docs all show wallclock: null).
+            return (datetime.fromisoformat(spawned_iso.replace("Z", "+00:00"))
+                    + timedelta(seconds=float(t))).isoformat()
         except Exception:  # noqa: BLE001
             return None
 
@@ -396,6 +401,13 @@ class LiveShotScorer:
             "n_miss": len(shadow) - n_make,
             "n_sl": sum(1 for s in shadow if s["cam"] == "SL"),
             "n_sr": sum(1 for s in shadow if s["cam"] == "SR"),
+            # per-hoop-side make counts: the CV auto-scorecard's source numbers
+            # (team attribution + halftime flip happen in the frontend, which
+            # owns the period state; this stays a pure count).
+            "n_make_left": sum(1 for s in shadow
+                               if s["made"] and s.get("side") == "left"),
+            "n_make_right": sum(1 for s in shadow
+                                if s["made"] and s.get("side") == "right"),
             "backlog": (backlog or {}).get("now", 0),
             "max_backlog": (backlog or {}).get("max", 0),
             "shots": shadow[-SHADOW_CAP:], "secs": round(time.time() - t0, 1),
