@@ -54,6 +54,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shutil
 import signal
 import subprocess
 import time
@@ -66,6 +67,23 @@ logger = logging.getLogger("agx.shot")
 DEFAULT_BITRATE = os.getenv("SHOT_BITRATE", "8000000")            # NVENC bits/sec
 DEFAULT_IFRAME = os.getenv("SHOT_IFRAME_INTERVAL", "30")
 START_SETTLE_SEC = float(os.getenv("SHOT_START_SETTLE_SEC", "2.5"))
+# Live segmentation (real-time shot detection): when ON, the encoded H.264 is
+# tee'd to a SECOND sink that closes short, seekable MP4 segments every
+# SHOT_SEGMENT_SEC — readable WHILE recording (the master mp4mux only writes its
+# moov at EOS, so the master stays un-tailable mid-game). Default OFF: with it
+# off the pipeline is byte-for-byte the original single mp4mux->filesink, so the
+# recording path is unchanged until this is deliberately enabled in a no-game
+# window. The segment branch is `leaky` so it can NEVER back-pressure the master.
+SHOT_SEGMENT_ENABLED = os.getenv("SHOT_SEGMENT_ENABLED", "false").strip().lower() in (
+    "1", "true", "yes", "on")
+SHOT_SEGMENT_SEC = int(os.getenv("SHOT_SEGMENT_SEC", "4"))
+
+
+def shot_seg_dir(output_dir: str, label: str) -> str:
+    """Where the live SL/SR segments land — a sibling of recordings/{label} so it
+    survives ingest's session rmtree (mirrors highlight_buf). Both angles share
+    the dir; the angle is in each segment's filename."""
+    return os.path.join(output_dir, "shot_seg", label)
 # Constant frame rate locked on the camera via caps (0 disables the lock and
 # reverts to free-running — see module docstring for why locked 120 is the default).
 SHOT_FPS = int(os.getenv("SHOT_FPS", "120"))
@@ -89,7 +107,8 @@ class AravisRecorder:
         return [c for cid in camera_ids
                 for c in [self.cfg.shot_camera_by_id(cid)] if c]
 
-    def _pipeline(self, cam: Camera, out_path: str) -> List[str]:
+    def _pipeline(self, cam: Camera, out_path: str,
+                  seg_dir: Optional[str] = None) -> List[str]:
         src = ["aravissrc", f"camera-name={cam.camera_name or cam.ip}", "do-timestamp=true"]
         if SHOT_EXPOSURE_US > 0:
             # NB: aravis' GstArvAuto enum nick for Continuous is "on", NOT
@@ -108,10 +127,34 @@ class AravisRecorder:
             # IDR frames are seekable (same defect fixed in ingest._transcode_hw)
             "insert-sps-pps=1", f"iframeinterval={DEFAULT_IFRAME}",
             f"idrinterval={DEFAULT_IFRAME}", "maxperf-enable=1",
-            "!", "h264parse", "!", "mp4mux",
-            "!", "filesink", f"location={out_path}",
+            "!", "h264parse",
         ]
+        cmd += self._sink(cam, out_path, seg_dir)
         return cmd
+
+    def _sink(self, cam: Camera, out_path: str,
+              seg_dir: Optional[str]) -> List[str]:
+        """Encoder tail. Default: the original single master file. With live
+        segmentation enabled, `tee` the SAME encoded H.264 to the master AND a
+        `splitmuxsink` writing closed, seekable segments for real-time reading —
+        the master branch is unchanged, and the segment branch is `leaky` so a
+        slow disk/reader can drop segment frames but can NEVER stall the master."""
+        master = ["!", "mp4mux", "!", "filesink", f"location={out_path}"]
+        if not (SHOT_SEGMENT_ENABLED and seg_dir):
+            return master
+        seg_pattern = os.path.join(seg_dir, f"seg_%05d_{cam.angle}.mp4")
+        return [
+            "!", "tee", "name=shottee",
+            # master branch — a queue (canonical tee pattern: every branch needs
+            # one, else the tee src can't link the mux request pad) then the SAME
+            # mux+file, so the master stays identical to the non-segmented output.
+            "shottee.", "!", "queue", *master,
+            # live-segment branch — leaky so it can't back-pressure the master
+            "shottee.", "!", "queue", "leaky=downstream",
+            "max-size-buffers=400", "max-size-time=0", "max-size-bytes=0",
+            "!", "splitmuxsink", f"location={seg_pattern}",
+            f"max-size-time={SHOT_SEGMENT_SEC * 1_000_000_000}",
+        ]
 
     def _outputs_for(self, procs: List[Dict], alive_only: bool) -> List[Dict]:
         out = []
@@ -135,13 +178,20 @@ class AravisRecorder:
             raise RuntimeError(f"shot session {label} already recording")
         session_dir = os.path.join(self.cfg.output_dir, label)
         os.makedirs(session_dir, exist_ok=True)
+        # Live-segment dir (only used when SHOT_SEGMENT_ENABLED): wipe any stale
+        # segments from a previous run of this label so the live reader never
+        # sees old footage. Best-effort — a wipe failure must not block recording.
+        seg_dir = shot_seg_dir(self.cfg.output_dir, label) if SHOT_SEGMENT_ENABLED else None
+        if seg_dir:
+            shutil.rmtree(seg_dir, ignore_errors=True)
+            os.makedirs(seg_dir, exist_ok=True)
         procs: List[Dict] = []
         try:
             for cam in cams:
                 out_path = os.path.join(session_dir, f"{label}_{cam.angle}.mp4")
                 spawned_at = _utcnow()  # wall-clock anchor for cross-camera sync
                 proc = subprocess.Popen(
-                    self._pipeline(cam, out_path),
+                    self._pipeline(cam, out_path, seg_dir),
                     stdin=subprocess.DEVNULL,
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
@@ -269,9 +319,10 @@ def main() -> int:
     cam_ids = args.cameras.split(",") if args.cameras else None
 
     if args.action == "dry-run":
+        seg_dir = shot_seg_dir(cfg.output_dir, args.label) if SHOT_SEGMENT_ENABLED else None
         for cam in rec._select(cam_ids):
             out = os.path.join(cfg.output_dir, args.label, f"{args.label}_{cam.angle}.mp4")
-            print(f"{cam.angle} ({cam.id}):", " ".join(rec._pipeline(cam, out)))
+            print(f"{cam.angle} ({cam.id}):", " ".join(rec._pipeline(cam, out, seg_dir)))
     elif args.action == "start":
         started = rec.start(args.label, cam_ids)
         print(json.dumps(started, indent=2))

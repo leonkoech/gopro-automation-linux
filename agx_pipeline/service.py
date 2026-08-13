@@ -36,6 +36,7 @@ from agx_pipeline.recording import RecordingController, load_config
 from agx_pipeline.camrec_controller import CamrecController
 from agx_pipeline.shot_recording import AravisRecorder
 from agx_pipeline.highlight import HighlightBuffer, cut_highlight
+from agx_pipeline.shot_detect.live import LiveShotScorer, live_enabled
 from agx_pipeline.side_attribution import scoring_hoop_side
 from agx_pipeline.sessions import AgxSessionTracker, get_active_game
 from agx_pipeline.notifier import CameraAlerter
@@ -71,6 +72,37 @@ _current: Dict[str, object] = {}   # {label, firebase_game_id, container, output
 _last_pipeline: Optional[Dict] = None
 _RELAY = None                      # Firebase relay (status heartbeat + command consumer)
 _auto_recorded: set = set()        # firebase_game_ids already auto-handled (avoid re-recording)
+_active_ingests = 0                # in-flight ingestion threads (GPU HW-transcode)
+
+
+def is_gpu_free() -> bool:
+    """True only when nothing is recording AND no ingestion is transcoding — the
+    gate the deferred shot-QA worker honors so it NEVER competes with a live game
+    for the GPU. Recording + live highlights always win."""
+    with _lock:
+        return not _current and _active_ingests == 0
+
+
+def transcode_active() -> bool:
+    """True only while an ingestion is in its GPU TRANSCODE stage — NOT its long
+    upload/register phases. The LIVE shot loop pauses on this so it yields the GPU
+    for the actual transcode but keeps detecting through a prior game's upload
+    window (ingests run ~30min but only ~7-15min is transcode; games are ~10min
+    apart, so the coarse whole-ingest gate would starve games 2/3 of live data).
+    It runs DURING recording by design; recording (NVENC) is unaffected regardless."""
+    try:
+        from agx_pipeline.ingest import is_transcoding
+        return is_transcoding()
+    except Exception:  # noqa: BLE001
+        return False
+
+
+# Real-time shot detector over the live SL/SR segments (shadow-first, off unless
+# SHOT_LIVE_ENABLED). Reads only the segments produced when SHOT_SEGMENT_ENABLED
+# is on; pauses on transcode_active so it never competes with a live transcode.
+LIVE = (LiveShotScorer(CFG, FB, should_pause=transcode_active,
+                       on_make=lambda cmd: _do_highlight(cmd))
+        if SHOT and live_enabled() else None)
 AUTO_RECORD = os.getenv("AUTO_RECORD_ON_GAME", "true").lower() in ("1", "true", "yes")
 AUTO_MAX_AGE_MIN = int(os.getenv("AUTO_RECORD_MAX_AGE_MIN", "45"))       # ignore games older than this
 AUTO_MAX_DURATION_MIN = int(os.getenv("AUTO_RECORD_MAX_DURATION_MIN", "180"))  # safety auto-stop
@@ -154,6 +186,7 @@ def _device_state() -> Dict:
         },
         "current_ingestion": (_last_pipeline or {}).get("pipeline_id"),
         "highlight": HIGHLIGHT.status() if HIGHLIGHT else None,
+        "shot_live": LIVE.status() if LIVE else None,
         "location": CFG.location,
     }
 
@@ -278,6 +311,11 @@ def _do_start(game_id=None, label=None, force=False):
                 HIGHLIGHT.start(label)
             except Exception as e:  # noqa: BLE001
                 logger.warning("highlight recorder failed to start: %s", e)
+        if LIVE:
+            try:
+                LIVE.start(label, game_id, _starting_side_team1(game_id))
+            except Exception as e:  # noqa: BLE001
+                logger.warning("shot-live failed to start: %s", e)
     logger.info("recording started label=%s game=%s force=%s angles=%s",
                 label, game_id, bool(force), [o["angle"] for o in outputs])
     _publish()
@@ -324,6 +362,11 @@ def _do_stop():
                 HIGHLIGHT.stop()
             except Exception as e:  # noqa: BLE001
                 logger.warning("highlight recorder stop failed: %s", e)
+        if LIVE:
+            try:
+                LIVE.stop()
+            except Exception as e:  # noqa: BLE001
+                logger.warning("shot-live stop failed: %s", e)
     if track_err is not None:
         return {"success": False, "error": track_err}, 500
     if TRACKER:
@@ -402,14 +445,24 @@ def _do_highlight(cmd: Dict):
     # Route the cut to the camera on the scoring team's current hoop side
     # (issue #4): team+period ride on the command, startingSideTeam1 is on the
     # game doc. Unknown side → left recorder (the prior single-buffer default).
-    side = scoring_hoop_side(cmd.get("team"), cmd.get("period"),
-                             _starting_side_team1(game_id))
+    sst = _starting_side_team1(game_id)
+    # CV-triggered cuts carry the hoop side directly (SL=left / SR=right);
+    # scorekeeper cuts derive it from team+period as before.
+    side = (cmd.get("side") if cmd.get("side") in ("left", "right")
+            else scoring_hoop_side(cmd.get("team"), cmd.get("period"), sst))
     recorder = HIGHLIGHT.recorder_for(side)
     req = {"game_id": game_id, "log_id": str(log_id), "ts_epoch": t_epoch,
            "label": label or recorder.status().get("label"),
            "pre": cmd.get("pre"), "post": cmd.get("post")}
     threading.Thread(target=cut_highlight, args=(FB, CFG, recorder, req),
                      name=f"highlight-{str(log_id)[:8]}", daemon=True).start()
+    # Env-gated shadow shot-detection validation (SHOT_VALIDATION_ENABLED, default
+    # OFF). Best-effort on its own daemon thread — never affects the clip above.
+    try:
+        from agx_pipeline.shot_detect.node import validate_async
+        validate_async(FB, CFG, cmd, game_id, label, sst)
+    except Exception:  # noqa: BLE001
+        pass
     return {"success": True, "queued": True, "logId": str(log_id),
             "side": side, "angle": recorder.angle()}, 202
 
@@ -482,10 +535,16 @@ def _create_pipeline_run(pipeline_id: str, state: Dict, stopped: Dict) -> None:
 def _start_ingestion(pipeline_id: str, state: Dict, stopped: Dict) -> None:
     """Run P1 ingestion (transcode → upload → register), driving the ingestion-runs doc."""
     from agx_pipeline.ingest import run_ingestion
+    global _active_ingests
+    with _lock:
+        _active_ingests += 1                  # gate the shot-QA worker off the GPU
     try:
         run_ingestion(FB, CFG, pipeline_id, state, stopped, TRACKER)
     except Exception as e:  # noqa: BLE001
         logger.error("ingestion %s crashed: %s", pipeline_id, e)
+    finally:
+        with _lock:
+            _active_ingests = max(0, _active_ingests - 1)
 
 
 if __name__ == "__main__":
@@ -502,6 +561,10 @@ if __name__ == "__main__":
         if os.getenv("COURTSIDE_SCRAPE", "true").lower() in ("1", "true", "yes"):
             from agx_pipeline.courtside import start_refresh
             start_refresh(FB, int(os.getenv("COURTSIDE_REFRESH_MIN", "30")))
+        # Deferred shot-detection QA worker: drains the shot-qa-queue only while
+        # is_gpu_free() (nothing recording/ingesting). Dormant unless SHOT_QA_ENABLED.
+        from agx_pipeline.shot_detect.qa import start_worker as _start_qa_worker
+        _start_qa_worker(FB, CFG, is_gpu_free)
     logger.info("AGX service starting on :%d (firebase=%s, cameras=%d, relay=%s, auto_record=%s)",
                 port, FB is not None, len(CFG.cameras), _RELAY is not None, AUTO_RECORD)
     app.run(host="0.0.0.0", port=port)

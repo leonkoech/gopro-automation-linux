@@ -34,6 +34,7 @@ import concurrent.futures
 import logging
 import os
 import subprocess
+import threading
 from datetime import datetime, timezone
 from typing import Dict, Optional
 
@@ -52,6 +53,11 @@ DELETE_RAW = os.getenv("DELETE_RAW_AFTER_TRANSCODE", "true").lower() in ("1", "t
 # pipeline against real footage). Flip to false later to process it locally on
 # the AGX only — one env change, no code change.
 SHOTDET_UPLOAD_S3 = os.getenv("SHOTDET_UPLOAD_S3", "true").lower() in ("1", "true", "yes")
+# Auto-seed annotation cards from the CV's shot_live detections (one card per shot
+# the SL/SR detector saw), so a game is carded even when the scorekeeper didn't
+# score. Off by default — it seeds ~150-200 review-flagged (source="cv") cards per
+# game into the annotators' workflow, so it's an explicit opt-in.
+SHOT_CARDS_ENABLED = os.getenv("SHOT_CARDS_ENABLED", "false").lower() in ("1", "true", "yes")
 CRF = os.getenv("TRANSCODE_CRF", "23")
 PRESET = os.getenv("TRANSCODE_PRESET", "veryfast")
 HW_BITRATE = os.getenv("TRANSCODE_HW_BITRATE", "8000000")  # NVENC bits/sec for 1080p
@@ -59,6 +65,32 @@ MAX_PARALLEL = int(os.getenv("TRANSCODE_PARALLEL", "2"))
 UBALL_ANGLE = {"FL": "LEFT", "FR": "RIGHT"}  # registered angles (annotation is 2-angle today)
 SETTINGS_COLLECTION = "agx-settings"
 TRANSCODE_DEFAULT = os.getenv("TRANSCODE_ENABLED", "true").lower() in ("1", "true", "yes")
+
+# GPU-transcode activity gate. `_active_ingests` (in service.py) is True for the
+# WHOLE ~30min ingest lifecycle (transcode + the long S3 upload + register); the
+# live shot loop only needs to yield during the ACTUAL GPU transcode (~7-15min),
+# so it can keep detecting through a prior game's upload window. This counter is
+# raised only around the transcode stage and read via is_transcoding().
+_transcode_lock = threading.Lock()
+_transcoding = 0
+
+
+def is_transcoding() -> bool:
+    """True while any ingestion is in its GPU transcode stage (NOT upload/register)."""
+    with _transcode_lock:
+        return _transcoding > 0
+
+
+def _transcode_begin() -> None:
+    global _transcoding
+    with _transcode_lock:
+        _transcoding += 1
+
+
+def _transcode_end() -> None:
+    global _transcoding
+    with _transcode_lock:
+        _transcoding = max(0, _transcoding - 1)
 
 
 def _transcode_enabled(fb, jetson_id: str) -> bool:
@@ -364,7 +396,9 @@ def run_ingestion(fb, cfg, pipeline_id: str, state: Dict, stopped: Dict, tracker
         run.set_s3(BUCKET, f"{LOCATION}/{date}/{folder}/")
         work_dir = os.path.join(cfg.output_dir, label, "1080p")
 
-        # STAGE 1 — transcode (parallel, bounded); mark each angle as it finishes
+        # STAGE 1 — transcode (parallel, bounded); mark each angle as it finishes.
+        # _transcode_begin/end flag the GPU-busy window so the live shot loop yields
+        # only for the transcode, not the whole (upload-heavy) ingest.
         run.start_stage("transcode")
 
         def _do(f: Dict) -> tuple:
@@ -377,13 +411,17 @@ def run_ingestion(fb, cfg, pipeline_id: str, state: Dict, stopped: Dict, tracker
                                 "size": os.path.getsize(dst) if ok and os.path.exists(dst) else 0,
                                 "uploaded": False}
         tr: Dict[str, Dict] = {}
-        with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_PARALLEL) as ex:
-            futs = [ex.submit(_do, f) for f in files]
-            for fut in concurrent.futures.as_completed(futs):
-                angle, r = fut.result()
-                tr[angle] = r
-                run.angle_done("transcode", angle) if r["ok"] else \
-                    run.angle_failed("transcode", angle, "ffmpeg failed")
+        _transcode_begin()
+        try:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_PARALLEL) as ex:
+                futs = [ex.submit(_do, f) for f in files]
+                for fut in concurrent.futures.as_completed(futs):
+                    angle, r = fut.result()
+                    tr[angle] = r
+                    run.angle_done("transcode", angle) if r["ok"] else \
+                        run.angle_failed("transcode", angle, "ffmpeg failed")
+        finally:
+            _transcode_end()
         run.finish_stage("transcode")
 
         # STAGE 2 — upload 1080p to S3
@@ -496,6 +534,44 @@ def run_ingestion(fb, cfg, pipeline_id: str, state: Dict, stopped: Dict, tracker
         # are moved out of the session dir first (survive the rmtree below).
         if shot_files:
             _ingest_shot(run, cfg, shot_files, date, folder)
+            # STAGE 4.5 — ENQUEUE the scorekeeper's scored makes for DEFERRED QA
+            # (gated by SHOT_QA_ENABLED). Reads the timing sidecar (still local) +
+            # writes a shot-qa-queue job; the GPU work runs later in the shot-qa
+            # worker, only when nothing is recording/ingesting. No GPU here, and it
+            # must NEVER block or break ingestion.
+            try:
+                from agx_pipeline.shot_detect.qa import enqueue as qa_enqueue
+                qa_enqueue(fb, cfg, firebase_game_id, label,
+                           f"{LOCATION}/{date}/{folder}", date, folder,
+                           game.get("startingSideTeam1"), pipeline_id, run=run)
+            except Exception as e:  # noqa: BLE001
+                run.log("warn", f"shot-qa enqueue skipped: {str(e)[:150]}")
+
+        # STAGE 4.6 — the live CV's OWN shot detections (shadow): (a) surface the
+        # count on the card, and (b) SHOT_CARDS_ENABLED: seed one annotation card
+        # per detected shot (source="cv", review-flagged) so a game is carded even
+        # when nobody scored. Read the game doc fresh (the live loop finalized it at
+        # game stop, before this ingest). Best-effort — never breaks ingestion.
+        if fb and firebase_game_id:
+            try:
+                gd = fb.db.collection("basketball-games").document(firebase_game_id).get()
+                fresh = (gd.to_dict() or {}) if gd.exists else {}
+                live = fresh.get("shot_live") or {}
+                if live.get("n_shots"):
+                    run.set_shot_detection(
+                        n_shots=int(live.get("n_shots", 0)), n_make=int(live.get("n_make", 0)),
+                        n_miss=int(live.get("n_miss", 0)), n_sl=int(live.get("n_sl", 0)),
+                        n_sr=int(live.get("n_sr", 0)), source="live")
+                else:
+                    run.set_shot_detection(0, 0, 0, 0, 0, source="live", status="none")
+                if SHOT_CARDS_ENABLED and client and game_uuid and live.get("shots"):
+                    from plays_sync import create_plays_from_shot_live
+                    csum: Dict = {}
+                    n_cv = create_plays_from_shot_live(client, game_uuid, fresh, summary=csum)
+                    run.log("info", f"CV cards: {n_cv} created"
+                            + (" (skipped — already carded)" if csum.get("skipped_existing") else ""))
+            except Exception as e:  # noqa: BLE001
+                run.log("warn", f"shot-detection cards/summary skipped: {str(e)[:120]}")
 
         # audio cross-correlation sync (FL<->FR) from the host-captured side-files;
         # runs before cleanup so the session-dir .m4a files still exist.
