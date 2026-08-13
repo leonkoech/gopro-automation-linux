@@ -199,3 +199,23 @@ by construction. The real test:
   pipeline on retained games clears 80%. NEXT BUILD (user-directed): production typing job — after
   ingest, type every CV card (2/3/4 MAKE/MISS) + team name (side+period->team), WHO optional;
   golden nano calibration one-time per production camera with user approval + nightly drift check.
+
+## GO-LIVE OPERATING MODEL (user-directed, 2026-08-13 — THE STANDARD)
+
+**Ship now, improve forever.** Production runs generate CV annotations alongside the annotators'
+manual ones -> a nightly CV-vs-manual comparison scores every game automatically (type %, WHO
+coverage, make/miss agreement). Every game night = a free blind benchmark; improvements are
+picked by whatever the nightly numbers say hurts most. No more bespoke test setups.
+
+**TWO-PATH ARCHITECTURE (latency contract):**
+- FAST PATH (already live, H1): SL/SR make -> clip cut -> green button -> TV. NO tracking in
+  this path, ever — "fastest to the green play button wins." Measured latency target ~15-40s.
+- ASYNC PATH (to build): every shot event -> tracking QUEUE (rim anchor from packaged/live
+  SL/SR + FL/FR classify + OCR, ~17-20s/shot measured) -> card & History row UPGRADE in place
+  ("Shot made — left rim" -> "3PT MAKE · <Team> (#8 optional)"). Queue drains during play as
+  GPU allows, finishes minutes after the horn. Per-stage telemetry (decode/detect/classify/OCR)
+  built in so the budget is always known.
+
+**Rollout:** build queue+upgrade+telemetry+nightly-comparison -> one-time golden Nano calibration
+of production cameras (user approves 2 images) -> deploy in no-game window -> self-tests
+(synthetic + one historical game re-typed) -> live -> improve one bucket at a time.
