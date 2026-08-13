@@ -189,3 +189,13 @@ by construction. The real test:
   (possible auto-calib edge tightness — user reviewing overlays). Evidence pack:
   `Tracking…/evidence_blind_2e57/` (20 clips + 2 calib overlays); 9 failures sent for verdicts.
   Blind #2 = FULL pipeline w/ anchor, needs an annotated RETAINED game (234447 / Aug-13 games).
+
+- 2026-08-13 — **BLIND RERUN with NANO-BANANA GOLDEN CALIBRATION (user-approved): TYPE 15/20 = 75%,
+  15/19 = 79% excl. the bad-GT window (B06, two shots in 8s). Up from 55%.** Calibration = image-
+  EDITING model (`gemini-3-pro-image-preview`) paints the zones -> OpenCV contours extract polygons
+  (`nano_calibrate.py`); user approved both cameras' overlays. Remaining failures: B12+B17 wrong-
+  shooter (= rim anchor's job; this Aug-6 game has no SL/SR), B05/B10/B14 boundary/straddle tail.
+  **Quality gate PASSED for go-live**: 79% no-anchor blind + anchor's +8-11pt dev gain => full
+  pipeline on retained games clears 80%. NEXT BUILD (user-directed): production typing job — after
+  ingest, type every CV card (2/3/4 MAKE/MISS) + team name (side+period->team), WHO optional;
+  golden nano calibration one-time per production camera with user approval + nightly drift check.
