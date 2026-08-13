@@ -178,3 +178,14 @@ by construction. The real test:
    uses new games (annotators card games weekly, so the supply is continuous). Rationale: one
    verdict round was worth +20pts on dev (corner discovery, stale-ball discovery) — human-in-
    the-loop failure review is the highest-leverage accuracy tool we have; ride it past 80%.
+
+- 2026-08-13 — **BLIND EVAL #1 (game 2e574fd2, Aug-6, user-picked): TYPE 11/20 = 55%, WHO 2/2
+  correct reads (10% coverage).** NO-ANCHOR mode (game predates SL/SR; cv_cards=0) — comparable
+  dev mode scored ~46-50%, so the pipeline GENERALIZES (blind >= dev in like-for-like mode). The
+  ~20pt gap to dev-74% IS the rim anchor. Fully automatic run: boto3 S3 download (no aws cli on
+  box!) -> auto Gemini corner calibration on the game's own frames (worked on a different night's
+  court) -> 20 stratified shots (10/hoop, 12x3PT+8x4PT, 11 make/9 miss) -> clips. Failure shape
+  matches known buckets: 3 wrong-shooter (B06/B12/B17 — anchor's job), ~5 boundary overshoots
+  (possible auto-calib edge tightness — user reviewing overlays). Evidence pack:
+  `Tracking…/evidence_blind_2e57/` (20 clips + 2 calib overlays); 9 failures sent for verdicts.
+  Blind #2 = FULL pipeline w/ anchor, needs an annotated RETAINED game (234447 / Aug-13 games).
