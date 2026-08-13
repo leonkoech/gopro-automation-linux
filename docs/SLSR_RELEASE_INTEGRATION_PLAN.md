@@ -133,3 +133,17 @@ W1 is most of the work; W2/W3 are small; W4 is a benchmark run. W5 is a separate
     Cost: ~10 GPU-min/game at ingest. Integration point: `ingest.py` STAGE 4.6 (next to
     `create_plays_from_shot_live`) on `feat/shot-detection-trigger`. NOT yet implemented — next
     session's build; needs deploy green-light when ready.
+
+- 2026-08-13 — **EVIDENCE-REVIEW ROUND (user clip verdicts) → CORNER-AWARE CALIBRATION: 54% → 74%.**
+  User verdicts on the 15-clip pack re-ranked everything: 7/13 failures were CALIBRATION at the
+  court CORNERS (player+ball correct) — the painted 3/4PT boundaries have STRAIGHT corner
+  segments the y(x) curve fit couldn't represent; 2/13 were a STALE SECOND BALL on court fooling
+  possession (F02/F03); 1 bad-GT shot excluded (F12 = two shots in window → 27-shot benchmark);
+  rest = pass-before-shot (F13), wrong player (F10), straddle rule (F01: one foot in/out = lesser
+  value — needs both-ankle test). FIX SHIPPED (Tracking `0a55f26`+`853d4b6`): Gemini traces the FULL
+  ordered boundary incl. corner segments; order-preserving smoothing (no poly fit); regions =
+  closed POLYGONS (fillPoly/pointPolygonTest). Scores: polygon-closure alone 64/67%; TRUE corner
+  trace **71% (20/28) / 74% (20/27 honest)**. Arc: 43→46→50→54→64→**74**.
+  Remaining 7 (honest-27): stale-ball ×2 (F02/F03 — moving-ball gate = next build, would cross 80%),
+  straddle ×1 (FL297), boundary-precision ×2 (FR479.2, FR510.3 — 510.3 regressed with corner trace),
+  wrong-player ×1 (FR556.7), pass-before-shot ×1 (FR1237.4, also no SL/SR anchor).
