@@ -171,3 +171,10 @@ by construction. The real test:
    gated at 80 (coverage ~25% today; dual-angle OCR is the lever) — honest reporting, no fudging.
 6. **Deliverable:** per-shot table + 20 annotated evidence clips from the blind game (same
    format as the 0d96 pack) so failures are reviewable the same way.
+
+7. **THE LOOP (standing methodology, user-confirmed):** every blind game's failures become the
+   next evidence pack (same overlay format) -> user reviews and gives per-clip verdicts -> fixes
+   are built from that evidence -> config re-freezes -> NEXT fresh blind game. Each iteration
+   uses new games (annotators card games weekly, so the supply is continuous). Rationale: one
+   verdict round was worth +20pts on dev (corner discovery, stale-ball discovery) — human-in-
+   the-loop failure review is the highest-leverage accuracy tool we have; ride it past 80%.
