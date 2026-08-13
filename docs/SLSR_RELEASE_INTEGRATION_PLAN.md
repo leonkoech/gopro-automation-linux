@@ -219,3 +219,36 @@ picked by whatever the nightly numbers say hurts most. No more bespoke test setu
 **Rollout:** build queue+upgrade+telemetry+nightly-comparison -> one-time golden Nano calibration
 of production cameras (user approves 2 images) -> deploy in no-game window -> self-tests
 (synthetic + one historical game re-typed) -> live -> improve one bucket at a time.
+
+## FAST-PATH LATENCY FIX (user-directed 2026-08-13: "clip first... deploy immediately")
+
+**User's directive:** trigger -> clip -> green button -> then shot detection -> timeline/History
+-> then tracking. **Engineering translation** (the live loop has NO separate trigger — the
+segment scan IS both trigger and make/miss verdict in one pass, and a pre-verdict clip would also
+clip every miss: last night = 262 rim events, ~3/4 misses -> History flood + wasted GPU): make the
+VERDICT itself fast, clip fires the same instant (already wired). Detection latency =
+segment-close wait (~SEG_SEC) + scan wall + poll; tail (cut->transcode->S3->green) ~5-6s measured.
+
+**The fix (branch `feat/fastpath-latency`):**
+1. live.py instrumentation: per-shot `latency_s` (wallclock->verdict) + `scan_s` + backlog/
+   max_backlog in the shadow doc + detect_latency in the AUTO-HIGHLIGHT log — tonight measures
+   its own chain per make (verdict leg here; tail leg = log ts vs highlight-doc ready ts).
+2. Env tuning (values set by on-box benchmark, bench_live_scan.py on real SL footage):
+   SHOT_SEGMENT_SEC 4->2 halves the close wait IF scan throughput >=1x real time per angle with
+   SHOT_LIVE_WINDOW on (P3.1 sliding window: cost = 2x footage per segment REGARDLESS of seg
+   size, so smaller segments are a pure latency win unless fixed per-segment overhead dominates).
+   SHOT_LIVE_POLL_SEC 2->1.
+3. This deploy also ships main's P3.1 live.py (sliding window + rim accumulation, env-gated
+   SHOT_LIVE_WINDOW) — validated offline via fastpath_harness.py (stub cfg/fb, real carved
+   segments, real drain-throughput measurement) before deploy.
+
+**Deploy authorization (user, 2026-08-13):** batch jobs on the box (Miracle Leaf typing +
+2e574fd2 compare) keep running — don't disturb; once BOTH finish (TYPING_DONE + COMPARE_DONE log
+markers) AND /health shows recording:false, deploy IMMEDIATELY to production (no further
+approval), well before tonight's games. Unit agx-ingestion, EnvironmentFile .env.agx, restart via
+systemctl. Rollback = revert .env.agx knobs (+ .bak-fastpath file backups).
+
+**Endgame (recorded for later):** if segment tuning can't reach <=10s, the next step is the
+streaming detector — tap live frames off the recording pipeline (appsink tee) so the verdict
+lands ~1-3s after the ball drops; the clip-first contract (button never waits for type/WHO)
+stays as designed here.

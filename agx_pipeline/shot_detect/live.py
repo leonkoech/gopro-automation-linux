@@ -152,8 +152,9 @@ class LiveShotScorer:
         scored: List[Dict] = []          # {wallclock_epoch, side} — dedup ledger
         shadow: List[Dict] = []          # detections for the shadow field
         n_seg = 0
+        backlog = {"now": 0, "max": 0}   # unprocessed-closed-segments queue depth
         t0 = time.time()
-        self._write_shadow(game_id, shadow, n_seg, t0, status="running")
+        self._write_shadow(game_id, shadow, n_seg, t0, status="running", backlog=backlog)
 
         while not stop_evt.wait(POLL_SEC):
             if self._should_pause():
@@ -161,7 +162,12 @@ class LiveShotScorer:
             try:
                 closed = self._closed_segments(seg_dir, processed)
                 if not closed:
+                    backlog["now"] = 0
                     continue
+                backlog["now"] = len(closed)
+                backlog["max"] = max(backlog["max"], len(closed))
+                if len(closed) > 2:     # falling behind real time — visible in logs
+                    logger.warning("shot-live backlog=%d segments", len(closed))
                 if detector is None:
                     detector, rims = _VALIDATOR.get()   # lazy load once (2.5s)
                 for idx, angle, path in closed:
@@ -178,7 +184,8 @@ class LiveShotScorer:
                     # publish after EACH segment so a fresh make reaches the shadow
                     # (and, in Phase C, the scoreboard) within a segment of the
                     # shot — not in a burst after a whole backlog drains.
-                    self._write_shadow(game_id, shadow, n_seg, t0, status="running")
+                    self._write_shadow(game_id, shadow, n_seg, t0, status="running",
+                                       backlog=backlog)
             except Exception as e:  # noqa: BLE001 — a bad segment must not kill the loop
                 logger.warning("shot-live segment pass failed: %s", e)
 
@@ -203,12 +210,14 @@ class LiveShotScorer:
             if tmp:
                 window, base_idx = tmp, prev[0]
         # 2. One pass: coarse ball track + hoop samples.
+        t_sc = time.time()
         try:
             track, hoops = scan.scan_ball_and_hoops(
                 detector.model, window, detector.device, stride=stride, imgsz=imgsz)
         finally:
             if tmp:
                 _rm(tmp)
+        scan_s = round(time.time() - t_sc, 2)
         # 3. Accumulate hoop samples -> running-median rim (whole-game quality),
         #    canonical rims.json until we have enough.
         acc = hoop_acc.setdefault(angle, {"cx": [], "cy": [], "w": [], "h": []})
@@ -239,13 +248,20 @@ class LiveShotScorer:
             if self._is_dup(scored, wc_epoch, side):
                 continue   # overlap between consecutive windows -> one shot
             scored.append({"wc": wc_epoch, "side": side})
+            # latency_s: shot happened (wallclock) -> verdict now. THE number the
+            # green-button target is tuned on; scan_s isolates the decode+infer
+            # share of it per window.
             rec = {"cam": angle, "side": side, "seg": base_idx,
                    "t_shot": round(t_shot, 3), "made": v["verdict"] == "MAKE",
                    "verdict": v["verdict"], "rho": v.get("rho"),
-                   "wallclock": wc_iso, "detected_at": _utcnow_iso()}
+                   "wallclock": wc_iso, "detected_at": _utcnow_iso(),
+                   "latency_s": (round(time.time() - wc_epoch, 1)
+                                 if wc_epoch else None),
+                   "scan_s": scan_s}
             shadow.append(rec)
-            logger.info("shot-live %s %s win@%d t=%.2f -> %s", game_id, angle,
-                        base_idx, t_shot, v["verdict"])
+            logger.info("shot-live %s %s win@%d t=%.2f -> %s (latency=%ss scan=%ss)",
+                        game_id, angle, base_idx, t_shot, v["verdict"],
+                        rec["latency_s"], scan_s)
             if rec["made"] and autoscore_enabled():
                 self._maybe_autoscore(game_id, rec, starting_side)
             if rec["made"] and autohighlight_enabled():
@@ -300,7 +316,10 @@ class LiveShotScorer:
                "ts": wc, "side": side, "firebase_game_id": game_id}
         try:
             resp = self._on_make(cmd)
-            logger.info("shot-live AUTO-HIGHLIGHT %s -> %s", cmd["logId"], resp)
+            # detect_latency + this log's timestamp vs the highlight doc's ready
+            # time = the full basket->green-button chain, measured per make.
+            logger.info("shot-live AUTO-HIGHLIGHT %s (detect_latency=%ss) -> %s",
+                        cmd["logId"], shot.get("latency_s"), resp)
         except Exception as e:  # noqa: BLE001 — never break the detector
             logger.warning("shot-live auto-highlight failed for %s: %s", cmd["logId"], e)
 
@@ -366,7 +385,8 @@ class LiveShotScorer:
             return {}
 
     def _write_shadow(self, game_id: str, shadow: List[Dict], n_seg: int,
-                      t0: float, status: str) -> None:
+                      t0: float, status: str,
+                      backlog: Optional[Dict] = None) -> None:
         if not self.fb:
             return
         n_make = sum(1 for s in shadow if s["made"])
@@ -376,6 +396,8 @@ class LiveShotScorer:
             "n_miss": len(shadow) - n_make,
             "n_sl": sum(1 for s in shadow if s["cam"] == "SL"),
             "n_sr": sum(1 for s in shadow if s["cam"] == "SR"),
+            "backlog": (backlog or {}).get("now", 0),
+            "max_backlog": (backlog or {}).get("max", 0),
             "shots": shadow[-SHADOW_CAP:], "secs": round(time.time() - t0, 1),
             "updated_at": _utcnow_iso(),
         }

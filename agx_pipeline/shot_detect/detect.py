@@ -235,6 +235,12 @@ def iter_frames(video_path: str, size=(720, 540), select_stride: int = 1,
     W, H = size
     stride_bytes = W * H * 3
     cmd = ["ffmpeg", "-nostdin", "-loglevel", "error"]
+    # SHOT_DECODE=nv routes decode to the Orin's dedicated NVDEC engine
+    # (h264_nvv4l2dec in the Jetson ffmpeg build) — measured CPU decode of a 4s
+    # 120fps segment is ~4x slower than real time, which the live loop can never
+    # outrun with two angles. NVDEC shares nothing with the NVENC recorders.
+    if os.environ.get("SHOT_DECODE", "").strip().lower() == "nv":
+        cmd += ["-c:v", "h264_nvv4l2dec"]
     if ss is not None:
         cmd += ["-ss", f"{ss:.3f}"]
     cmd += ["-i", video_path]
