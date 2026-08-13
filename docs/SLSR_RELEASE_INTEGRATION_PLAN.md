@@ -147,3 +147,27 @@ W1 is most of the work; W2/W3 are small; W4 is a benchmark run. W5 is a separate
   Remaining 7 (honest-27): stale-ball ×2 (F02/F03 — moving-ball gate = next build, would cross 80%),
   straddle ×1 (FL297), boundary-precision ×2 (FR479.2, FR510.3 — 510.3 regressed with corner trace),
   wrong-player ×1 (FR556.7), pass-before-shot ×1 (FR1237.4, also no SL/SR anchor).
+
+## BLIND-GAME EVALUATION PROTOCOL (user directive, 2026-08-13)
+
+**Goal: >=80% on a game the pipeline has never been tuned on.** 0d96e12a is hereby the DEV set
+(corner arcs, rim cap, feet rule were all tuned on it); accuracy claims from it are optimistic
+by construction. The real test:
+
+1. **Input:** a FRESHLY human-annotated game with retained SL/SR + FL/FR footage (candidates:
+   `234447` once carded, or any of the Aug-13 games — Miracle Leaf / Team Iconic / Practice
+   Squad — after annotation; all have packaged SL/SR on the box). Standing rule: RETAIN SL/SR
+   for any game headed to annotation.
+2. **Sample:** ~20 shots, stratified — both hoops, mix of 2/3/4, makes AND misses.
+3. **Freeze first:** finish the dev-set fixes (moving-ball gate, straddle rule), then FREEZE the
+   pipeline config. No parameter may change after seeing blind results — if it fails, diagnose,
+   fix, and re-test on a NEW blind game.
+4. **Run the FULL pipeline per shot** (everything automatic, nothing hand-set):
+   auto arc-calibration (Gemini trace on that game's frames) → SL/SR detector: **make/miss** +
+   rim_base → FL/FR tracking with rim anchor: shooter possession + grounded feet → **type**
+   (polygon zones) → jersey OCR + roster map: **who**.
+5. **Score three metrics vs the human annotation:** make/miss %, type %, WHO (precision +
+   coverage). Target: >=80% on make/miss and TYPE. WHO is measured and reported but not yet
+   gated at 80 (coverage ~25% today; dual-angle OCR is the lever) — honest reporting, no fudging.
+6. **Deliverable:** per-shot table + 20 annotated evidence clips from the blind game (same
+   format as the 0d96 pack) so failures are reviewable the same way.
