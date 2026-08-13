@@ -209,7 +209,7 @@ picked by whatever the nightly numbers say hurts most. No more bespoke test setu
 
 **TWO-PATH ARCHITECTURE (latency contract):**
 - FAST PATH (already live, H1): SL/SR make -> clip cut -> green button -> TV. NO tracking in
-  this path, ever — "fastest to the green play button wins." Measured latency target ~15-40s.
+  this path, ever — "fastest to the green play button wins." **HARD TARGET (user): green button <=10s from the make.** Physical floor ~6s (3s post-roll + ~3s cut/upload); requires detection <=4-6s -> knobs in order: SL/SR segment 4s->2s (biggest wait), highlight-buffer segment length down, post-roll trim last. Per-stage latency is measurable from tonight's own timestamps (wallclock -> detected_at -> requestedAt -> ready) — read tomorrow, tune, verify next night.
 - ASYNC PATH (to build): every shot event -> tracking QUEUE (rim anchor from packaged/live
   SL/SR + FL/FR classify + OCR, ~17-20s/shot measured) -> card & History row UPGRADE in place
   ("Shot made — left rim" -> "3PT MAKE · <Team> (#8 optional)"). Queue drains during play as
