@@ -163,13 +163,13 @@ def cut_clip(label, cam, t_cam, t_fl, name, rec):
     out = f"{OUT}/{label}/clips/{name}.mp4"
     if os.path.exists(out):
         return out
-    sl = f"{rec}/{label}/{label}_{cam}.mp4"
+    # Tracking cam ONLY: -ss on the FLIR shot-cam masters cannot seek (bogus
+    # 12000/1 timebase -> ffmpeg grinds for HOURS; measured 2.7h for one clip).
+    # The FL/FR view shows the basket clearly enough to judge make/miss.
     fl = f"{rec}/{label}/{label}_{'FL' if cam == 'SL' else 'FR'}.mp4"
     cmd = ["ffmpeg", "-y", "-loglevel", "error",
-           "-ss", f"{max(0.0, t_cam-4):.1f}", "-i", sl,
            "-ss", f"{max(0.0, t_fl-4):.1f}", "-i", fl,
-           "-t", "8", "-filter_complex",
-           "[0:v]scale=720:540[a];[1:v]scale=960:540[b];[a][b]hstack",
+           "-t", "8", "-vf", "scale=1280:720",
            "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p", out]
     subprocess.run(cmd, check=True)
     return out
@@ -205,8 +205,41 @@ def main():
 
     agree = sum(1 for g, s, _ in pairs if g["made"] == s["made"])
     dis = [(g, s) for g, s, _ in pairs if g["made"] != s["made"]]
-    s3c = boto3.client("s3")
+    in_game_cv_only = [s for s in cv_only if s.get("in_game")]
     links = []
+
+    def write_report():
+        report = {
+            "label": a.label, "uball_game_id": a.uball_game_id,
+            "gt_shots": len(gt), "cv_shots": len(cv),
+            "sync_offset_s": off, "sync_prior_s": prior, "sync_votes": votes,
+            "matched": len(pairs),
+            # per-pair residual deltas over game time — the drift analysis data
+            "matched_deltas": [{"gt_ts": g["ts"],
+                                "delta": round(g["ts"] - (s["t"] + off), 2)}
+                               for g, s, _ in pairs],
+            "model_missed": [{"ts": g["ts"], "side": g["side"], "cls": g["cls"]}
+                             for g in gt_only],
+            "gt_missed_in_game": [{"t_fl": round(s["t"] + off, 1),
+                                   "side": s["side"], "made": s["made"]}
+                                  for s in in_game_cv_only],
+            "gt_missed_warmup_or_ft": len(cv_only) - len(in_game_cv_only),
+            "makemiss_agree": agree,
+            "makemiss_accuracy": (round(agree / len(pairs), 3)
+                                  if pairs else None),
+            "disagreements": [{"gt_ts": g["ts"], "gt": g["cls"],
+                               "cv_made": s["made"], "cam": s["cam"]}
+                              for g, s in dis],
+            "clips": links,
+        }
+        with open(f"{OUT}/{a.label}_report.json", "w") as f:
+            json.dump(report, f, indent=2)
+        return report
+
+    # analysis is the valuable part — persist it BEFORE the slow clip phase
+    report = write_report()
+    log("report written (pre-clips)")
+    s3c = boto3.client("s3")
     for i, (g, s) in enumerate(dis):
         name = (f"D{i+1:02d}_{s['cam']}_GT-{'MAKE' if g['made'] else 'MISS'}"
                 f"_CV-{'MAKE' if s['made'] else 'MISS'}_t{int(g['ts'])}")
@@ -223,26 +256,7 @@ def main():
         except Exception as e:  # noqa: BLE001
             log(f"clip {name} FAILED: {e}")
 
-    in_game_cv_only = [s for s in cv_only if s.get("in_game")]
-    report = {
-        "label": a.label, "uball_game_id": a.uball_game_id,
-        "gt_shots": len(gt), "cv_shots": len(cv),
-        "sync_offset_s": off, "sync_prior_s": prior, "sync_votes": votes,
-        "matched": len(pairs),
-        "model_missed": [{"ts": g["ts"], "side": g["side"], "cls": g["cls"]}
-                         for g in gt_only],
-        "gt_missed_in_game": [{"t_fl": round(s["t"] + off, 1), "side": s["side"],
-                               "made": s["made"]} for s in in_game_cv_only],
-        "gt_missed_warmup_or_ft": len(cv_only) - len(in_game_cv_only),
-        "makemiss_agree": agree,
-        "makemiss_accuracy": round(agree / len(pairs), 3) if pairs else None,
-        "disagreements": [{"gt_ts": g["ts"], "gt": g["cls"],
-                           "cv_made": s["made"], "cam": s["cam"]}
-                          for g, s in dis],
-        "clips": links,
-    }
-    with open(f"{OUT}/{a.label}_report.json", "w") as f:
-        json.dump(report, f, indent=2)
+    report = write_report()   # final rewrite: now with clip links
 
     log("===== SUMMARY =====")
     log(f"GT {len(gt)} | CV {len(cv)} | matched {len(pairs)}")
