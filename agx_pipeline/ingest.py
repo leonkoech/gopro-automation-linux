@@ -281,8 +281,12 @@ def _resolve_checkin_roster(fb, game: Dict) -> "tuple[Optional[list], Optional[l
 
 
 def _create_or_get_game(client, fb, game: Dict, firebase_game_id: str, date: str) -> Optional[Dict]:
-    existing = client.get_game_by_firebase_id(firebase_game_id)
-    if existing:
+    existing = client.get_game_by_firebase_id(firebase_game_id) if firebase_game_id else None
+    # Reuse ONLY on an exact firebase-id match — a fuzzy/arbitrary match here
+    # attaches this recording's uploads to another game's S3 keys (the
+    # 2026-08-13 manual-recording overwrite). No firebase game => always a NEW
+    # annotation game.
+    if existing and existing.get("firebase_game_id") == firebase_game_id:
         return existing
     left, right = game.get("leftTeam", {}) or {}, game.get("rightTeam", {}) or {}
     roster1, roster2 = _resolve_checkin_roster(fb, game)

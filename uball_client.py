@@ -234,6 +234,12 @@ class UballClient:
         Returns:
             Game data or None if not found
         """
+        # A None/empty id must NEVER match: requests drops None params, so the
+        # call degrades to "list all games" and games[0] is an ARBITRARY game.
+        # 2026-08-13: a manual recording (no firebase game) attached itself to
+        # the previous night's game this way and overwrote its S3 videos.
+        if not firebase_game_id:
+            return None
         if not self._ensure_authenticated():
             return None
 
