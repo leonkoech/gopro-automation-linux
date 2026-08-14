@@ -50,6 +50,13 @@ SHADOW_CAP = int(os.getenv("SHOT_LIVE_SHADOW_CAP", "500"))   # max shots kept in
 SHOT_LIVE_WINDOW = os.getenv("SHOT_LIVE_WINDOW", "true").strip().lower() in ("1", "true", "yes", "on")
 RIM_MIN_SAMPLES = int(os.getenv("SHOT_LIVE_RIM_MIN", "8"))
 HOOP_ACC_CAP = int(os.getenv("SHOT_LIVE_HOOP_CAP", "5000"))
+# Freshness guard: skip (never scan) closed segments older than this — a verdict
+# that old can't cut a clip anyway (the highlight buffer holds ~10 min), and
+# scanning a stale backlog keeps the loop stale forever. Night 1: a 54-min
+# starvation produced an hour-deep backlog the loop dutifully chewed through,
+# staying ~45 min behind all game. Fresh-first beats complete-but-late live;
+# the nightly typing still covers the skipped stretch from the masters.
+MAX_AGE_S = float(os.getenv("SHOT_LIVE_MAX_AGE_S", "480"))
 
 
 def live_enabled() -> bool:
@@ -156,9 +163,18 @@ class LiveShotScorer:
         t0 = time.time()
         self._write_shadow(game_id, shadow, n_seg, t0, status="running", backlog=backlog)
 
+        pause_since: Optional[float] = None
         while not stop_evt.wait(POLL_SEC):
             if self._should_pause():
+                # visible pause: night 1's 54-min silent pause hid the outage
+                if pause_since is None:
+                    pause_since = time.time()
+                elif time.time() - pause_since > 60:
+                    logger.warning("shot-live paused %ds (ingest transcode)",
+                                   int(time.time() - pause_since))
+                    pause_since = time.time() - 0.001  # re-log every ~60s
                 continue                # yield the GPU to an ingest transcode
+            pause_since = None
             try:
                 closed = self._closed_segments(seg_dir, processed)
                 if not closed:
@@ -170,10 +186,21 @@ class LiveShotScorer:
                     logger.warning("shot-live backlog=%d segments", len(closed))
                 if detector is None:
                     detector, rims = _VALIDATOR.get()   # lazy load once (2.5s)
+                n_stale = 0
                 for idx, angle, path in closed:
                     if stop_evt.is_set() or self._should_pause():
                         break
                     processed.add(os.path.basename(path))
+                    # Freshness guard: drop segments too old to matter live
+                    # (mtime = splitmuxsink close time). See MAX_AGE_S above.
+                    try:
+                        stale = time.time() - os.path.getmtime(path) > MAX_AGE_S
+                    except OSError:
+                        stale = True
+                    if stale:
+                        n_stale += 1
+                        self._advance_prev(prev_seg, angle, idx, path)
+                        continue
                     n_seg += 1
                     self._process_window(scan, detector, rims, path, idx, angle,
                                          fps, imgsz, stride, spawned.get(angle),
@@ -186,6 +213,9 @@ class LiveShotScorer:
                     # shot — not in a burst after a whole backlog drains.
                     self._write_shadow(game_id, shadow, n_seg, t0, status="running",
                                        backlog=backlog)
+                if n_stale:
+                    logger.warning("shot-live skipped %d stale segments (>%.0fs old)",
+                                   n_stale, MAX_AGE_S)
             except Exception as e:  # noqa: BLE001 — a bad segment must not kill the loop
                 logger.warning("shot-live segment pass failed: %s", e)
 

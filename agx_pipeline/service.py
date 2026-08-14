@@ -97,10 +97,23 @@ def transcode_active() -> bool:
         return False
 
 
+def _live_should_pause() -> bool:
+    """Yield to an ingest transcode ONLY when no game is recording. During a
+    live game the detector's verdicts ARE the product (green button + CV
+    scorecard) and its CUDA scan barely touches the NVENC/NVDEC engines the
+    transcode uses. Night 1 (2026-08-13): the previous game's 54-min transcode
+    started 6s before the next tip-off and the old unconditional pause starved
+    the detector for the whole first half — 55-min verdict lag, every clip
+    outside the highlight buffer, zero green buttons."""
+    with _lock:
+        rec = bool(_current)
+    return (not rec) and transcode_active()
+
+
 # Real-time shot detector over the live SL/SR segments (shadow-first, off unless
 # SHOT_LIVE_ENABLED). Reads only the segments produced when SHOT_SEGMENT_ENABLED
-# is on; pauses on transcode_active so it never competes with a live transcode.
-LIVE = (LiveShotScorer(CFG, FB, should_pause=transcode_active,
+# is on; yields to an ingest transcode only between games (_live_should_pause).
+LIVE = (LiveShotScorer(CFG, FB, should_pause=_live_should_pause,
                        on_make=lambda cmd: _do_highlight(cmd))
         if SHOT and live_enabled() else None)
 AUTO_RECORD = os.getenv("AUTO_RECORD_ON_GAME", "true").lower() in ("1", "true", "yes")
