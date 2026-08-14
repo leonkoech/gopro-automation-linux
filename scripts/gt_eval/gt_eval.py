@@ -36,7 +36,7 @@ from agx_pipeline.shot_detect.backtest import scan  # noqa: E402
 from agx_pipeline.shot_detect.detect import ShotDetector, iter_frames  # noqa: E402
 from uball_client import UballClient  # noqa: E402
 
-REC = "/home/dev/app/recordings"
+REC_DEFAULT = "/home/dev/app/recordings"
 OUT = "/home/dev/gt_eval"
 BUCKET = "uball-videos-production"
 WEIGHTS = ("/home/dev/gopro-automation-linux/agx_pipeline/shot_detect/weights/"
@@ -69,11 +69,11 @@ def load_gt(uball_id: str):
     return [r for r in rows if r["side"]]
 
 
-def sidecar_offsets(label: str):
+def sidecar_offsets(label: str, rec: str):
     """Per shot-cam offset prior: t_FL ~= t_cam + (cam.spawned_at - FL_start).
     FL start ~= the label's UTC time (recorders spawn with the start command)."""
     try:
-        sc = json.load(open(f"{REC}/{label}/{label}_shot_timing.json"))
+        sc = json.load(open(f"{rec}/{label}/{label}_shot_timing.json"))
         t_label = datetime.strptime(label, "game_%Y%m%d_%H%M%S")
         out = {}
         for c in sc.get("cameras", []):
@@ -86,11 +86,11 @@ def sidecar_offsets(label: str):
         return {}
 
 
-def cv_shots(label: str, det, rims_all, limit_s):
+def cv_shots(label: str, det, rims_all, limit_s, rec: str):
     """Coarse scan of both shot cams + full-fps confirm per candidate."""
     shots = []
     for cam in ("SL", "SR"):
-        video = f"{REC}/{label}/{label}_{cam}.mp4"
+        video = f"{rec}/{label}/{label}_{cam}.mp4"
         if not os.path.isfile(video):
             log(f"{cam}: master missing — skipped")
             continue
@@ -129,7 +129,8 @@ def refine_offset(gt, cv, prior: float):
             if s["side"] != g["side"] or not s["made"]:
                 continue
             d = g["ts"] - s["t"]
-            if abs(d - prior) <= 12.0:
+            # no sidecar prior (S3-packaged games): search wide
+            if abs(d - prior) <= (45.0 if prior == 0.0 else 12.0):
                 deltas.append(round(d * 2) / 2)
     if not deltas:
         return prior, 0
@@ -157,13 +158,13 @@ def match(gt, cv, off):
     return pairs, gt_only, cv_only
 
 
-def cut_clip(label, cam, t_cam, t_fl, name):
+def cut_clip(label, cam, t_cam, t_fl, name, rec):
     os.makedirs(f"{OUT}/{label}/clips", exist_ok=True)
     out = f"{OUT}/{label}/clips/{name}.mp4"
     if os.path.exists(out):
         return out
-    sl = f"{REC}/{label}/{label}_{cam}.mp4"
-    fl = f"{REC}/{label}/{label}_{'FL' if cam == 'SL' else 'FR'}.mp4"
+    sl = f"{rec}/{label}/{label}_{cam}.mp4"
+    fl = f"{rec}/{label}/{label}_{'FL' if cam == 'SL' else 'FR'}.mp4"
     cmd = ["ffmpeg", "-y", "-loglevel", "error",
            "-ss", f"{max(0.0, t_cam-4):.1f}", "-i", sl,
            "-ss", f"{max(0.0, t_fl-4):.1f}", "-i", fl,
@@ -179,6 +180,7 @@ def main():
     ap.add_argument("--label", required=True)
     ap.add_argument("--uball-game-id", required=True)
     ap.add_argument("--limit-s", type=float, default=None)
+    ap.add_argument("--rec-dir", default=REC_DEFAULT)
     a = ap.parse_args()
     os.makedirs(f"{OUT}/{a.label}", exist_ok=True)
 
@@ -186,10 +188,10 @@ def main():
     log(f"GT: {len(gt)} manual shots ({sum(1 for g in gt if g['made'])} makes)")
     rims_all = json.load(open(RIMS))
     det = ShotDetector(WEIGHTS)
-    cv = cv_shots(a.label, det, rims_all, a.limit_s)
+    cv = cv_shots(a.label, det, rims_all, a.limit_s, a.rec_dir)
     log(f"CV: {len(cv)} confirmed shots ({sum(1 for s in cv if s['made'])} makes)")
 
-    prior_all = sidecar_offsets(a.label)
+    prior_all = sidecar_offsets(a.label, a.rec_dir)
     prior = -(prior_all.get("SL", 0.0))          # t_fl = t_sl + (SL_spawn-FL) -> gt-cv
     off, votes = refine_offset(gt, cv, prior)
     log(f"SYNC: prior={prior:+.1f}s empirical={off:+.1f}s (votes={votes})")
@@ -209,7 +211,7 @@ def main():
         name = (f"D{i+1:02d}_{s['cam']}_GT-{'MAKE' if g['made'] else 'MISS'}"
                 f"_CV-{'MAKE' if s['made'] else 'MISS'}_t{int(g['ts'])}")
         try:
-            path = cut_clip(a.label, s["cam"], s["t"], g["ts"], name)
+            path = cut_clip(a.label, s["cam"], s["t"], g["ts"], name, a.rec_dir)
             key = f"review/gt_eval/{a.label}/{name}.mp4"
             s3c.upload_file(path, BUCKET, key,
                             ExtraArgs={"ContentType": "video/mp4"})
