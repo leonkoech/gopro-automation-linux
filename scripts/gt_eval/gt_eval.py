@@ -186,6 +186,13 @@ def main():
 
     gt = load_gt(a.uball_game_id)
     log(f"GT: {len(gt)} manual shots ({sum(1 for g in gt if g['made'])} makes)")
+    if not gt:
+        # An annotated eval game NEVER has zero GT — this means the annotation
+        # backend is down (list_plays 503s -> []). Abort BEFORE burning ~2.5h of
+        # GPU on an unmatched scan (2026-08-15: the Colada rerun did exactly
+        # that during the backend outage). No report, no DONE marker.
+        log("GT EMPTY — annotation backend down? ABORTING before the scan.")
+        sys.exit(2)
     rims_all = json.load(open(RIMS))
     det = ShotDetector(WEIGHTS)
     cv = cv_shots(a.label, det, rims_all, a.limit_s, a.rec_dir)
