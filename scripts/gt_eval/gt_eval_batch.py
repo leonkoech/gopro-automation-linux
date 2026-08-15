@@ -36,13 +36,9 @@ def log(m):
 
 
 def wait_safe():
-    """Defer during the evening game window; never start while recording."""
+    """Continuous mode (user directive): pause ONLY while a game is actively
+    recording — resume the moment it stops."""
     while True:
-        h = datetime.now().hour
-        if 18 <= h or h < 3:
-            log("game window — sleeping 10 min")
-            time.sleep(600)
-            continue
         try:
             r = requests.get("http://localhost:5000/health", timeout=5).json()
             if r.get("recording"):
