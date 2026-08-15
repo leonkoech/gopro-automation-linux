@@ -100,8 +100,10 @@ def cv_shots(label: str, det, rims_all, limit_s, rec: str):
         log(f"{cam}: rim={rim and 'ok'} ({time.time()-t0:.0f}s)")
         t0 = time.time()
         cand = scan.scan_shots(det.model, video, det.device, 119.9, rim,
-                               stride=4, imgsz=640, progress_every=0,
-                               limit_s=limit_s)
+                               stride=int(os.getenv("SHOT_EVAL_STRIDE", "4")),
+                               imgsz=int(os.getenv("SHOT_EVAL_IMGSZ", "640")),
+                               conf=float(os.getenv("SHOT_EVAL_CONF", "0.20")),
+                               progress_every=0, limit_s=limit_s)
         log(f"{cam}: coarse scan -> {len(cand)} candidates "
             f"({time.time()-t0:.0f}s)")
         for c in cand:
