@@ -204,6 +204,27 @@ def main():
     log(f"SYNC: prior={prior:+.1f}s empirical={off:+.1f}s (votes={votes})")
 
     pairs, gt_only, cv_only = match(gt, cv, off)
+    # LINEAR clock refine (the 2026-08-15 finding: SL vs FL clocks diverge
+    # ~6.8%/s — fps-mismatch; a constant offset false-locks). Fit
+    # gt_ts = b*cv_t + a on the constant-offset matches, remap, rematch.
+    lin_a, lin_b = off, 1.0
+    if len(pairs) >= 6:
+        xs = [s_["t"] for _, s_, _ in pairs]
+        ys = [g_["ts"] for g_, _, _ in pairs]
+        n = len(xs)
+        sx, sy = sum(xs), sum(ys)
+        sxx = sum(x * x for x in xs)
+        sxy = sum(x * y for x, y in zip(xs, ys))
+        den = n * sxx - sx * sx
+        if den:
+            lin_b = (n * sxy - sx * sy) / den
+            lin_a = (sy - lin_b * sx) / n
+            for s_ in cv:
+                s_["t"] = round(lin_b * s_["t"] + lin_a, 2)
+            pairs, gt_only, cv_only = match(gt, cv, 0.0)
+            off = 0.0
+            log(f"SYNC-LINEAR: gt = {lin_b:.5f}*cv + {lin_a:.2f} "
+                f"(drift {100*(lin_b-1):+.2f}%) -> rematched {len(pairs)}")
     first_gt = gt[0]["ts"] if gt else 0
     last_gt = gt[-1]["ts"] if gt else 0
     for s in cv_only:
@@ -220,6 +241,7 @@ def main():
             "label": a.label, "uball_game_id": a.uball_game_id,
             "gt_shots": len(gt), "cv_shots": len(cv),
             "sync_offset_s": off, "sync_prior_s": prior, "sync_votes": votes,
+            "sync_linear_a": round(lin_a, 2), "sync_linear_b": round(lin_b, 5),
             "matched": len(pairs),
             # per-pair residual deltas over game time — the drift analysis data
             "matched_deltas": [{"gt_ts": g["ts"],
