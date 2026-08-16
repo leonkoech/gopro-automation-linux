@@ -42,7 +42,9 @@ BUCKET = "uball-videos-production"
 WEIGHTS = ("/home/dev/gopro-automation-linux/agx_pipeline/shot_detect/weights/"
            "ball_yolo26s_gray_hifps_v3_best.pt")
 RIMS = "/home/dev/gopro-automation-linux/agx_pipeline/shot_detect/rims.json"
-SIDE = {"SL": "left", "SR": "right"}
+SIDE = ({"SL": "right", "SR": "left"}
+        if os.getenv("SHOT_EVAL_FLIP_SIDES") == "1"
+        else {"SL": "left", "SR": "right"})  # pre-2026-08-05 games: cams swapped
 GT_SIDE = {"LEFT": "left", "RIGHT": "right"}
 MATCH_WIN = 4.0          # s, after offset correction
 CONFIRM_HALF = 2.0       # s of full-fps window each side of a candidate
