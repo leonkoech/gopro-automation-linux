@@ -60,8 +60,10 @@ def load_gt(uball_id: str):
     rows = []
     for p in client.list_plays(uball_id):
         cls = str(p.get("classification") or "")
+        # FREE_THROW included (user calibration 2026-08-17): FTs are real rim
+        # events the detector sees; excluding them made them look "uncarded".
         if p.get("source") == "manual" and any(
-                cls == f"{z}_{m}" for z in ("FG", "2PT", "3PT", "4PT")
+                cls == f"{z}_{m}" for z in ("FG", "2PT", "3PT", "4PT", "FREE_THROW")
                 for m in ("MAKE", "MISS")):
             rows.append({"ts": float(p.get("timestamp_seconds") or 0),
                          "side": GT_SIDE.get(str(p.get("angle") or "").upper()),
