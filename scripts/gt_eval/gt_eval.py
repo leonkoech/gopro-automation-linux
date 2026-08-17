@@ -144,6 +144,49 @@ def refine_offset(gt, cv, prior: float):
     return off, n
 
 
+def train_scan(gt, cv):
+    """Direct (slope, offset) grid scan over the two event trains.
+
+    2026-08-19 Akatsuki finding: a strong clock drift defeats the
+    constant-offset seed entirely (Akatsuki drifts +1.04%; the constant lock
+    only held mid-game, so the pair-seeded least squares inherited the bad
+    seed: b=1.0007, a=+18 vs truth b=1.0104, a=-2.7 — the family intercept).
+    Scanning gt_ts ~ b*cv_t + a with NO matching prior finds the true map.
+    Side-constrained hits at +/-2s; coarse 2e-4/1.0s grid, then fine refine.
+    Returns (hits, b, a).
+    """
+    from bisect import bisect
+
+    by_side = {}
+    for s in cv:
+        by_side.setdefault(s["side"], []).append(s["t"])
+    for v in by_side.values():
+        v.sort()
+
+    def hits(b, a, tol=2.0):
+        n = 0
+        for g in gt:
+            ts_list = by_side.get(g["side"])
+            if not ts_list:
+                continue
+            p = (g["ts"] - a) / b  # predicted cv time for this gt event
+            i = bisect(ts_list, p)
+            d = min((abs(ts_list[j] - p) for j in (i - 1, i)
+                     if 0 <= j < len(ts_list)), default=1e9)
+            if d < tol:
+                n += 1
+        return n
+
+    best = max(((hits(0.990 + i * 2e-4, float(a0)), 0.990 + i * 2e-4, float(a0))
+                for i in range(111) for a0 in range(-60, 61)),
+               key=lambda x: x[0])
+    b0, a0 = best[1], best[2]
+    fine = max(((hits(b0 + i * 2e-5, a0 + j * 0.1), b0 + i * 2e-5, a0 + j * 0.1)
+                for i in range(-15, 16) for j in range(-15, 16)),
+               key=lambda x: x[0])
+    return fine
+
+
 def match(gt, cv, off):
     used = set()
     pairs, gt_only = [], []
@@ -210,6 +253,20 @@ def main():
     log(f"SYNC: prior={prior:+.1f}s empirical={off:+.1f}s (votes={votes})")
 
     pairs, gt_only, cv_only = match(gt, cv, off)
+    # TRAIN SCAN: when the drift is too big for the constant seed to lock
+    # anywhere useful, the direct (b, a) scan beats the seeded match count —
+    # adopt its map before the least-squares polish. Default on;
+    # SHOT_EVAL_TRAIN_SCAN=0 disables.
+    if os.environ.get("SHOT_EVAL_TRAIN_SCAN", "1") != "0":
+        s_hits, s_b, s_a = train_scan(gt, cv)
+        if s_hits > len(pairs):
+            for s_ in cv:
+                s_["t"] = round(s_b * s_["t"] + s_a, 2)
+            off = 0.0
+            pairs, gt_only, cv_only = match(gt, cv, off)
+            log(f"SYNC-SCAN: gt = {s_b:.5f}*cv + {s_a:.2f} "
+                f"(drift {100*(s_b-1):+.2f}%, {s_hits} train hits) "
+                f"-> rematched {len(pairs)} (beat constant seed)")
     # LINEAR clock refine (the 2026-08-15 finding: SL vs FL clocks diverge
     # ~6.8%/s — fps-mismatch; a constant offset false-locks). Fit
     # gt_ts = b*cv_t + a on the constant-offset matches, remap, rematch.
