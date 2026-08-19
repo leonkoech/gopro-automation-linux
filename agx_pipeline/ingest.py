@@ -142,7 +142,10 @@ def _transcode_hw(src: str, dst: str, cfg) -> bool:
     os.makedirs(os.path.dirname(dst), exist_ok=True)
     cin, cout = _to_container_path(src, cfg.app_mount), _to_container_path(dst, cfg.app_mount)
     cmd = list(cfg.docker_cmd) + [
+        # cpu-shares 128 (vs default 1024): under contention the recorder's
+        # capture path outranks this batch job ~8:1 (2026-08-19 freeze fix).
         "run", "--rm", "--privileged", "--runtime", "nvidia", "--net=host",
+        "--cpu-shares=128",
         "-v", f"{cfg.app_mount}:/app/data", "--workdir", "/app/data", cfg.docker_image,
         "gst-launch-1.0", "-e",
         "filesrc", f"location={cin}", "!", "qtdemux", "!", "h265parse", "!",
@@ -168,7 +171,10 @@ def _transcode_sw(src: str, dst: str) -> bool:
     # -g 30 -sc_threshold 0: keyframe every second (libx264 defaults to 250,
     # ~8.3s — unseekable in the annotation editor). Matches the HW path's
     # iframeinterval/idrinterval=30.
-    cmd = ["ffmpeg", "-nostdin", "-y", "-i", src, "-vf", "scale=-2:1080",
+    # Background priority (2026-08-19 freeze fix): libx264 saturates the box;
+    # nice/ionice keep the live capture path fed first when they ever overlap.
+    cmd = ["nice", "-n", "15", "ionice", "-c", "3",
+           "ffmpeg", "-nostdin", "-y", "-i", src, "-vf", "scale=-2:1080",
            "-c:v", "libx264", "-preset", PRESET, "-crf", CRF,
            "-g", "30", "-sc_threshold", "0",
            "-movflags", "+faststart", "-an", dst]
