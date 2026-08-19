@@ -82,7 +82,11 @@ def main():
     try:
         rep = json.load(open(f"{OUT}/{a.label}_report.json"))
         for m in rep.get("matched_deltas") or []:
-            rim_by_gt[round(m["gt_ts"], 1)] = m["gt_ts"] + m["delta"]
+            # delta is stored UNSIGNED (|gt-cv|); the detector's rim moment is
+            # almost always BEFORE the card press, so subtract. cv_t is exact
+            # when present (newer reports persist it).
+            rim_by_gt[round(m["gt_ts"], 1)] = (
+                m["cv_t"] if "cv_t" in m else m["gt_ts"] - m["delta"])
         log(f"rim anchors: {len(rim_by_gt)} matched shots from detection report")
     except Exception as e:  # noqa: BLE001
         log(f"no detection report ({e}) — card-time anchors only")

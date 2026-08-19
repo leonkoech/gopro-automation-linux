@@ -87,6 +87,17 @@ def main():
     four = [[x * sx, y * sy] for x, y in vectorize(yellow, n_bins=35)]
     if len(three) < 15 or len(four) < 12:
         raise SystemExit(f"trace too sparse: three={len(three)} four={len(four)}")
+
+    def close_region(pts):
+        """The classifier treats the polyline as a CLOSED polygon (implicit
+        first-last edge). An open arc closes across the court interior and
+        everything near the basket tests outside (the round-3 4PT explosion).
+        Close along the baseline instead: run back above the arc's top edge."""
+        y_top = min(p[1] for p in pts) - 120
+        return pts + [[pts[-1][0], y_top], [pts[0][0], y_top]]
+
+    three = close_region(three)
+    four = close_region(four)
     out = {"angle": angle, "w": W, "h": H, "model": MODEL,
            "three_pt_white": three, "four_pt_red": four,
            "notes": f"auto_calib {datetime.now(timezone.utc).isoformat()} "

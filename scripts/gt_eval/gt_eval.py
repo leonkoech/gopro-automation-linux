@@ -308,7 +308,8 @@ def main():
             "matched": len(pairs),
             # per-pair residual deltas over game time — the drift analysis data
             "matched_deltas": [{"gt_ts": g["ts"],
-                                "delta": round(g["ts"] - (s["t"] + off), 2)}
+                                "delta": round(g["ts"] - (s["t"] + off), 2),
+                                "cv_t": round(s["t"] + off, 2)}
                                for g, s, _ in pairs],
             "model_missed": [{"ts": g["ts"], "side": g["side"], "cls": g["cls"]}
                              for g in gt_only],
