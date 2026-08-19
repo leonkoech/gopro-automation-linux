@@ -16,6 +16,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 from collections import defaultdict
@@ -90,6 +91,31 @@ def main():
     os.makedirs(clip_dir, exist_ok=True)
     env = classify_env()
 
+    # Per-game calibration (2026-08-19): camera framing drifts between nights,
+    # so a fixed calibration misplaces the arcs (Aug-4 games measured 26pts
+    # below Aug-6). When auto_calib polygons exist for this game, run the
+    # classifier from a shadow workdir: everything symlinked from production,
+    # calib_arcs_* replaced with this game's own trace.
+    workdir = TYPING_CWD
+    game_calib = {ang: f"/home/dev/game_calibs/calib_arcs_{ang}_{a.label}.json"
+                  for ang in ("FL", "FR")}
+    if all(os.path.isfile(v) for v in game_calib.values()):
+        workdir = f"{OUT}/{a.label}/typing_cwd"
+        os.makedirs(workdir, exist_ok=True)
+        for f in os.listdir(TYPING_CWD):
+            src, dst = f"{TYPING_CWD}/{f}", f"{workdir}/{f}"
+            if f.startswith("calib_arcs") or os.path.exists(dst):
+                continue
+            os.symlink(src, dst)
+        for ang, v in game_calib.items():
+            dst = f"{workdir}/calib_arcs_{ang}.json"
+            if os.path.lexists(dst):
+                os.unlink(dst)
+            shutil.copy(v, dst)
+        log(f"per-game calibration ACTIVE ({workdir})")
+    else:
+        log("per-game calibration missing — production calib")
+
     matrix = defaultdict(lambda: defaultdict(int))
     rows, kept = [], 0
     for i, g in enumerate(gt):
@@ -114,7 +140,7 @@ def main():
             cp = subprocess.run(
                 ["python3", "agx_classify.py", angle, clip, f"{PRE_S:.2f}",
                  f"te_{int(g['ts'])}"],
-                cwd=TYPING_CWD, env=env, capture_output=True, text=True,
+                cwd=workdir, env=env, capture_output=True, text=True,
                 timeout=CLASSIFY_TIMEOUT_S)
             m = re.search(r"ZONE_NEW=(\w+)", cp.stdout)
             zone = m.group(1) if m else None
