@@ -453,8 +453,6 @@ def _do_highlight(cmd: Dict):
         t_epoch = datetime.fromisoformat(str(ts).replace("Z", "+00:00")).timestamp()
     except ValueError:
         return {"success": False, "error": f"unparseable ts: {ts}"}, 400
-    if not HIGHLIGHT.active():
-        return {"success": False, "error": "highlight recorder not running"}, 409
     # Route the cut to the camera on the scoring team's current hoop side
     # (issue #4): team+period ride on the command, startingSideTeam1 is on the
     # game doc. Unknown side → left recorder (the prior single-buffer default).
@@ -464,6 +462,15 @@ def _do_highlight(cmd: Dict):
     side = (cmd.get("side") if cmd.get("side") in ("left", "right")
             else scoring_hoop_side(cmd.get("team"), cmd.get("period"), sst))
     recorder = HIGHLIGHT.recorder_for(side)
+    # Post-night retries (2026-08-19): with the recorder stopped, a cut is
+    # still valid as long as the label's buffer segments are on disk — the
+    # night-end retry sweep runs exactly then. cmd may carry the label.
+    retry_label = cmd.get("label") or label
+    if not HIGHLIGHT.active():
+        if not (retry_label and recorder.segments(retry_label)):
+            return {"success": False,
+                    "error": "recorder not running and no segments for label"}, 409
+        label = retry_label
     req = {"game_id": game_id, "log_id": str(log_id), "ts_epoch": t_epoch,
            "label": label or recorder.status().get("label"),
            "pre": cmd.get("pre"), "post": cmd.get("post")}
@@ -598,14 +605,16 @@ def _retry_failed_highlights(state: Dict) -> None:
                 parts = k.split("_")
                 epoch, side = int(parts[1]), parts[2]
                 ts = datetime.fromtimestamp(epoch, tz=timezone.utc).isoformat()
-                cmd = {"firebase_game_id": game_id, "logId": k, "ts": ts, "side": side}
+                cmd = {"firebase_game_id": game_id, "logId": k, "ts": ts,
+                       "side": side, "label": state.get("label")}
             else:
                 log = logs_by_id.get(k)
                 if not log:
                     continue
                 cmd = {"firebase_game_id": game_id, "logId": k,
                        "ts": log.get("timestamp"), "team": log.get("team"),
-                       "period": log.get("period"), "pre": 6.5, "post": -1.5}
+                       "period": log.get("period"), "pre": 6.5, "post": -1.5,
+                       "label": state.get("label")}
             try:
                 _do_highlight(cmd)
                 time.sleep(20)   # serialized-ish: one cut lands before the next
