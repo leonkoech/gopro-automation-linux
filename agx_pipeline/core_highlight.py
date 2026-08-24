@@ -53,6 +53,13 @@ def build_reel(firebase_game_id: str, game: Dict, game_date: Optional[str] = Non
     for log_id, h in highlights.items():
         if h.get("status") != "ready" or not h.get("url"):
             continue
+        # A CV-detected MISS is cut and stored (the typing stage needs it) but
+        # is not a highlight: publishing it would put missed shots in the feed,
+        # and Core cannot tell one from a make -- a clip carries no outcome
+        # field, and `cv_` basename + null play_type reads as "cv" either way.
+        # Filtering here keeps the reel honest without a Core schema change.
+        if h.get("made") is False:
+            continue
         log = by_id.get(str(log_id), {})
         clips.append({
             "url": h["url"],

@@ -330,6 +330,10 @@ def cut_highlight(fb, cfg, recorder: HighlightRecorder, req: Dict) -> None:
     label = req.get("label") or recorder.status().get("label")
     t0, t1 = t - pre, t + post
     _mark(fb, game_id, log_id, {"status": "processing",
+                                # CV verdict, when the cut came from the
+                                # shot detector. Absent for scorekeeper cuts.
+                                **({"made": req["made"]} if req.get("made") is not None else {}),
+                                **({"verdict": req["verdict"]} if req.get("verdict") else {}),
                                 "requestedAt": _utcnow(),
                                 "angle": recorder.angle()})
     try:
