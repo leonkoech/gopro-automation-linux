@@ -71,15 +71,16 @@ def autohighlight_enabled() -> bool:
 
 # Clip window around the trigger, which is the ball AT THE RIM -- not the release.
 # A make and a miss want different framing: on a make the interesting part is the
-# build-up and the ball going in, so the clip runs long before and stops just
-# after; on a miss the rebound matters as much as the shot, so it sits centred.
+# build-up and the ball going in, so the clip runs long before and keeps a short
+# tail; on a miss the rebound matters as much as the shot, so it runs longer
+# after. Reviewed on real clips 2026-08-24 and lengthened by 1s on both tails.
 def clip_window(made: bool) -> tuple:
     """(pre_s, post_s) for a CV-triggered cut. Rim-anchored."""
     if made:
         return (float(os.getenv("CV_CLIP_PRE_MAKE_S", "5")),
-                float(os.getenv("CV_CLIP_POST_MAKE_S", "1")))
+                float(os.getenv("CV_CLIP_POST_MAKE_S", "2")))
     return (float(os.getenv("CV_CLIP_PRE_MISS_S", "3")),
-            float(os.getenv("CV_CLIP_POST_MISS_S", "3")))
+            float(os.getenv("CV_CLIP_POST_MISS_S", "4")))
 
 
 def autoscore_enabled() -> bool:
