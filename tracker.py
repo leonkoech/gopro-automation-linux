@@ -7,13 +7,30 @@ from flask_cors import CORS
 from datetime import datetime
 import threading
 import os
+import re
 import json
 
-LOCALSENSE_IP = "127.0.0.1"
-PORT = 48300
-USERNAME = "admin"
-PASSWORD = "Uball_Tracking"
-SALT = "abcdefghijklmnopqrstuvwxyz20191107salt"
+from dotenv import load_dotenv
+
+load_dotenv()
+
+
+def _require_env(name):
+    """Fetch a required secret from the environment, failing loudly if unset."""
+    value = os.getenv(name)
+    if not value:
+        raise RuntimeError(
+            f"Missing required environment variable {name!r}. "
+            f"Set it in your .env file (see .env.example)."
+        )
+    return value
+
+
+LOCALSENSE_IP = os.getenv("LOCALSENSE_IP", "127.0.0.1")
+PORT = int(os.getenv("LOCALSENSE_PORT", "48300"))
+USERNAME = os.getenv("TRACKER_USERNAME", "admin")
+PASSWORD = _require_env("TRACKER_PASSWORD")
+SALT = _require_env("TRACKER_SALT")
 LOGS_DIR = "tracker_logs"
 SESSIONS_FILE = "sessions.json"
 
@@ -165,7 +182,16 @@ def home():
 def start():
     data = request.json or {}
     session_id = data.get('session_id', f"session_{int(datetime.utcnow().timestamp())}")
-    
+
+    # session_id is used to build a log file path (os.path.join(LOGS_DIR,
+    # f"{session_id}.log")); restrict it to a safe token so it cannot
+    # traverse out of LOGS_DIR or override it with an absolute path.
+    if not re.fullmatch(r'[A-Za-z0-9_-]{1,64}', session_id):
+        return jsonify({
+            "status": "error",
+            "error": "Invalid session_id: use 1-64 chars of [A-Za-z0-9_-]"
+        }), 400
+
     if not hasattr(app, "listener_thread") or not app.listener_thread.is_alive():
         session_manager.start_session(session_id)
         app.listener_thread = threading.Thread(target=start_listener_thread, daemon=True)

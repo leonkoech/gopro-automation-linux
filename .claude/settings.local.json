@@ -5,7 +5,14 @@
       "Bash(ssh:*)",
       "Bash(python3:*)",
       "Bash(SSH_KEY=\"/Users/rohitkale/Cellstrat/GitHub_Repositories/gopro-automation-linux/id_rsa\")",
-      "Bash(__NEW_LINE_801c3476a9dd493c__ echo \"=== JETSON 1 - Recent activity ===\")"
+      "Bash(__NEW_LINE_801c3476a9dd493c__ echo \"=== JETSON 1 - Recent activity ===\")",
+      "mcp__claude_ai_Linear__get_issue",
+      "mcp__claude_ai_Linear__save_comment",
+      "Bash(git checkout *)",
+      "Bash(python -m pytest tests/test_game_auto_end.py -q)",
+      "Bash(cd *)",
+      "Bash(python3 -c \"import ast; ast.parse\\(open\\('game_auto_end.py'\\).read\\(\\)\\); ast.parse\\(open\\('tests/test_game_auto_end.py'\\).read\\(\\)\\); print\\('syntax OK'\\)\")",
+      "Bash(python3 -c \"import game_auto_end; print\\('import OK; DEFAULT_IDLE_MINUTES =', game_auto_end.DEFAULT_IDLE_MINUTES\\)\")"
     ],
     "deny": [],
     "ask": []

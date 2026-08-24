@@ -124,9 +124,13 @@ class ZCamUploader:
     def _process_job(self, job: UploadJob):
         """Download from Z-CAM, then upload to S3."""
         job.started_at = time.time()
+        # filename is parsed from the camera's HTTP DCIM listing (untrusted);
+        # strip any path components so a crafted name cannot traverse out of
+        # download_dir when we open()/os.remove() local_path below.
+        safe_filename = os.path.basename(job.file_info['filename'])
         local_path = os.path.join(
             self.config.download_dir,
-            f"{job.camera.cam_id}_{job.file_info['filename']}"
+            f"{job.camera.cam_id}_{safe_filename}"
         )
 
         try:

@@ -1,0 +1,365 @@
+"""GT evaluation harness — CV shot detection vs manual annotation (full game).
+
+Per game (needs SL/SR/FL/FR masters on disk + manual GT in the annotation tool):
+  1. GT           manual shot cards (FG|2PT|3PT|4PT)_(MAKE|MISS) via uball API
+  2. CV shots     coarse scan of BOTH SL/SR masters -> each candidate confirmed
+                  with the full-fps windowed detector (the validated make/miss)
+  3. SYNC         FL<->SL offset: sidecar spawned_at prior, refined empirically
+                  (mode of GT-vs-CV make deltas) — reported per game
+  4. MATCH        greedy nearest within +/-4s on the same hoop side ->
+                    matched (make/miss agreement matrix)
+                    GT-only  = OUR MODEL MISSED
+                    CV-only  = GT (annotators) MISSED  [in-game vs warmup flag]
+  5. CLIPS        every make/miss disagreement -> SL|FL side-by-side 8s clip,
+                  uploaded to S3 with 7-day presigned links
+  6. REPORT       /home/dev/gt_eval/<label>_report.json + printed summary
+
+Usage: python3 gt_eval.py --label game_X --uball-game-id U [--limit-s N]
+Run only while nothing is recording (GPU + correctness).
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+import time
+from collections import Counter
+from datetime import datetime
+
+import boto3
+
+sys.path.insert(0, "/home/dev/gopro-automation-linux")
+from agx_pipeline.shot_detect import logic  # noqa: E402
+from agx_pipeline.shot_detect.backtest import scan  # noqa: E402
+from agx_pipeline.shot_detect.detect import ShotDetector, iter_frames  # noqa: E402
+from uball_client import UballClient  # noqa: E402
+
+REC_DEFAULT = "/home/dev/app/recordings"
+OUT = "/home/dev/gt_eval"
+BUCKET = "uball-videos-production"
+WEIGHTS = ("/home/dev/gopro-automation-linux/agx_pipeline/shot_detect/weights/"
+           "ball_yolo26s_gray_hifps_v3_best.pt")
+RIMS = "/home/dev/gopro-automation-linux/agx_pipeline/shot_detect/rims.json"
+SIDE = ({"SL": "right", "SR": "left"}
+        if os.getenv("SHOT_EVAL_FLIP_SIDES") == "1"
+        else {"SL": "left", "SR": "right"})  # pre-2026-08-05 games: cams swapped
+GT_SIDE = {"LEFT": "left", "RIGHT": "right"}
+MATCH_WIN = 4.0          # s, after offset correction
+CONFIRM_HALF = 2.0       # s of full-fps window each side of a candidate
+WARMUP_PAD = 90.0        # s outside [first_gt, last_gt] counts as out-of-game
+
+
+def log(msg: str) -> None:
+    print(f"[gt_eval {datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
+
+
+def load_gt(uball_id: str):
+    client = UballClient()
+    rows = []
+    for p in client.list_plays(uball_id):
+        cls = str(p.get("classification") or "")
+        # FREE_THROW included (user calibration 2026-08-17): FTs are real rim
+        # events the detector sees; excluding them made them look "uncarded".
+        if p.get("source") == "manual" and any(
+                cls == f"{z}_{m}" for z in ("FG", "2PT", "3PT", "4PT", "FREE_THROW")
+                for m in ("MAKE", "MISS")):
+            rows.append({"ts": float(p.get("timestamp_seconds") or 0),
+                         "side": GT_SIDE.get(str(p.get("angle") or "").upper()),
+                         "made": cls.endswith("MAKE"), "cls": cls,
+                         "player": p.get("player_a")})
+    rows.sort(key=lambda r: r["ts"])
+    return [r for r in rows if r["side"]]
+
+
+def sidecar_offsets(label: str, rec: str):
+    """Per shot-cam offset prior: t_FL ~= t_cam + (cam.spawned_at - FL_start).
+    FL start ~= the label's UTC time (recorders spawn with the start command)."""
+    try:
+        sc = json.load(open(f"{rec}/{label}/{label}_shot_timing.json"))
+        t_label = datetime.strptime(label, "game_%Y%m%d_%H%M%S")
+        out = {}
+        for c in sc.get("cameras", []):
+            sp = datetime.fromisoformat(
+                str(c.get("spawned_at")).replace("Z", "+00:00")).replace(tzinfo=None)
+            out[c["angle"]] = (sp - t_label).total_seconds()
+        return out
+    except Exception as e:  # noqa: BLE001
+        log(f"sidecar offsets unavailable ({e}) — using 0")
+        return {}
+
+
+def cv_shots(label: str, det, rims_all, limit_s, rec: str):
+    """Coarse scan of both shot cams + full-fps confirm per candidate."""
+    shots = []
+    for cam in ("SL", "SR"):
+        video = f"{rec}/{label}/{label}_{cam}.mp4"
+        if not os.path.isfile(video):
+            log(f"{cam}: master missing — skipped")
+            continue
+        t0 = time.time()
+        rim = (scan.estimate_rim(det.model, video, det.device, fps=119.9)
+               or (rims_all or {}).get(cam))
+        log(f"{cam}: rim={rim and 'ok'} ({time.time()-t0:.0f}s)")
+        t0 = time.time()
+        cand = scan.scan_shots(det.model, video, det.device, 119.9, rim,
+                               stride=int(os.getenv("SHOT_EVAL_STRIDE", "4")),
+                               imgsz=int(os.getenv("SHOT_EVAL_IMGSZ", "640")),
+                               conf=float(os.getenv("SHOT_EVAL_CONF", "0.20")),
+                               progress_every=0, limit_s=limit_s)
+        log(f"{cam}: coarse scan -> {len(cand)} candidates "
+            f"({time.time()-t0:.0f}s)")
+        for c in cand:
+            t = c["t_shot"]
+            frames = [fr for _, fr in iter_frames(
+                video, ss=max(0.0, t - CONFIRM_HALF),
+                max_frames=int(2 * CONFIRM_HALF * 120))]
+            v = det.detect(frames, rim, fps=119.9) if frames else None
+            shots.append({"cam": cam, "side": SIDE[cam], "t": round(t, 2),
+                          "made_coarse": c["made"],
+                          "made": bool(v and v.get("made")) if v else c["made"],
+                          "confirmed": bool(v)})
+        log(f"{cam}: confirmed {sum(1 for s in shots if s['cam']==cam)} shots")
+    shots.sort(key=lambda s: s["t"])
+    return shots
+
+
+def refine_offset(gt, cv, prior: float):
+    """Mode of (gt_ts - cv_t) over same-side makes within +/-12s of prior."""
+    deltas = []
+    for g in gt:
+        if not g["made"]:
+            continue
+        for s in cv:
+            if s["side"] != g["side"] or not s["made"]:
+                continue
+            d = g["ts"] - s["t"]
+            # no sidecar prior (S3-packaged games): search wide
+            if abs(d - prior) <= (45.0 if prior == 0.0 else 12.0):
+                deltas.append(round(d * 2) / 2)
+    if not deltas:
+        return prior, 0
+    off, n = Counter(deltas).most_common(1)[0]
+    return off, n
+
+
+def train_scan(gt, cv):
+    """Direct (slope, offset) grid scan over the two event trains.
+
+    2026-08-19 Akatsuki finding: a strong clock drift defeats the
+    constant-offset seed entirely (Akatsuki drifts +1.04%; the constant lock
+    only held mid-game, so the pair-seeded least squares inherited the bad
+    seed: b=1.0007, a=+18 vs truth b=1.0104, a=-2.7 — the family intercept).
+    Scanning gt_ts ~ b*cv_t + a with NO matching prior finds the true map.
+    Side-constrained hits at +/-2s; coarse 2e-4/1.0s grid, then fine refine.
+    Returns (hits, b, a).
+    """
+    from bisect import bisect
+
+    by_side = {}
+    for s in cv:
+        by_side.setdefault(s["side"], []).append(s["t"])
+    for v in by_side.values():
+        v.sort()
+
+    def hits(b, a, tol=2.0):
+        n = 0
+        for g in gt:
+            ts_list = by_side.get(g["side"])
+            if not ts_list:
+                continue
+            p = (g["ts"] - a) / b  # predicted cv time for this gt event
+            i = bisect(ts_list, p)
+            d = min((abs(ts_list[j] - p) for j in (i - 1, i)
+                     if 0 <= j < len(ts_list)), default=1e9)
+            if d < tol:
+                n += 1
+        return n
+
+    best = max(((hits(0.990 + i * 2e-4, float(a0)), 0.990 + i * 2e-4, float(a0))
+                for i in range(111) for a0 in range(-60, 61)),
+               key=lambda x: x[0])
+    b0, a0 = best[1], best[2]
+    fine = max(((hits(b0 + i * 2e-5, a0 + j * 0.1), b0 + i * 2e-5, a0 + j * 0.1)
+                for i in range(-15, 16) for j in range(-15, 16)),
+               key=lambda x: x[0])
+    return fine
+
+
+def match(gt, cv, off):
+    used = set()
+    pairs, gt_only = [], []
+    for g in gt:
+        best, best_d = None, MATCH_WIN + 1
+        for i, s in enumerate(cv):
+            if i in used or s["side"] != g["side"]:
+                continue
+            d = abs(g["ts"] - (s["t"] + off))
+            if d < best_d:
+                best, best_d = i, d
+        if best is not None and best_d <= MATCH_WIN:
+            used.add(best)
+            pairs.append((g, cv[best], round(best_d, 2)))
+        else:
+            gt_only.append(g)
+    cv_only = [s for i, s in enumerate(cv) if i not in used]
+    return pairs, gt_only, cv_only
+
+
+def cut_clip(label, cam, t_cam, t_fl, name, rec):
+    os.makedirs(f"{OUT}/{label}/clips", exist_ok=True)
+    out = f"{OUT}/{label}/clips/{name}.mp4"
+    if os.path.exists(out):
+        return out
+    # Tracking cam ONLY: -ss on the FLIR shot-cam masters cannot seek (bogus
+    # 12000/1 timebase -> ffmpeg grinds for HOURS; measured 2.7h for one clip).
+    # The FL/FR view shows the basket clearly enough to judge make/miss.
+    fl = f"{rec}/{label}/{label}_{'FL' if cam == 'SL' else 'FR'}.mp4"
+    cmd = ["ffmpeg", "-y", "-loglevel", "error",
+           "-ss", f"{max(0.0, t_fl-4):.1f}", "-i", fl,
+           "-t", "8", "-vf", "scale=1280:720",
+           "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p", out]
+    subprocess.run(cmd, check=True)
+    return out
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--label", required=True)
+    ap.add_argument("--uball-game-id", required=True)
+    ap.add_argument("--limit-s", type=float, default=None)
+    ap.add_argument("--rec-dir", default=REC_DEFAULT)
+    a = ap.parse_args()
+    os.makedirs(f"{OUT}/{a.label}", exist_ok=True)
+
+    gt = load_gt(a.uball_game_id)
+    log(f"GT: {len(gt)} manual shots ({sum(1 for g in gt if g['made'])} makes)")
+    if not gt:
+        # An annotated eval game NEVER has zero GT — this means the annotation
+        # backend is down (list_plays 503s -> []). Abort BEFORE burning ~2.5h of
+        # GPU on an unmatched scan (2026-08-15: the Colada rerun did exactly
+        # that during the backend outage). No report, no DONE marker.
+        log("GT EMPTY — annotation backend down? ABORTING before the scan.")
+        sys.exit(2)
+    rims_all = json.load(open(RIMS))
+    det = ShotDetector(WEIGHTS)
+    cv = cv_shots(a.label, det, rims_all, a.limit_s, a.rec_dir)
+    log(f"CV: {len(cv)} confirmed shots ({sum(1 for s in cv if s['made'])} makes)")
+
+    prior_all = sidecar_offsets(a.label, a.rec_dir)
+    prior = -(prior_all.get("SL", 0.0))          # t_fl = t_sl + (SL_spawn-FL) -> gt-cv
+    off, votes = refine_offset(gt, cv, prior)
+    log(f"SYNC: prior={prior:+.1f}s empirical={off:+.1f}s (votes={votes})")
+
+    pairs, gt_only, cv_only = match(gt, cv, off)
+    # TRAIN SCAN: when the drift is too big for the constant seed to lock
+    # anywhere useful, the direct (b, a) scan beats the seeded match count —
+    # adopt its map before the least-squares polish. Default on;
+    # SHOT_EVAL_TRAIN_SCAN=0 disables.
+    if os.environ.get("SHOT_EVAL_TRAIN_SCAN", "1") != "0":
+        s_hits, s_b, s_a = train_scan(gt, cv)
+        if s_hits > len(pairs):
+            for s_ in cv:
+                s_["t"] = round(s_b * s_["t"] + s_a, 2)
+            off = 0.0
+            pairs, gt_only, cv_only = match(gt, cv, off)
+            log(f"SYNC-SCAN: gt = {s_b:.5f}*cv + {s_a:.2f} "
+                f"(drift {100*(s_b-1):+.2f}%, {s_hits} train hits) "
+                f"-> rematched {len(pairs)} (beat constant seed)")
+    # LINEAR clock refine (the 2026-08-15 finding: SL vs FL clocks diverge
+    # ~6.8%/s — fps-mismatch; a constant offset false-locks). Fit
+    # gt_ts = b*cv_t + a on the constant-offset matches, remap, rematch.
+    lin_a, lin_b = off, 1.0
+    if len(pairs) >= 6:
+        xs = [s_["t"] for _, s_, _ in pairs]
+        ys = [g_["ts"] for g_, _, _ in pairs]
+        n = len(xs)
+        sx, sy = sum(xs), sum(ys)
+        sxx = sum(x * x for x in xs)
+        sxy = sum(x * y for x, y in zip(xs, ys))
+        den = n * sxx - sx * sx
+        if den:
+            lin_b = (n * sxy - sx * sy) / den
+            lin_a = (sy - lin_b * sx) / n
+            for s_ in cv:
+                s_["t"] = round(lin_b * s_["t"] + lin_a, 2)
+            pairs, gt_only, cv_only = match(gt, cv, 0.0)
+            off = 0.0
+            log(f"SYNC-LINEAR: gt = {lin_b:.5f}*cv + {lin_a:.2f} "
+                f"(drift {100*(lin_b-1):+.2f}%) -> rematched {len(pairs)}")
+    first_gt = gt[0]["ts"] if gt else 0
+    last_gt = gt[-1]["ts"] if gt else 0
+    for s in cv_only:
+        t_fl = s["t"] + off
+        s["in_game"] = (first_gt - WARMUP_PAD) <= t_fl <= (last_gt + WARMUP_PAD)
+
+    agree = sum(1 for g, s, _ in pairs if g["made"] == s["made"])
+    dis = [(g, s) for g, s, _ in pairs if g["made"] != s["made"]]
+    in_game_cv_only = [s for s in cv_only if s.get("in_game")]
+    links = []
+
+    def write_report():
+        report = {
+            "label": a.label, "uball_game_id": a.uball_game_id,
+            "gt_shots": len(gt), "cv_shots": len(cv),
+            "sync_offset_s": off, "sync_prior_s": prior, "sync_votes": votes,
+            "sync_linear_a": round(lin_a, 2), "sync_linear_b": round(lin_b, 5),
+            "matched": len(pairs),
+            # per-pair residual deltas over game time — the drift analysis data
+            "matched_deltas": [{"gt_ts": g["ts"],
+                                "delta": round(g["ts"] - (s["t"] + off), 2)}
+                               for g, s, _ in pairs],
+            "model_missed": [{"ts": g["ts"], "side": g["side"], "cls": g["cls"]}
+                             for g in gt_only],
+            "gt_missed_in_game": [{"t_fl": round(s["t"] + off, 1),
+                                   "side": s["side"], "made": s["made"]}
+                                  for s in in_game_cv_only],
+            "gt_missed_warmup_or_ft": len(cv_only) - len(in_game_cv_only),
+            "makemiss_agree": agree,
+            "makemiss_accuracy": (round(agree / len(pairs), 3)
+                                  if pairs else None),
+            "disagreements": [{"gt_ts": g["ts"], "gt": g["cls"],
+                               "cv_made": s["made"], "cam": s["cam"]}
+                              for g, s in dis],
+            "clips": links,
+        }
+        with open(f"{OUT}/{a.label}_report.json", "w") as f:
+            json.dump(report, f, indent=2)
+        return report
+
+    # analysis is the valuable part — persist it BEFORE the slow clip phase
+    report = write_report()
+    log("report written (pre-clips)")
+    s3c = boto3.client("s3")
+    for i, (g, s) in enumerate(dis):
+        name = (f"D{i+1:02d}_{s['cam']}_GT-{'MAKE' if g['made'] else 'MISS'}"
+                f"_CV-{'MAKE' if s['made'] else 'MISS'}_t{int(g['ts'])}")
+        try:
+            path = cut_clip(a.label, s["cam"], s["t"], g["ts"], name, a.rec_dir)
+            key = f"review/gt_eval/{a.label}/{name}.mp4"
+            s3c.upload_file(path, BUCKET, key,
+                            ExtraArgs={"ContentType": "video/mp4"})
+            url = s3c.generate_presigned_url(
+                "get_object", Params={"Bucket": BUCKET, "Key": key},
+                ExpiresIn=604800)
+            links.append({"name": name, "url": url})
+            log(f"clip {name} uploaded")
+        except Exception as e:  # noqa: BLE001
+            log(f"clip {name} FAILED: {e}")
+
+    report = write_report()   # final rewrite: now with clip links
+
+    log("===== SUMMARY =====")
+    log(f"GT {len(gt)} | CV {len(cv)} | matched {len(pairs)}")
+    log(f"MODEL MISSED {len(gt_only)}/{len(gt)} "
+        f"(recall {1 - len(gt_only)/len(gt):.0%})" if gt else "no GT")
+    log(f"GT MISSED (in-game) {len(in_game_cv_only)} | warmup/FT {report['gt_missed_warmup_or_ft']}")
+    log(f"MAKE/MISS accuracy {agree}/{len(pairs)}"
+        f" = {report['makemiss_accuracy']}")
+    log(f"disagreement clips: {len(links)}")
+    print("GT_EVAL_DONE", flush=True)
+
+
+if __name__ == "__main__":
+    main()

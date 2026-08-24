@@ -7,44 +7,42 @@ callers can import it without introducing a circular dependency.
 
 from __future__ import annotations
 
-import os
 from datetime import datetime
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from logging_service import get_logger
 
 logger = get_logger("gopro.plays_sync")
 
 
+# Points → canonical annotation-tool classification. These MUST match the
+# vocabulary the box score / UBall sync / chatbot expect: a 2-point make is
+# FG_MAKE and a free throw is FREE_THROW_MAKE. (The old 2PT_MAKE/FT_MAKE were
+# wrong and polluted the plays table; 4-pointers were dropped entirely.)
+_MAKE_BY_POINTS: Dict[int, str] = {1: "FREE_THROW_MAKE", 2: "FG_MAKE", 3: "3PT_MAKE", 4: "4PT_MAKE"}
+
 SHOT_LABELS: Dict[str, str] = {
-    "2PT_MAKE": "2-Pointer Made",  "2PT_MISS": "2-Pointer Missed",
-    "3PT_MAKE": "3-Pointer Made",  "3PT_MISS": "3-Pointer Missed",
-    "FT_MAKE":  "Free Throw Made", "FT_MISS":  "Free Throw Missed",
-    "FG_MAKE":  "Field Goal Made", "FG_MISS":  "Field Goal Missed",
-    "FOUL":     "Foul",            "TIPOFF":   "Tipoff",
+    "FG_MAKE": "Field Goal Made", "FG_MISS": "Field Goal Missed",
+    "3PT_MAKE": "3-Pointer Made", "3PT_MISS": "3-Pointer Missed",
+    "4PT_MAKE": "4-Pointer Made", "4PT_MISS": "4-Pointer Missed",
+    "FREE_THROW_MAKE": "Free Throw Made", "FREE_THROW_MISS": "Free Throw Missed",
+    "FOUL": "Foul", "TIPOFF": "Tipoff",
 }
 
-
-def _cv_plays_enabled() -> bool:
-    """Feature gate for CV-emitted plays reaching the annotation tool.
-
-    V1 far-angle model under-detects shots in production (~3-12 detections per
-    game vs an expected 70+), driven by a training-distribution mismatch with
-    production cameras.  Until the far-angle retrain lands and validates on
-    real games, CV-emitted events (those with `payload.source == "cv"`) are
-    filtered out by `plays_sync` even if they end up in Firebase `logs[]`.
-
-    Set CV_PLAYS_ENABLED=true on the Jetson .env to allow CV-source events to
-    become Supabase plays.  Operator-entered scoreboard events are unaffected
-    by this flag and always create plays.
-    """
-    return os.getenv("CV_PLAYS_ENABLED", "false").strip().lower() in ("true", "1", "yes", "on")
+# Resolve the play's camera side (LEFT/RIGHT) from scoring team + period +
+# startingSideTeam1 — the same halftime-aware math the highlight clips use.
+# Imported defensively so this module still loads in the legacy (non-AGX) env.
+try:
+    from agx_pipeline.side_attribution import scoring_hoop_side as _scoring_hoop_side
+except Exception:  # pragma: no cover - legacy env without agx_pipeline
+    _scoring_hoop_side = None
 
 
 def create_plays_from_firebase_logs(
     client: Any,
     uball_game_id: str,
     firebase_game: Dict[str, Any],
+    summary: Optional[Dict[str, Any]] = None,
 ) -> int:
     """Create plays in the annotation tool from a Firebase game's logs.
 
@@ -72,6 +70,9 @@ def create_plays_from_firebase_logs(
             logger.info(
                 f"[PlaysSync] Game {uball_game_id} already has {len(existing)} plays — skipping."
             )
+            if summary is not None:
+                summary.update({"created": 0, "with_players": 0,
+                                "by_label": {}, "skipped_existing": True})
             return 0
     except Exception as exc:
         logger.warning(
@@ -88,46 +89,25 @@ def create_plays_from_firebase_logs(
     right_name = firebase_game.get("rightTeam", {}).get("name", "Team 2")
 
     created = 0
-    cv_skipped = 0
-    cv_enabled = _cv_plays_enabled()
+    with_players = 0
+    by_label: Dict[str, int] = {}
     for log in logs:
         action = log.get("actionType", "")
         payload = log.get("payload", {}) or {}
         team_side = log.get("team")
 
-        # Feature gate: CV-source events (payload.source == "cv") are filtered
-        # out until CV_PLAYS_ENABLED=true.  Defense-in-depth with cv-merge's
-        # emit_target=cv_logs_staging shadow gate — even if CV events end up
-        # in logs[] somehow, plays_sync still won't promote them while the
-        # far-angle model is under-detecting on production cameras.
-        if payload.get("source") == "cv" and not cv_enabled:
-            cv_skipped += 1
-            continue
-
-        if action == "score_added":
-            points = payload.get("points", 0)
-            if points == 2:
-                classification = "2PT_MAKE"
-            elif points == 3:
-                classification = "3PT_MAKE"
-            elif points == 1:
-                classification = "FT_MAKE"
-            else:
-                continue
-        elif action == "shot_missed":
-            # UBA-237: V1 introduces missed shots via the CV pipeline.
-            # Same payload shape as score_added (`payload.points` chooses
-            # the distance bucket); V1 always sets 2.
-            points = payload.get("points", 2)
-            if points == 2:
-                classification = "2PT_MISS"
-            elif points == 3:
-                classification = "3PT_MISS"
-            elif points == 1:
-                classification = "FT_MISS"
-            else:
-                logger.warning(f"[PlaysSync] shot_missed log has invalid points: {payload}")
-                continue
+        # Player pre-fill: only a player tap (player_score_added) carries a
+        # player; a team-button score (score_added) does not, and the annotator
+        # fills it in later — but the card + clip are already placed for them.
+        player_id = None
+        player_name = None
+        if action in ("score_added", "player_score_added"):
+            classification = _MAKE_BY_POINTS.get(payload.get("points", 0))
+            if not classification:
+                continue  # 0-point / malformed score log
+            if action == "player_score_added":
+                player_id = payload.get("playerId")
+                player_name = payload.get("playerName")
         elif action == "foul_added":
             classification = "FOUL"
         elif action == "game_started":
@@ -153,22 +133,19 @@ def create_plays_from_firebase_logs(
         start_ts = max(0.0, ts - 5.0)
         end_ts = ts + 3.0
 
-        is_cv = payload.get("source") == "cv"
-        if is_cv:
-            # V1 CV pipeline is distance-blind: we always assign the 2PT_MAKE/2PT_MISS
-            # bucket as a backend default, but the human-readable note must NOT claim
-            # "2-Pointer" since the model can't actually tell 2 vs 3.  V2 will emit
-            # a distance estimate and we'll restore the bucket-specific label.
-            if classification.endswith("_MAKE"):
-                cv_label = "Made"
-            elif classification.endswith("_MISS"):
-                cv_label = "Missed"
-            else:
-                cv_label = SHOT_LABELS.get(classification, classification)
-            note = f"{team_name} — {cv_label} (CV)"
-        else:
-            label = SHOT_LABELS.get(classification, classification)
-            note = f"{team_name} — {label}"
+        label = SHOT_LABELS.get(classification, classification)
+
+        # Camera side (LEFT/RIGHT) the play happened at — flips at halftime.
+        # Same math as the highlight clips; None if the resolver isn't available
+        # (legacy env) or the event has no team (e.g. tipoff).
+        angle = None
+        if _scoring_hoop_side and team_side in ("left", "right"):
+            hoop = _scoring_hoop_side(team_side, log.get("period"),
+                                      firebase_game.get("startingSideTeam1"))
+            angle = hoop.upper() if hoop else None
+
+        confidence = 1.0  # operator-entered scoreboard truth
+        note = f"{player_name or team_name} — {label}"
 
         play_data: Dict[str, Any] = {
             "game_id": uball_game_id,
@@ -177,35 +154,141 @@ def create_plays_from_firebase_logs(
             "timestamp_seconds": ts,
             "start_timestamp": start_ts,
             "end_timestamp": end_ts,
+            # source tags the card's origin so annotators can tell auto-seeded
+            # scoreboard plays ("firebase") from their own ("manual").
+            "source": "firebase",
+            "events": [{
+                "label": classification,
+                "playerA": player_name, "playerAId": player_id,
+                "playerB": None, "playerBId": None,
+                "confidence": confidence,
+            }],
         }
         if team:
             play_data["team"] = team
-
-        # Carry CV provenance + confidence through to the backend (optional fields
-        # on PlayCreate; safely dropped by the backend if the columns are absent
-        # prior to the 007 migration being applied). Triggered by
-        # `payload.source == "cv"` rather than the actionType so an operator-
-        # entered shot is never mis-stamped.
-        if is_cv:
-            play_data["source"] = "cv"
-            confidence = payload.get("confidence")
-            if confidence is not None:
-                play_data["confidence"] = float(confidence)
+        if angle:
+            play_data["angle"] = angle
+        if player_id or player_name:
+            play_data["player_a"] = player_name
+            play_data["player_a_id"] = player_id
+        if confidence is not None:
+            play_data["confidence"] = confidence
 
         try:
             client.create_play(play_data)
             created += 1
+            by_label[classification] = by_label.get(classification, 0) + 1
+            if player_id:
+                with_players += 1
         except Exception as exc:
             logger.warning(
                 f"[PlaysSync] Failed to create play ({classification} at {ts:.1f}s) "
                 f"for game {uball_game_id}: {exc}"
             )
 
-    if cv_skipped:
-        logger.info(
-            f"[PlaysSync] Created {created}/{len(logs)} plays for game {uball_game_id} "
-            f"(skipped {cv_skipped} CV-source event(s); CV_PLAYS_ENABLED={cv_enabled})"
-        )
-    else:
-        logger.info(f"[PlaysSync] Created {created}/{len(logs)} plays for game {uball_game_id}")
+    logger.info(f"[PlaysSync] Created {created}/{len(logs)} plays for game {uball_game_id}")
+    if summary is not None:
+        summary.update({"created": created, "with_players": with_players,
+                        "by_label": by_label, "skipped_existing": False})
+    return created
+
+
+_HOOP_ANGLE = {"left": "LEFT", "right": "RIGHT"}
+
+
+def create_plays_from_shot_live(
+    client: Any,
+    uball_game_id: str,
+    firebase_game: Dict[str, Any],
+    dry_run: bool = False,
+    summary: Optional[Dict[str, Any]] = None,
+) -> int:
+    """Create annotation cards from the CV's `shot_live` shadow — every make/miss
+    the high-fps SL/SR detector saw, independent of the scorekeeper.
+
+    Tagged `source="cv"` so annotators can tell these from scoreboard cards AND so
+    this is idempotent on CV cards (re-runs won't duplicate). The CV knows the hoop
+    (angle LEFT/RIGHT) and make/miss but NOT the point value (→ FG_MAKE/FG_MISS,
+    2pt assumed) or the team (left for the annotator). Low confidence (0.5) flags
+    them as CV-suggested + review-needed (~65% recall / ~80% precision shadow).
+
+    `dry_run` counts without writing. Returns the number created (or would create).
+    """
+    if not uball_game_id:
+        return 0
+    live = firebase_game.get("shot_live") or {}
+    shots = live.get("shots") or []
+    if not shots:
+        return 0
+
+    # Idempotency: skip if this game already has CV cards.
+    try:
+        existing = client.list_plays(uball_game_id)
+        if any((p.get("source") == "cv") for p in existing):
+            logger.info(f"[PlaysSync/CV] Game {uball_game_id} already has CV cards — skipping.")
+            if summary is not None:
+                summary.update({"created": 0, "by_label": {}, "skipped_existing": True})
+            return 0
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"[PlaysSync/CV] list_plays check failed for {uball_game_id}: {exc}")
+
+    created_at_raw = firebase_game.get("createdAt")
+    game_start = (datetime.fromisoformat(created_at_raw.replace("Z", "+00:00"))
+                  if created_at_raw else None)
+
+    created = 0
+    by_label: Dict[str, int] = {}
+    for s in shots:
+        classification = "FG_MAKE" if s.get("made") else "FG_MISS"
+        # Video-timeline seconds: prefer wallclock - game_start; fall back to the
+        # segment offset. Approximate (SL/SR vs tracking-cam sync) — the annotator
+        # nudges it; the card + rough position is what saves them the work.
+        ts = None
+        wc = s.get("wallclock")
+        if wc and game_start:
+            try:
+                ts = (datetime.fromisoformat(wc) - game_start).total_seconds()
+            except Exception:  # noqa: BLE001
+                ts = None
+        if ts is None:
+            ts = float(s.get("seg", 0)) * 4.0 + float(s.get("t_shot", 0.0))
+        ts = max(0.0, ts)
+        angle = _HOOP_ANGLE.get(s.get("side"))
+        label = SHOT_LABELS.get(classification, classification)
+        note = f"CV: {label}" + (f" ({s.get('cam')} · {s.get('side')} rim)" if s.get("cam") else "")
+
+        play_data: Dict[str, Any] = {
+            "game_id": uball_game_id,
+            "classification": classification,
+            "note": note,
+            "timestamp_seconds": ts,
+            "start_timestamp": max(0.0, ts - 5.0),
+            "end_timestamp": ts + 3.0,
+            "source": "cv",
+            "confidence": 0.5,
+            "events": [{
+                "label": classification,
+                "playerA": None, "playerAId": None,
+                "playerB": None, "playerBId": None,
+                "confidence": 0.5,
+            }],
+        }
+        if angle:
+            play_data["angle"] = angle
+
+        if dry_run:
+            created += 1
+            by_label[classification] = by_label.get(classification, 0) + 1
+            continue
+        try:
+            client.create_play(play_data)
+            created += 1
+            by_label[classification] = by_label.get(classification, 0) + 1
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"[PlaysSync/CV] create_play failed ({classification} @ {ts:.1f}s): {exc}")
+
+    logger.info(f"[PlaysSync/CV] {'(dry-run) ' if dry_run else ''}created {created}/{len(shots)} "
+                f"CV cards for game {uball_game_id}")
+    if summary is not None:
+        summary.update({"created": created, "by_label": by_label, "skipped_existing": False})
     return created

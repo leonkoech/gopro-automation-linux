@@ -1,0 +1,12 @@
+{
+  "_note": "Rim ellipses for the FLIR shot cams, in full-frame (720x540) pixels. SL/SR are the production keys (rim is stable per mount; RECALIBRATE if the rig moves or a court differs). The dated *_highfps.mp4 keys are the 2026-07-20 test rig, kept for the P1.0 acceptance test against makemiss_v43 verdicts.",
+  "SL": { "center": [355.0, 252.0], "semi_axes": [101.8, 108.0], "angle": 92.0, "bbox": [248, 150, 462, 352] },
+  "SR": { "center": [402.5, 274.0], "semi_axes": [100.3, 111.3], "angle": 98.0, "bbox": [291, 174, 513, 373] },
+
+  "2026-07-20_ba4d38fa_SL_highfps.mp4": { "center": [355.0, 251.9], "semi_axes": [101.8, 107.5], "angle": 91.8, "bbox": [248, 150, 462, 352] },
+  "2026-07-20_ba4d38fa_SR_highfps.mp4": { "center": [402.8, 273.9], "semi_axes": [100.4, 111.1], "angle": 97.8, "bbox": [291, 173, 513, 373] },
+  "2026-07-20_f1ea21f0_SL_highfps.mp4": { "center": [355.2, 252.3], "semi_axes": [101.8, 108.2], "angle": 95.8, "bbox": [247, 151, 463, 353] },
+  "2026-07-20_f1ea21f0_SR_highfps.mp4": { "center": [402.3, 274.3], "semi_axes": [100.7, 111.0], "angle": 97.2, "bbox": [292, 174, 512, 374] },
+  "2026-07-20_fea58411_SL_highfps.mp4": { "center": [353.8, 252.4], "semi_axes": [101.8, 108.6], "angle": 87.4, "bbox": [245, 151, 461, 353] },
+  "2026-07-20_fea58411_SR_highfps.mp4": { "center": [402.5, 273.9], "semi_axes": [99.9, 111.9], "angle": 99.1, "bbox": [291, 174, 513, 372] }
+}
