@@ -69,6 +69,19 @@ def autohighlight_enabled() -> bool:
     return os.getenv("SHOT_AUTO_HIGHLIGHT", "false").lower() in ("1", "true", "yes", "on")
 
 
+# Clip window around the trigger, which is the ball AT THE RIM -- not the release.
+# A make and a miss want different framing: on a make the interesting part is the
+# build-up and the ball going in, so the clip runs long before and stops just
+# after; on a miss the rebound matters as much as the shot, so it sits centred.
+def clip_window(made: bool) -> tuple:
+    """(pre_s, post_s) for a CV-triggered cut. Rim-anchored."""
+    if made:
+        return (float(os.getenv("CV_CLIP_PRE_MAKE_S", "5")),
+                float(os.getenv("CV_CLIP_POST_MAKE_S", "1")))
+    return (float(os.getenv("CV_CLIP_PRE_MISS_S", "3")),
+            float(os.getenv("CV_CLIP_POST_MISS_S", "3")))
+
+
 def autoscore_enabled() -> bool:
     return os.getenv("SHOT_AUTOSCORE_ENABLED", "false").strip().lower() in ("1", "true", "yes", "on")
 
@@ -294,7 +307,11 @@ class LiveShotScorer:
                         rec["latency_s"], scan_s)
             if rec["made"] and autoscore_enabled():
                 self._maybe_autoscore(game_id, rec, starting_side)
-            if rec["made"] and autohighlight_enabled():
+            # Cut for MISSES as well: the clip is evidence for the shot type
+            # regardless of outcome, and misses were previously invisible to
+            # the typing stage because no clip was ever produced for them.
+            # NOTE: this roughly doubles clip volume -- misses outnumber makes.
+            if autohighlight_enabled():
                 self._maybe_highlight(game_id, rec)
         self._advance_prev(prev_seg, angle, idx, path)
 
@@ -329,7 +346,7 @@ class LiveShotScorer:
 
     # ---- Phase C seam (NOT yet wired to the visible scoreboard) ------------- #
     def _maybe_highlight(self, game_id: str, shot: Dict) -> None:
-        """Cut a highlight clip for a CV-detected make — the SAME pipeline as a
+        """Cut a highlight clip for a CV-detected shot — the SAME pipeline as a
         scorekeeper score row (buffer -> transcode -> S3 -> highlights.{id} on the
         game doc), keyed `cv_<epoch>_<side>` so the frontend's CV timeline rows can
         grow the green play button. Best-effort: a failed cut never affects
@@ -342,14 +359,17 @@ class LiveShotScorer:
             logger.info("shot-live highlight skipped (wc=%s side=%s)", wc, side)
             return
         epoch = self._epoch(wc)
+        pre_s, post_s = clip_window(bool(shot.get("made")))
         cmd = {"logId": f"cv_{int(epoch)}_{side}" if epoch else f"cv_{wc}_{side}",
-               "ts": wc, "side": side, "firebase_game_id": game_id}
+               "ts": wc, "side": side, "firebase_game_id": game_id,
+               "pre": pre_s, "post": post_s}
         try:
             resp = self._on_make(cmd)
             # detect_latency + this log's timestamp vs the highlight doc's ready
             # time = the full basket->green-button chain, measured per make.
-            logger.info("shot-live AUTO-HIGHLIGHT %s (detect_latency=%ss) -> %s",
-                        cmd["logId"], shot.get("latency_s"), resp)
+            logger.info("shot-live AUTO-HIGHLIGHT %s %s pre=%.1f post=%.1f (detect_latency=%ss) -> %s",
+                        cmd["logId"], shot.get("verdict"), pre_s, post_s,
+                        shot.get("latency_s"), resp)
         except Exception as e:  # noqa: BLE001 — never break the detector
             logger.warning("shot-live auto-highlight failed for %s: %s", cmd["logId"], e)
 
