@@ -195,6 +195,41 @@ def create_plays_from_firebase_logs(
 
 _HOOP_ANGLE = {"left": "LEFT", "right": "RIGHT"}
 
+# The typing stage (LiveTyper) writes its verdict to
+# basketball-games/{game}.cv_points.{cv_<epoch>_<side>} -- the SAME key the clip
+# cutter mints in shot_detect/live.py. Joining on it turns a bare make/miss into
+# a real shot type. ~85% of shots carry an entry; the rest fall back to FG,
+# which is what every CV card used to be.
+_TYPE_BY_POINTS = {1: ("FREE_THROW_MAKE", "FREE_THROW_MISS"),
+                   2: ("FG_MAKE", "FG_MISS"),
+                   3: ("3PT_MAKE", "3PT_MISS"),
+                   4: ("4PT_MAKE", "4PT_MISS")}
+
+
+def _cv_key(shot: Dict[str, Any]) -> Optional[str]:
+    """Rebuild the cv_<epoch>_<side> key for a shot_live entry."""
+    wc, side = shot.get("wallclock"), shot.get("side")
+    if not wc or side not in ("left", "right"):
+        return None
+    try:
+        epoch = datetime.fromisoformat(str(wc).replace("Z", "+00:00")).timestamp()
+    except Exception:  # noqa: BLE001
+        return None
+    return f"cv_{int(epoch)}_{side}"
+
+
+def _classify(shot: Dict[str, Any], cv_points: Dict[str, Any]) -> tuple:
+    """(classification, typed) -- typed says whether a real shot type was found."""
+    made = bool(shot.get("made"))
+    key = _cv_key(shot)
+    rec = cv_points.get(key) if key else None
+    pts = (rec or {}).get("points")
+    pair = _TYPE_BY_POINTS.get(pts)
+    if pair:
+        return (pair[0] if made else pair[1]), True
+    return ("FG_MAKE" if made else "FG_MISS"), False
+
+
 
 def create_plays_from_shot_live(
     client: Any,
@@ -208,8 +243,10 @@ def create_plays_from_shot_live(
 
     Tagged `source="cv"` so annotators can tell these from scoreboard cards AND so
     this is idempotent on CV cards (re-runs won't duplicate). The CV knows the hoop
-    (angle LEFT/RIGHT) and make/miss but NOT the point value (→ FG_MAKE/FG_MISS,
-    2pt assumed) or the team (left for the annotator). Low confidence (0.5) flags
+    (angle LEFT/RIGHT), make/miss, and -- where the typing stage got to it -- the
+    point value, joined from cv_points on the shared cv_<epoch>_<side> key. A shot
+    with no typed record still falls back to FG_MAKE/FG_MISS. Team is left for the
+    annotator. Low confidence (0.5) flags
     them as CV-suggested + review-needed (~65% recall / ~80% precision shadow).
 
     `dry_run` counts without writing. Returns the number created (or would create).
@@ -218,6 +255,7 @@ def create_plays_from_shot_live(
         return 0
     live = firebase_game.get("shot_live") or {}
     shots = live.get("shots") or []
+    cv_points = firebase_game.get("cv_points") or {}
     if not shots:
         return 0
 
@@ -239,7 +277,7 @@ def create_plays_from_shot_live(
     created = 0
     by_label: Dict[str, int] = {}
     for s in shots:
-        classification = "FG_MAKE" if s.get("made") else "FG_MISS"
+        classification, typed = _classify(s, cv_points)
         # Video-timeline seconds: prefer wallclock - game_start; fall back to the
         # segment offset. Approximate (SL/SR vs tracking-cam sync) — the annotator
         # nudges it; the card + rough position is what saves them the work.
