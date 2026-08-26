@@ -106,7 +106,13 @@ def autohighlight_enabled() -> bool:
 # tail; on a miss the rebound matters as much as the shot, so it runs longer
 # after. Reviewed on real clips 2026-08-24 and lengthened by 1s on both tails.
 def clip_window(made: bool) -> tuple:
-    """(pre_s, post_s) for a CV-triggered cut. Rim-anchored."""
+    """(pre_s, post_s) for a CV-triggered cut. Rim-anchored.
+
+    The live path only cuts makes, so the miss branch is unreachable from there.
+    It is kept because offline re-cuts (a backfill, a review reel) still ask for
+    a miss window, and because the two windows differ for a reason: on a make the
+    interest is the build-up and the ball dropping, on a miss it is the rebound.
+    """
     if made:
         return (float(os.getenv("CV_CLIP_PRE_MAKE_S", "5")),
                 float(os.getenv("CV_CLIP_POST_MAKE_S", "2")))
@@ -361,11 +367,15 @@ class LiveShotScorer:
                         rec["latency_s"], scan_s)
             if rec["made"] and autoscore_enabled():
                 self._maybe_autoscore(game_id, rec, starting_side)
-            # Cut for MISSES as well: the clip is evidence for the shot type
-            # regardless of outcome, and misses were previously invisible to
-            # the typing stage because no clip was ever produced for them.
-            # NOTE: this roughly doubles clip volume -- misses outnumber makes.
-            if autohighlight_enabled():
+            # MAKES ONLY. A reel of missed shots is not something anyone wants to
+            # watch, and cutting them roughly doubled clip volume -- misses
+            # outnumber makes -- for no viewer value, while doubling the work the
+            # live loop has to finish before the next segment lands.
+            #
+            # Misses are NOT discarded: the record above (with its verdict and
+            # time) is what plays_sync turns into FG_MISS annotation cards. A
+            # miss needs a timestamp, not a clip.
+            if rec["made"] and autohighlight_enabled():
                 self._maybe_highlight(game_id, rec)
         self._advance_prev(prev_seg, angle, idx, path)
 
