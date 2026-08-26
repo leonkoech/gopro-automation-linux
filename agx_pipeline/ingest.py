@@ -495,6 +495,35 @@ def run_ingestion(fb, cfg, pipeline_id: str, state: Dict, stopped: Dict, tracker
             run.set_register_plays(0, 0, ok=False,
                                    error="no annotation game (UBALL creds?)")
 
+        # STAGE 3a — re-derive the shots from the SL/SR masters, now that the
+        # game is over and nothing is racing the clock.
+        #
+        # The live detector works to a deadline and drops segments when it falls
+        # behind, so it loses shots — one 2026-08-24 game recorded 4 live against
+        # 196 real ones. It also reconstructs the shot time from a segment index,
+        # which is what put clips minutes away from their shot. Neither applies
+        # here: the master holds every frame, and `cross_frame / measured_fps` is
+        # the position outright.
+        #
+        # Runs AFTER transcode (both want the GPU) and BEFORE the Core publish
+        # and card creation below, which read straight from Firebase and so pick
+        # up the rebuilt data without knowing anything changed.
+        #
+        # The live clips are left in S3 untouched — they served the green button
+        # during the game. This only changes what Core and the cards READ.
+        try:
+            from agx_pipeline import shot_rebuild
+            if shot_rebuild.enabled() and shot_files and fb:
+                run.log("info", "shot-rebuild: re-detecting from SL/SR masters")
+                rb = shot_rebuild.rebuild(fb, firebase_game_id, date,
+                                          shot_files, tr, work_dir)
+                run.log("info",
+                        f"shot-rebuild: {rb['detected']} shots "
+                        f"({rb['makes']} make), {rb['clips']} clips re-cut "
+                        f"from {','.join(rb['angles']) or 'no shot cams'}")
+        except Exception as e:  # noqa: BLE001 — never fail ingestion on this
+            run.log("error", f"shot-rebuild failed: {str(e)[:200]}")
+
         # Publish Game Highlight to Core — a whole-game reel assembled from the
         # AGX highlight clips already cut + uploaded this game (references their
         # CloudFront URLs; no re-upload, no annotation / Sync-to-UBall
