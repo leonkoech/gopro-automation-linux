@@ -38,6 +38,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import time
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
@@ -105,6 +106,60 @@ def cut_clip(src: str, t: float, log_id: str, angle: str, date: str,
             pass
 
 
+def _recording_now() -> Optional[bool]:
+    """Is the box capturing a game right now? None when it cannot be determined."""
+    import json as _json
+    import urllib.request
+    try:
+        with urllib.request.urlopen("http://localhost:5000/health", timeout=5) as r:
+            return bool(_json.loads(r.read().decode()).get("recording"))
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _yield_to_recording(angle: str) -> None:
+    """Block while a game is being captured. Capture always wins.
+
+    This pass is GPU-bound and takes ~1x realtime per camera, so a backlog run
+    can still be going when the next fixture starts. The transcode is already
+    protected by nice/ionice and cpu-shares, but inference is not: it would
+    compete with the LIVE shot detector for the same GPU, degrading the thing
+    that has a deadline in order to speed up the thing that does not.
+
+    An unknown state (health unreachable) is treated as safe-to-continue rather
+    than blocking forever — a backlog job that silently never finishes is its own
+    failure, and the caller already gated on `recording:false` at start.
+    """
+    waited = 0
+    while True:
+        rec = _recording_now() is True
+        # Also yield to a FRESH ingestion. Backlog work must not slow down the
+        # game that just finished: when recording stops, that game's own
+        # transcode starts, and a backlog rebuild resuming at the same moment
+        # would compete with it for the GPU. Tonight's game reaches the
+        # annotators first; the backlog fills the gaps afterwards.
+        busy = False
+        if not rec:
+            try:
+                from agx_pipeline.ingest import is_transcoding   # lazy: ingest imports us
+                busy = is_transcoding()
+            except Exception:  # noqa: BLE001
+                busy = False
+        if not (rec or busy):
+            break
+        if waited == 0:
+            logger.warning("shot-rebuild %s: pausing — %s owns the GPU", angle,
+                           "a game is RECORDING" if rec else "a fresh ingestion")
+        time.sleep(60)
+        waited += 60
+        if waited % 900 == 0:
+            logger.info("shot-rebuild %s: still paused (%d min, recording=%s "
+                        "transcoding=%s)", angle, waited // 60, rec, busy)
+    if waited:
+        logger.info("shot-rebuild %s: resuming after %d min paused",
+                    angle, waited // 60)
+
+
 def _measured_fps(path: str) -> Optional[tuple]:
     """(fps, frames, duration) straight from the container. None if unreadable."""
     r = subprocess.run(
@@ -169,6 +224,8 @@ def detect_master(path: str, angle: str, work_dir: str) -> List[Dict]:
             except Exception as e:  # noqa: BLE001 — one bad window must not stop the sweep
                 logger.warning("shot-rebuild %s window %.0fs failed: %s", angle, t, e)
         nwin += 1
+        if nwin % 10 == 0:
+            _yield_to_recording(angle)
         if nwin % 50 == 0:
             logger.info("shot-rebuild %s: %.0fs/%.0fs, %d crossings",
                         angle, t, dur, len(found))
