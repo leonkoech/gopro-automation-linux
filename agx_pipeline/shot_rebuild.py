@@ -190,6 +190,24 @@ def detect_master(path: str, angle: str, work_dir: str) -> List[Dict]:
     return out
 
 
+def _game_start_epoch(fb, firebase_game_id: str) -> Optional[float]:
+    """Wall-clock epoch the game began, for naming clips the way live does.
+
+    Clip ids are `cv_<epoch_seconds>_<side>` and downstream treats that number as
+    a real wall-clock time: the recap reel walks the score logs against it to put
+    the running score on each clip. A game-relative number sorts correctly but
+    sits ~800 years before any score log, so every clip would caption 0-0.
+    """
+    try:
+        g = fb.db.collection("basketball-games").document(firebase_game_id).get()
+        raw = (g.to_dict() or {}).get("createdAt")
+        if not raw:
+            return None
+        return datetime.fromisoformat(str(raw).replace("Z", "+00:00")).timestamp()
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def rebuild(fb, firebase_game_id: str, date: str, shot_files: List[Dict],
             tr: Dict[str, Dict], work_dir: str) -> Dict:
     """Detect on SL/SR, re-cut FL/FR clips for the makes, and replace what Core
@@ -211,6 +229,10 @@ def rebuild(fb, firebase_game_id: str, date: str, shot_files: List[Dict],
 
     # Clips for MAKES only; misses travel as timestamps for their cards.
     now = datetime.now(timezone.utc).isoformat()
+    game_start = _game_start_epoch(fb, firebase_game_id)
+    if game_start is None:
+        logger.warning("shot-rebuild: no game start time — clip ids will be "
+                       "game-relative, so the recap will caption them 0-0")
     highlights: Dict[str, Dict] = {}
     for s in shots:
         if s["verdict"] != "MAKE":
@@ -219,7 +241,13 @@ def rebuild(fb, firebase_game_id: str, date: str, shot_files: List[Dict],
         src = (tr.get(ang) or {}).get("dst")
         if not src or not os.path.exists(src):
             continue
-        log_id = f"cv_{int(round(s['t'] * 1000))}_{s['side']}"
+        # Same id shape as the live cutter: cv_<epoch_seconds>_<side>. Downstream
+        # reads that number as wall-clock (the recap reel walks the score logs
+        # against it), so a game-relative value would order fine and caption
+        # every clip 0-0. Falls back to game-relative only if the start time is
+        # unknown, where wrong ordering would be worse than a wrong score.
+        stamp = int(round((game_start + s["t"]) if game_start else s["t"] * 1000))
+        log_id = f"cv_{stamp}_{s['side']}"
         cut = cut_clip(src, s["t"], log_id, ang, date, firebase_game_id, work_dir)
         if not cut:
             continue
