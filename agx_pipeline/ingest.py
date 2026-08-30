@@ -627,9 +627,30 @@ def run_ingestion(fb, cfg, pipeline_id: str, state: Dict, stopped: Dict, tracker
             else:
                 run.log("error", f"{r['filename']}: S3 upload not confirmed — keeping raw "
                                  f"master on disk for retry ({r['src']})")
-        if DELETE_RAW and all(_raw_safe_to_delete(r) for r in tr.values()):
+        # Deleting the session directory takes the FLIR masters with it, so it
+        # needs more than "nothing failed" -- it needs positive proof that this
+        # game's footage is safely elsewhere.
+        #
+        # `all()` over an EMPTY sequence is True. When every transcode failed,
+        # `tr` was empty, this guard passed vacuously, and the rmtree destroyed
+        # the only copy. That is exactly how Moonlight vs Locksmith (5 angles,
+        # ~40 GB) was lost on 2026-08-29: the recorder died mid-game leaving
+        # headerless files, ffmpeg could not read one frame, the run uploaded 0
+        # files and registered 0 videos, reported status=completed, and then
+        # deleted the footage. Nothing in the logs said "0" loudly enough.
+        #
+        # So: require at least one file, EVERY file uploaded, and the annotation
+        # register to have accepted the game. Anything less keeps the masters --
+        # disk is cheap, footage is not recoverable.
+        registered = (run.doc.get("register_game") or {}).get("status") == "done"
+        deletable = [r for r in tr.values() if _raw_safe_to_delete(r)]
+        if DELETE_RAW and session_delete_ok(len(tr), len(deletable), registered):
             import shutil
             shutil.rmtree(os.path.join(cfg.output_dir, label), ignore_errors=True)
+        elif DELETE_RAW:
+            run.log("warn", f"masters KEPT for {label}: "
+                            f"{len(deletable)}/{len(tr)} uploaded, "
+                            f"register_game={'done' if registered else 'not done'}")
 
         if tracker:
             tracker.set_s3_prefix(state["session_ids"], f"{LOCATION}/{date}/{folder}/")
@@ -646,6 +667,20 @@ def run_ingestion(fb, cfg, pipeline_id: str, state: Dict, stopped: Dict, tracker
                                                    "stage_message": str(e)[:200], "progress": 100,
                                                    "completed_at": _now()})
         raise
+
+
+def session_delete_ok(n_files: int, n_uploaded: int, registered: bool) -> bool:
+    """May we delete a session's masters? Only on positive proof they are safe.
+
+    Pulled out of run_ingestion so the rule can be tested directly: it is the
+    single most destructive decision in the pipeline and it was wrong.
+
+    The bug it replaces was `all(safe(r) for r in tr.values())`, which is True
+    for an EMPTY tr -- so a run where every transcode failed deleted the whole
+    session directory, FLIR masters included (Moonlight vs Locksmith, 5 angles,
+    ~40 GB, 2026-08-29). Uploading nothing must never count as success.
+    """
+    return n_files > 0 and n_uploaded == n_files and registered
 
 
 def _ingest_shot(run, cfg, shot_files, date: str, folder: str) -> None:
