@@ -49,8 +49,9 @@ TAILSCALE_API_KEY = os.environ.get("TAILSCALE_API_KEY", "")
 # pass JETSON_DEVICES="" without crashing on json.loads.
 _jetson_devices_raw = os.getenv("JETSON_DEVICES", "").strip()
 JETSON_DEVICES = json.loads(_jetson_devices_raw) if _jetson_devices_raw else [
+    {"name": "AGX Orin (agx-1)", "tailscale_hostname": "agxorin001", "tailscale_ip": "100.116.99.109"},
     {"name": "Jetson Nano 1", "tailscale_hostname": "jetson-nano-002", "tailscale_ip": "100.87.190.71"},
-    {"name": "Jetson Nano 2", "tailscale_hostname": "JETSON-NANO-001", "tailscale_ip": "100.106.30.98"},
+    {"name": "Jetson Nano 2", "tailscale_hostname": "jetson-nano-001", "tailscale_ip": "100.106.30.98"},
 ]
 
 SMTP_HOST = os.environ.get("SMTP_HOST", "smtpout.secureserver.net")
