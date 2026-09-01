@@ -314,6 +314,9 @@ def _select_segments(segs: List[Tuple[int, str, str]], t0: float, t1: float
 
 
 def _run(cmd: List[str], timeout: int = 600) -> bool:
+    # Mild demotion (2026-08-19 freeze fix): clip work must never starve the
+    # capture path, but stays snappy enough for the MARK->TV replay flow.
+    cmd = ["nice", "-n", "10", "ionice", "-c", "2", "-n", "7"] + cmd
     cp = subprocess.run(cmd, capture_output=True, text=True,
                         stdin=subprocess.DEVNULL, timeout=timeout)
     if cp.returncode != 0:

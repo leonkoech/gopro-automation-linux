@@ -453,8 +453,6 @@ def _do_highlight(cmd: Dict):
         t_epoch = datetime.fromisoformat(str(ts).replace("Z", "+00:00")).timestamp()
     except ValueError:
         return {"success": False, "error": f"unparseable ts: {ts}"}, 400
-    if not HIGHLIGHT.active():
-        return {"success": False, "error": "highlight recorder not running"}, 409
     # Route the cut to the camera on the scoring team's current hoop side
     # (issue #4): team+period ride on the command, startingSideTeam1 is on the
     # game doc. Unknown side → left recorder (the prior single-buffer default).
@@ -464,6 +462,15 @@ def _do_highlight(cmd: Dict):
     side = (cmd.get("side") if cmd.get("side") in ("left", "right")
             else scoring_hoop_side(cmd.get("team"), cmd.get("period"), sst))
     recorder = HIGHLIGHT.recorder_for(side)
+    # Post-night retries (2026-08-19): with the recorder stopped, a cut is
+    # still valid as long as the label's buffer segments are on disk — the
+    # night-end retry sweep runs exactly then. cmd may carry the label.
+    retry_label = cmd.get("label") or label
+    if not HIGHLIGHT.active():
+        if not (retry_label and recorder.segments(retry_label)):
+            return {"success": False,
+                    "error": "recorder not running and no segments for label"}, 409
+        label = retry_label
     req = {"game_id": game_id, "log_id": str(log_id), "ts_epoch": t_epoch,
            "label": label or recorder.status().get("label"),
            "pre": cmd.get("pre"), "post": cmd.get("post"),
@@ -546,19 +553,94 @@ def _create_pipeline_run(pipeline_id: str, state: Dict, stopped: Dict) -> None:
             logger.error("create_pipeline_run failed: %s", e)
 
 
+# One ingestion at a time: with the night-end gate, several games' ingests all
+# queue and would otherwise stampede the encoder together when the gate opens.
+_ingest_serial = threading.Semaphore(1)
+
+
+def _wait_for_night_end(pipeline_id: str) -> None:
+    """Block until recording has been idle INGEST_DEFER_MIN consecutive minutes.
+
+    2026-08-19: ingestion transcodes running DURING later games starved game-3's
+    capture (frozen frames, broken DTS) and failed 27 clip cuts. A between-games
+    gap is 10-15 min, so 30 quiet minutes == the night is over. Set
+    INGEST_DEFER_MIN=0 to restore immediate ingestion."""
+    defer_min = float(os.getenv("INGEST_DEFER_MIN", "30"))
+    if defer_min <= 0:
+        return
+    quiet_since = time.time()
+    last_log = 0.0
+    while True:
+        with _lock:
+            rec = bool(_current)
+        now = time.time()
+        if rec:
+            quiet_since = now
+        elif now - quiet_since >= defer_min * 60:
+            logger.info("ingestion %s: night-end gate open", pipeline_id)
+            return
+        if now - last_log > 600:
+            logger.info("ingestion %s deferred (recording=%s, quiet %.0fm/%.0fm)",
+                        pipeline_id, rec, (now - quiet_since) / 60, defer_min)
+            last_log = now
+
+
+def _retry_failed_highlights(state: Dict) -> None:
+    """Re-cut this game's error-status highlight clips now that the encoder is
+    idle (they failed mid-game under load). Best-effort; runs BEFORE ingestion
+    so the buffer segments are still on disk."""
+    game_id = state.get("firebase_game_id")
+    if not (FB and game_id):
+        return
+    try:
+        doc = FB.db.collection("basketball-games").document(game_id).get()
+        d = doc.to_dict() or {}
+        errors = [k for k, v in (d.get("highlights") or {}).items()
+                  if isinstance(v, dict) and v.get("status") == "error"]
+        if not errors:
+            return
+        logs_by_id = {l.get("id"): l for l in (d.get("logs") or []) if l.get("id")}
+        logger.info("retrying %d failed highlight cuts for %s", len(errors), game_id)
+        for k in errors:
+            if k.startswith("cv_"):
+                parts = k.split("_")
+                epoch, side = int(parts[1]), parts[2]
+                ts = datetime.fromtimestamp(epoch, tz=timezone.utc).isoformat()
+                cmd = {"firebase_game_id": game_id, "logId": k, "ts": ts,
+                       "side": side, "label": state.get("label")}
+            else:
+                log = logs_by_id.get(k)
+                if not log:
+                    continue
+                cmd = {"firebase_game_id": game_id, "logId": k,
+                       "ts": log.get("timestamp"), "team": log.get("team"),
+                       "period": log.get("period"), "pre": 6.5, "post": -1.5,
+                       "label": state.get("label")}
+            try:
+                _do_highlight(cmd)
+                time.sleep(20)   # serialized-ish: one cut lands before the next
+            except Exception as e:  # noqa: BLE001
+                logger.warning("highlight retry failed for %s: %s", k, e)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("highlight retry sweep failed for %s: %s", game_id, e)
+
+
 def _start_ingestion(pipeline_id: str, state: Dict, stopped: Dict) -> None:
     """Run P1 ingestion (transcode → upload → register), driving the ingestion-runs doc."""
     from agx_pipeline.ingest import run_ingestion
     global _active_ingests
-    with _lock:
-        _active_ingests += 1                  # gate the shot-QA worker off the GPU
-    try:
-        run_ingestion(FB, CFG, pipeline_id, state, stopped, TRACKER)
-    except Exception as e:  # noqa: BLE001
-        logger.error("ingestion %s crashed: %s", pipeline_id, e)
-    finally:
+    _wait_for_night_end(pipeline_id)
+    with _ingest_serial:
+        _retry_failed_highlights(state)
         with _lock:
-            _active_ingests = max(0, _active_ingests - 1)
+            _active_ingests += 1                  # gate the shot-QA worker off the GPU
+        try:
+            run_ingestion(FB, CFG, pipeline_id, state, stopped, TRACKER)
+        except Exception as e:  # noqa: BLE001
+            logger.error("ingestion %s crashed: %s", pipeline_id, e)
+        finally:
+            with _lock:
+                _active_ingests = max(0, _active_ingests - 1)
 
 
 def _finalize_for_shutdown(signum, _frame) -> None:
