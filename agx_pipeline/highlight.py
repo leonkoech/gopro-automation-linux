@@ -48,14 +48,13 @@ STALL_SEC = float(os.getenv("HIGHLIGHT_STALL_SEC", "25"))       # no fresh segme
 ANGLES = [a.strip() for a in os.getenv("HIGHLIGHT_ANGLES", "FL,FR").split(",") if a.strip()]
 # Side-aware buffering (issue #4): a left- and a right-hoop buffer so a clip can
 # be cut from the camera that filmed the scoring team's basket. Each side fails
-# over within itself so a stall never crosses to the wrong hoop.
-#
-# Facility camera orientation (2026-08-05): despite the FL/FR ("far-left"/
-# "far-right") naming, FR/NR physically film the LEFT hoop and FL/NL the RIGHT
-# hoop — the recap showed the opposite basket until this swap. Override per-venue
-# with HIGHLIGHT_LEFT_ANGLES / HIGHLIGHT_RIGHT_ANGLES if a room is wired the other way.
-LEFT_ANGLES = [a.strip() for a in os.getenv("HIGHLIGHT_LEFT_ANGLES", "FR,NR").split(",") if a.strip()]
-RIGHT_ANGLES = [a.strip() for a in os.getenv("HIGHLIGHT_RIGHT_ANGLES", "FL,NL").split(",") if a.strip()]
+# over within itself (FL→NL, FR→NR) so a stall never crosses to the wrong hoop.
+# FL/NL film the left hoop, FR/NR the right — the 2026-08-05 swap to the
+# opposite mapping was a misdiagnosis (the "wrong basket" clips were mis-TIMED,
+# not mis-routed) and never held in production. Override per-venue with
+# HIGHLIGHT_LEFT_ANGLES / HIGHLIGHT_RIGHT_ANGLES if a room is wired the other way.
+LEFT_ANGLES = [a.strip() for a in os.getenv("HIGHLIGHT_LEFT_ANGLES", "FL,NL").split(",") if a.strip()]
+RIGHT_ANGLES = [a.strip() for a in os.getenv("HIGHLIGHT_RIGHT_ANGLES", "FR,NR").split(",") if a.strip()]
 S3_BUCKET = os.getenv("UPLOAD_BUCKET", "uball-videos-production")
 S3_PREFIX = os.getenv("HIGHLIGHT_S3_PREFIX", "highlights")
 AWS_REGION = os.getenv("UPLOAD_REGION", "us-east-1")
