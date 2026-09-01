@@ -190,15 +190,23 @@ class AravisRecorder:
             for cam in cams:
                 out_path = os.path.join(session_dir, f"{label}_{cam.angle}.mp4")
                 spawned_at = _utcnow()  # wall-clock anchor for cross-camera sync
+                # gst-launch's stderr is the ONLY place a negotiation or
+                # element failure is reported. Discarding it (as this did) makes
+                # a silent 0-byte capture undiagnosable -- five games were lost
+                # that way before anyone could see a reason. Keep it per camera,
+                # next to the footage it belongs to.
+                err_path = os.path.join(session_dir, f"{label}_{cam.angle}_gst.log")
+                err_fh = open(err_path, "wb", buffering=0)
                 proc = subprocess.Popen(
                     self._pipeline(cam, out_path, seg_dir),
                     stdin=subprocess.DEVNULL,
                     stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
+                    stderr=err_fh,
                 )
                 procs.append({"angle": cam.angle, "id": cam.id, "path": out_path,
                               "basket_side": cam.basket_side, "proc": proc,
-                              "spawned_at": spawned_at})
+                              "spawned_at": spawned_at,
+                              "err_path": err_path, "err_fh": err_fh})
         except OSError:
             self._reap(procs)  # a mid-loop Popen failure must not leak earlier procs
             raise
@@ -209,6 +217,28 @@ class AravisRecorder:
         dead = [pr["angle"] for pr in procs if pr["proc"].poll() is not None]
         if dead:
             logger.warning("shot cameras did not start: %s", dead)
+        # A live gst-launch is NOT the same as a recording one: the pipeline can
+        # sit in PLAYING and never pull a buffer, which is exactly the failure
+        # that produced 0-byte SL/SR files while alive_after_settle said true.
+        # Check the file, and quote the tail of stderr so the cause is in the
+        # service log rather than only on disk.
+        for pr in alive:
+            try:
+                grew = os.path.getsize(pr["path"]) > 0
+            except OSError:
+                grew = False
+            pr["wrote_bytes_after_settle"] = grew
+            if not grew:
+                tail = ""
+                try:
+                    with open(pr["err_path"], "rb") as fh:
+                        tail = fh.read()[-400:].decode("utf-8", "replace").strip()
+                except OSError:
+                    pass
+                logger.warning(
+                    "shot camera %s is RUNNING BUT WROTE NOTHING after %ss "
+                    "(no CV trigger will fire) — gst stderr tail: %s",
+                    pr["angle"], START_SETTLE_SEC, tail or "<empty>")
         if not alive:
             self._reap(procs)  # nothing came up — clean up any half-started procs
             raise RuntimeError("no shot cameras started (present? held by another process?)")
@@ -229,6 +259,15 @@ class AravisRecorder:
             deadline = time.monotonic() + finalize_timeout
             for pr in procs:
                 self._wait_or_kill(pr["proc"], max(0.0, deadline - time.monotonic()))
+            # Release the stderr handles: stop() does not go through _reap, so
+            # without this every session would leak two descriptors.
+            for pr in procs:
+                fh = pr.get("err_fh")
+                if fh is not None and not fh.closed:
+                    try:
+                        fh.close()
+                    except OSError:
+                        pass
         else:
             # No in-memory handles for this label (e.g. the CLI `stop` command).
             # Best effort — SIGINT any gst-launch still writing this session's
@@ -238,8 +277,17 @@ class AravisRecorder:
             self._pkill_session(label)
         outs = outputs or (self._outputs_for(procs, alive_only=False) if procs else [])
         results = [{**o, **_probe(o["path"])} for o in outs]
-        logger.info("shot stopped label=%s finalized=%s", label,
-                    [r["angle"] for r in results if r.get("ok")])
+        ok = [r["angle"] for r in results if r.get("ok")]
+        if not ok and results:
+            # finalized=[] on its own says nothing about why. Point at the logs
+            # that now exist rather than leaving the next person guessing.
+            logger.warning(
+                "shot stopped label=%s finalized=NOTHING — every shot camera "
+                "produced an unusable file, so CV detection had no input. "
+                "Per-camera gst stderr: %s", label,
+                ", ".join(f"{pr['angle']}={pr.get('err_path')}"
+                          for pr in (procs or []) if pr.get("err_path")) or "<not captured>")
+        logger.info("shot stopped label=%s finalized=%s", label, ok)
         return {"label": label, "stopped_at": _utcnow(), "files": results}
 
     # -- internals --------------------------------------------------------- #
@@ -286,6 +334,12 @@ class AravisRecorder:
                     p.wait(timeout=5)
                 except subprocess.TimeoutExpired:
                     p.kill()
+            fh = pr.get("err_fh")
+            if fh is not None and not fh.closed:
+                try:
+                    fh.close()
+                except OSError:
+                    pass
 
     def _pkill_session(self, label: str) -> None:
         session_dir = os.path.join(self.cfg.output_dir, label)
