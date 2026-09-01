@@ -244,8 +244,19 @@ def create_plays_from_shot_live(
         # segment offset. Approximate (SL/SR vs tracking-cam sync) — the annotator
         # nudges it; the card + rough position is what saves them the work.
         ts = None
+        # `video_ts` is the rebuilt time: the rim crossing found on the SL/SR
+        # master, in video seconds, cut straight from cross_frame/measured_fps.
+        # Prefer it over everything else — the two fallbacks below are the same
+        # arithmetic that put clips minutes from their shot, so a card built on
+        # them lands just as wrong. Scored against a hand-annotated game, the
+        # rebuilt times sit within 0.78s of what a human marked.
+        if s.get("video_ts") is not None:
+            try:
+                ts = float(s["video_ts"])
+            except (TypeError, ValueError):
+                ts = None
         wc = s.get("wallclock")
-        if wc and game_start:
+        if ts is None and wc and game_start:
             try:
                 ts = (datetime.fromisoformat(wc) - game_start).total_seconds()
             except Exception:  # noqa: BLE001

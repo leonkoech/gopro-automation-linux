@@ -31,6 +31,14 @@ _MAKE_BY_POINTS: Dict[int, str] = {1: "FREE_THROW_MAKE", 2: "FG_MAKE", 3: "3PT_M
 _TIMEOUT = 20
 
 
+def _include_misses() -> bool:
+    """Temporary escape hatch: publish CV misses into the Core reel.
+
+    Default OFF. Exists so the -3s/+3s miss window can be eyeballed on a real
+    clip in the app; it is not a shipping configuration."""
+    return os.getenv("CORE_REEL_INCLUDE_MISSES", "false").lower() in ("1", "true", "yes", "on")
+
+
 def _play_type(log: Dict) -> Optional[str]:
     """Canonical play-type label for a score log, or None for non-scores."""
     if log.get("actionType") in ("score_added", "player_score_added"):
@@ -52,6 +60,18 @@ def build_reel(firebase_game_id: str, game: Dict, game_date: Optional[str] = Non
     clips: List[Dict] = []
     for log_id, h in highlights.items():
         if h.get("status") != "ready" or not h.get("url"):
+            continue
+        # A CV-detected MISS is cut and stored (the typing stage needs it) but
+        # is not normally a highlight: Core cannot tell one from a make -- a clip
+        # carries no outcome field, and a `cv_` basename with a null play_type
+        # reads as "cv" either way -- so publishing misses would put missed shots
+        # in the feed unlabelled.
+        #
+        # CORE_REEL_INCLUDE_MISSES=true lets them through anyway. That is a
+        # DELIBERATE, TEMPORARY setting for verifying the -3s/+3s miss window on
+        # a live clip; turn it back off once confirmed, or the public feed shows
+        # missed shots as highlights.
+        if h.get("made") is False and not _include_misses():
             continue
         log = by_id.get(str(log_id), {})
         clips.append({

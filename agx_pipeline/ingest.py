@@ -495,6 +495,35 @@ def run_ingestion(fb, cfg, pipeline_id: str, state: Dict, stopped: Dict, tracker
             run.set_register_plays(0, 0, ok=False,
                                    error="no annotation game (UBALL creds?)")
 
+        # STAGE 3a — re-derive the shots from the SL/SR masters, now that the
+        # game is over and nothing is racing the clock.
+        #
+        # The live detector works to a deadline and drops segments when it falls
+        # behind, so it loses shots — one 2026-08-24 game recorded 4 live against
+        # 196 real ones. It also reconstructs the shot time from a segment index,
+        # which is what put clips minutes away from their shot. Neither applies
+        # here: the master holds every frame, and `cross_frame / measured_fps` is
+        # the position outright.
+        #
+        # Runs AFTER transcode (both want the GPU) and BEFORE the Core publish
+        # and card creation below, which read straight from Firebase and so pick
+        # up the rebuilt data without knowing anything changed.
+        #
+        # The live clips are left in S3 untouched — they served the green button
+        # during the game. This only changes what Core and the cards READ.
+        try:
+            from agx_pipeline import shot_rebuild
+            if shot_rebuild.enabled() and shot_files and fb:
+                run.log("info", "shot-rebuild: re-detecting from SL/SR masters")
+                rb = shot_rebuild.rebuild(fb, firebase_game_id, date,
+                                          shot_files, tr, work_dir)
+                run.log("info",
+                        f"shot-rebuild: {rb['detected']} shots "
+                        f"({rb['makes']} make), {rb['clips']} clips re-cut "
+                        f"from {','.join(rb['angles']) or 'no shot cams'}")
+        except Exception as e:  # noqa: BLE001 — never fail ingestion on this
+            run.log("error", f"shot-rebuild failed: {str(e)[:200]}")
+
         # Publish Game Highlight to Core — a whole-game reel assembled from the
         # AGX highlight clips already cut + uploaded this game (references their
         # CloudFront URLs; no re-upload, no annotation / Sync-to-UBall
@@ -598,9 +627,30 @@ def run_ingestion(fb, cfg, pipeline_id: str, state: Dict, stopped: Dict, tracker
             else:
                 run.log("error", f"{r['filename']}: S3 upload not confirmed — keeping raw "
                                  f"master on disk for retry ({r['src']})")
-        if DELETE_RAW and all(_raw_safe_to_delete(r) for r in tr.values()):
+        # Deleting the session directory takes the FLIR masters with it, so it
+        # needs more than "nothing failed" -- it needs positive proof that this
+        # game's footage is safely elsewhere.
+        #
+        # `all()` over an EMPTY sequence is True. When every transcode failed,
+        # `tr` was empty, this guard passed vacuously, and the rmtree destroyed
+        # the only copy. That is exactly how Moonlight vs Locksmith (5 angles,
+        # ~40 GB) was lost on 2026-08-29: the recorder died mid-game leaving
+        # headerless files, ffmpeg could not read one frame, the run uploaded 0
+        # files and registered 0 videos, reported status=completed, and then
+        # deleted the footage. Nothing in the logs said "0" loudly enough.
+        #
+        # So: require at least one file, EVERY file uploaded, and the annotation
+        # register to have accepted the game. Anything less keeps the masters --
+        # disk is cheap, footage is not recoverable.
+        registered = (run.doc.get("register_game") or {}).get("status") == "done"
+        deletable = [r for r in tr.values() if _raw_safe_to_delete(r)]
+        if DELETE_RAW and session_delete_ok(len(tr), len(deletable), registered):
             import shutil
             shutil.rmtree(os.path.join(cfg.output_dir, label), ignore_errors=True)
+        elif DELETE_RAW:
+            run.log("warn", f"masters KEPT for {label}: "
+                            f"{len(deletable)}/{len(tr)} uploaded, "
+                            f"register_game={'done' if registered else 'not done'}")
 
         if tracker:
             tracker.set_s3_prefix(state["session_ids"], f"{LOCATION}/{date}/{folder}/")
@@ -617,6 +667,20 @@ def run_ingestion(fb, cfg, pipeline_id: str, state: Dict, stopped: Dict, tracker
                                                    "stage_message": str(e)[:200], "progress": 100,
                                                    "completed_at": _now()})
         raise
+
+
+def session_delete_ok(n_files: int, n_uploaded: int, registered: bool) -> bool:
+    """May we delete a session's masters? Only on positive proof they are safe.
+
+    Pulled out of run_ingestion so the rule can be tested directly: it is the
+    single most destructive decision in the pipeline and it was wrong.
+
+    The bug it replaces was `all(safe(r) for r in tr.values())`, which is True
+    for an EMPTY tr -- so a run where every transcode failed deleted the whole
+    session directory, FLIR masters included (Moonlight vs Locksmith, 5 angles,
+    ~40 GB, 2026-08-29). Uploading nothing must never count as success.
+    """
+    return n_files > 0 and n_uploaded == n_files and registered
 
 
 def _ingest_shot(run, cfg, shot_files, date: str, folder: str) -> None:

@@ -54,6 +54,18 @@ VALID_ANGLES = TRACKING_ANGLES + SHOT_ANGLES
 RECORD_AUDIO = os.getenv("RECORD_AUDIO", "true").lower() in ("1", "true", "yes")
 AUDIO_JOURNAL = "audio_capture.json"
 
+# Watchdog stall gaps. A restart costs real game time; that hole is re-inserted
+# into the master so every angle stays on one timeline (see _concat_segments).
+# Below MIN it is muxer jitter, not a gap; above MAX it is a clock glitch we
+# refuse to trust rather than punch an absurd hole into a game master.
+MIN_STALL_GAP_SEC = float(os.getenv("REC_MIN_STALL_GAP_SEC", "0.25"))
+MAX_STALL_GAP_SEC = float(os.getenv("REC_MAX_STALL_GAP_SEC", "900"))
+# Post-stop alarm: the tracking angles record the same wall-clock window, so
+# their durations must agree. Divergence beyond this means one angle lost time
+# and the pair can NOT be aligned by a constant per-angle offset — exactly the
+# failure the annotators hit on 2026-08-17 and 2026-08-19, unnoticed for days.
+ANGLE_SKEW_ALARM_SEC = float(os.getenv("REC_ANGLE_SKEW_ALARM_SEC", "2.0"))
+
 
 @dataclass(frozen=True)
 class Camera:
@@ -294,7 +306,12 @@ class RecordingController:
         host_path = os.path.join(session_dir, f"{label}_{cam.angle}.mp4")
         run: Dict[str, object] = {"angle": cam.angle, "id": cam.id, "path": host_path,
                                   "cam": cam, "session_dir": session_dir, "label": label,
-                                  "restart": 0, "segments": [host_path]}
+                                  "restart": 0, "segments": [host_path],
+                                  # Wall-clock start of each segment, index-aligned with
+                                  # `segments`. This is what lets _concat_segments put the
+                                  # stall gap BACK into the master instead of butting the
+                                  # segments together and silently deleting that time.
+                                  "seg_starts": [time.time()]}
         if self.engine == "ffmpeg":
             # host ffmpeg subprocess: proc/pid + timeline heartbeat (out_time advancing)
             run.update({"proc": None, "pid": None, "out_time": 0.0, "last_advance": 0.0,
@@ -534,6 +551,7 @@ class RecordingController:
         run["path"] = self._seg_path(run, n)
         run["restart"] = n
         run["segments"].append(run["path"])
+        run.setdefault("seg_starts", []).append(time.time())
         run["retry_after"] = time.time() + delay   # gate the NEXT restart, not this respawn
         if not self._launch_ffmpeg(run):
             logger.error("watchdog relaunch (ffmpeg) failed for %s", angle)
@@ -581,6 +599,7 @@ class RecordingController:
         run["name"] = new_name
         run["path"] = new_path
         run["segments"].append(new_path)
+        run.setdefault("seg_starts", []).append(time.time())
         seen[angle] = (-1, time.time())
 
     def _stop_watchdog(self, label: str) -> None:
@@ -607,15 +626,77 @@ class RecordingController:
         except (ValueError, TypeError):
             return False
 
-    def _concat_segments(self, label: str) -> None:
+    def _seg_duration(self, path: str) -> Optional[float]:
+        cp = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                             "-of", "csv=p=0", path], capture_output=True, text=True,
+                            stdin=subprocess.DEVNULL)
+        try:
+            return float(cp.stdout.strip())
+        except (ValueError, TypeError):
+            return None
+
+    def _stall_gaps(self, run: Dict, segs: List[str],
+                    durs: List[Optional[float]]) -> List[float]:
+        """Wall-clock seconds LOST before each segment (index-aligned with `segs`;
+        entry 0 is always 0.0).
+
+        A watchdog restart takes real time — the stall is detected after
+        REC_FFMPEG_STALL_SEC of frozen timeline, then ffmpeg is finalized,
+        respawned and has to re-preroll RTSP. That is ~20s of the game during
+        which this camera recorded nothing. Butting the segments together
+        DELETES that time from the angle's timeline, which is why one angle
+        ends up ~20s shorter than the other four and slides progressively out
+        of sync with them (annotator reports, 2026-08-17 and 2026-08-19).
+
+        Preferred source is the `seg_starts` stamped at restart; a segment with
+        no stamp (e.g. runs recovered from the pid journal after a service
+        restart) falls back to mtime - duration, which is the moment ffmpeg
+        began writing it."""
+        starts_by_path = dict(zip(run.get("segments", []), run.get("seg_starts", [])))
+
+        def started_at(path: str, dur: Optional[float]) -> Optional[float]:
+            t = starts_by_path.get(path)
+            if t is not None:      # not `if t:` — a 0.0 stamp is a real timestamp
+                return float(t)
+            try:                       # fallback: finalize time minus what it holds
+                return os.path.getmtime(path) - (dur or 0.0)
+            except OSError:
+                return None
+
+        gaps = [0.0]
+        for i in range(1, len(segs)):
+            prev_start = started_at(segs[i - 1], durs[i - 1])
+            this_start = started_at(segs[i], durs[i])
+            prev_dur = durs[i - 1]
+            if prev_start is None or this_start is None or prev_dur is None:
+                gaps.append(0.0)
+                continue
+            gap = this_start - (prev_start + prev_dur)
+            # Clamp: sub-frame jitter is not a gap, and a clock glitch must never
+            # be able to inject an absurd hole into a master.
+            gaps.append(gap if MIN_STALL_GAP_SEC <= gap <= MAX_STALL_GAP_SEC else 0.0)
+        return gaps
+
+    def _concat_segments(self, label: str) -> Dict[str, Dict]:
         """After stop: for any camera the watchdog restarted, concat its READABLE
         segments [master + _wd/.rN] back into the single master {label}_{angle}.mp4
-        so ingest sees one file per camera (a ~stall-window gap between segments;
-        an unfinalized crashed segment is dropped, the recovery kept)."""
+        so ingest sees one file per camera (an unfinalized crashed segment is
+        dropped, the recovery kept).
+
+        The stall window between segments is PRESERVED, not deleted: each file's
+        `duration` directive is widened by its successor's gap, so the concat
+        demuxer starts that successor at its true offset. `-c copy` still holds —
+        the master keeps a real hole exactly where the camera was down, the same
+        way it already keeps holes for frames lost to RTSP packet loss, and every
+        angle stays on one shared timeline.
+
+        Returns {angle: {segments, restarts, inserted_s, gaps}} for the caller to
+        surface on the session/ingestion record."""
         with self._wd_lock:
             sess = self._sessions.get(label)
         if not sess:
-            return
+            return {}
+        report: Dict[str, Dict] = {}
         for run in sess["runs"]:
             if len(run["segments"]) <= 1:
                 continue                       # never restarted — master is fine as-is
@@ -624,10 +705,20 @@ class RecordingController:
             if not segs:
                 logger.error("watchdog: no readable segments for %s — footage lost", run["angle"])
                 continue
+            durs = [self._seg_duration(p) for p in segs]
+            gaps = self._stall_gaps(run, segs, durs)
+            inserted = round(sum(gaps), 3)
             tmp, lst = master + ".concat.mp4", master + ".concat.txt"
             try:
                 with open(lst, "w") as f:
-                    f.writelines(f"file '{p}'\n" for p in segs)
+                    for i, p in enumerate(segs):
+                        f.write(f"file '{p}'\n")
+                        # `duration` sets where the NEXT file starts, so widening it
+                        # by that file's gap re-opens the stall window. Only useful
+                        # when a successor exists and we know this file's length.
+                        nxt = gaps[i + 1] if i + 1 < len(gaps) else 0.0
+                        if nxt > 0.0 and durs[i]:
+                            f.write(f"duration {durs[i] + nxt:.6f}\n")
                 cp = subprocess.run(["ffmpeg", "-nostdin", "-loglevel", "error", "-y",
                                      "-f", "concat", "-safe", "0", "-i", lst, "-c", "copy", tmp],
                                     capture_output=True, text=True, stdin=subprocess.DEVNULL)
@@ -639,7 +730,14 @@ class RecordingController:
                             except OSError:
                                 pass
                     os.replace(tmp, master)
-                    logger.info("watchdog: concatenated %d segments for %s", len(segs), run["angle"])
+                    report[run["angle"]] = {
+                        "segments": len(segs), "restarts": run.get("restart", 0),
+                        "inserted_s": inserted,
+                        "gaps": [round(g, 3) for g in gaps[1:]]}
+                    logger.info("watchdog: concatenated %d segments for %s "
+                                "(re-inserted %.1fs of stall gap: %s)",
+                                len(segs), run["angle"], inserted,
+                                [round(g, 1) for g in gaps[1:]])
                 else:
                     logger.error("watchdog concat failed for %s: %s", run["angle"],
                                  cp.stderr.strip()[-200:])
@@ -650,6 +748,7 @@ class RecordingController:
                     os.unlink(lst)
                 except OSError:
                     pass
+        return report
 
     def _cleanup_session(self, label: str) -> None:
         with self._wd_lock:
@@ -680,16 +779,20 @@ class RecordingController:
             else:
                 for name in self._session_containers(label):
                     self._docker("kill", name)  # force
-        self._concat_segments(label)  # merge any watchdog restart segments -> one master
+        # merge any watchdog restart segments -> one master, stall gaps preserved
+        concat = self._concat_segments(label)
         # probe only what was actually recorded: caller-supplied outputs, else
         # scan the session dir (also catches a camera that dropped mid-recording).
         if outputs is None:
             outputs = self._scan_outputs(label)
-        results = [{**o, **_probe(o["path"])} for o in outputs]
+        results = [{**o, **_probe(o["path"]), **({"stall": concat[o["angle"]]}
+                                                 if o["angle"] in concat else {})}
+                   for o in outputs]
+        skew = _check_angle_skew(results)
         audio = self._stop_audio(os.path.join(self.cfg.output_dir, label))
         self._cleanup_session(label)
         return {"label": label, "stopped_at": _utcnow(), "files": results,
-                "audio": audio}
+                "audio": audio, "angle_skew_s": skew}
 
     def _scan_outputs(self, label: str) -> List[Dict]:
         """Discover recorded files in the session dir as [{angle, id, path}]."""
@@ -757,6 +860,35 @@ class RecordingController:
                     pass
         return [{"angle": pr["angle"], "path": pr["path"]} for pr in procs
                 if os.path.isfile(pr["path"]) and os.path.getsize(pr["path"]) > 1024]
+
+
+def _check_angle_skew(results: List[Dict]) -> Optional[float]:
+    """Alarm when the tracking angles disagree on how long the game was.
+
+    Every tracking camera films the same wall-clock window, so their durations
+    must match within a second or two. When one comes out materially shorter it
+    lost real time mid-game, and the annotation editor CANNOT rescue that: it
+    only carries a constant per-angle offset, while lost time is a step that
+    misaligns everything after it. Loud on purpose — this exact failure sat
+    undetected in two shipped games until the annotators found it by hand.
+
+    Returns the spread in seconds (None when there is nothing to compare)."""
+    durs = {r["angle"]: r["duration"] for r in results
+            if r.get("ok") and r.get("duration") and r.get("angle") in TRACKING_ANGLES}
+    if len(durs) < 2:
+        return None
+    lo, hi = min(durs.values()), max(durs.values())
+    skew = round(hi - lo, 3)
+    pretty = ", ".join(f"{a}={d:.1f}s" for a, d in sorted(durs.items()))
+    if skew > ANGLE_SKEW_ALARM_SEC:
+        short = min(durs, key=durs.get)
+        logger.error("ANGLE SKEW %.1fs — %s is short (%s). These angles will NOT stay "
+                     "in sync; a constant per-angle offset cannot fix lost time. "
+                     "Check the watchdog restarts for this session.",
+                     skew, short, pretty)
+    else:
+        logger.info("angle durations agree within %.2fs (%s)", skew, pretty)
+    return skew
 
 
 def _probe(path: str) -> Dict[str, object]:

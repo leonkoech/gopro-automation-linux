@@ -38,6 +38,37 @@ logger = get_logger("agx.shot_live")
 _SEG_RE = re.compile(r"^seg_(\d{5,})_([A-Z]{2})\.mp4$")
 _HOOP_SIDE = {"SL": "left", "SR": "right"}      # near-rim cam -> which hoop it films
 
+
+def _seg_real_time(path: str, prev: Optional[tuple]) -> tuple:
+    """Real wall-clock anchor for a shot segment: (close_epoch, real_seconds).
+
+    The segment index cannot be trusted to carry wall-clock, because segments are
+    split on media time at a nominal fps the cameras do not actually deliver. The
+    files themselves do carry it: each one's mtime is the instant it was closed,
+    and the gap between consecutive closes is that segment's true duration.
+
+    Returns (None, None) when there is no usable previous segment to measure
+    against, or when the measured gap is implausible -- a stalled or restarted
+    recorder can leave mtimes that would place a shot wildly wrong, and a wrong
+    anchor is worse than the nominal one it replaces.
+    """
+    try:
+        close = os.path.getmtime(path)
+    except OSError:
+        return None, None
+    if not (prev and prev[1] and os.path.exists(prev[1])):
+        return close, None
+    try:
+        gap = close - os.path.getmtime(prev[1])
+    except OSError:
+        return close, None
+    # A real segment sits near its nominal size, stretched by however far the
+    # capture rate falls short. Half to triple covers every rate we have seen and
+    # still rejects the multi-second gaps a stall leaves behind.
+    if not (0.5 * SHOT_SEGMENT_SEC <= gap <= 3.0 * SHOT_SEGMENT_SEC):
+        return close, None
+    return close, gap
+
 POLL_SEC = float(os.getenv("SHOT_LIVE_POLL_SEC", "2"))
 DEDUP_SEC = float(os.getenv("SHOT_LIVE_DEDUP_SEC", "2.5"))   # same-side makes within this window = one shot
 SHADOW_CAP = int(os.getenv("SHOT_LIVE_SHADOW_CAP", "500"))   # max shots kept in the shadow doc
@@ -67,6 +98,26 @@ def autohighlight_enabled() -> bool:
     """CV make -> auto highlight clip (same pipeline as scorekeeper clips).
     Default OFF; flip SHOT_AUTO_HIGHLIGHT=true on the box when ready."""
     return os.getenv("SHOT_AUTO_HIGHLIGHT", "false").lower() in ("1", "true", "yes", "on")
+
+
+# Clip window around the trigger, which is the ball AT THE RIM -- not the release.
+# A make and a miss want different framing: on a make the interesting part is the
+# build-up and the ball going in, so the clip runs long before and keeps a short
+# tail; on a miss the rebound matters as much as the shot, so it runs longer
+# after. Reviewed on real clips 2026-08-24 and lengthened by 1s on both tails.
+def clip_window(made: bool) -> tuple:
+    """(pre_s, post_s) for a CV-triggered cut. Rim-anchored.
+
+    The live path only cuts makes, so the miss branch is unreachable from there.
+    It is kept because offline re-cuts (a backfill, a review reel) still ask for
+    a miss window, and because the two windows differ for a reason: on a make the
+    interest is the build-up and the ball dropping, on a miss it is the rebound.
+    """
+    if made:
+        return (float(os.getenv("CV_CLIP_PRE_MAKE_S", "5")),
+                float(os.getenv("CV_CLIP_POST_MAKE_S", "2")))
+    return (float(os.getenv("CV_CLIP_PRE_MISS_S", "3")),
+            float(os.getenv("CV_CLIP_POST_MISS_S", "4")))
 
 
 def autoscore_enabled() -> bool:
@@ -268,13 +319,35 @@ class LiveShotScorer:
         #    footage seconds via the window's first-segment offset.
         G = logic.Geo.from_rim(rim, float(fps))
         window_base = base_idx * SHOT_SEGMENT_SEC
+        # splitmuxsink cuts on MEDIA time -- SHOT_SEGMENT_SEC worth of frames at
+        # the NOMINAL fps lock. The FLIRs deliver fewer frames than that lock
+        # (measured 105.6 and 106.0 fps on 2026-08-24 against a lock of 120), so
+        # a "4s" segment really spans ~4.54s of wall-clock. Deriving the shot's
+        # wall-clock as spawn + base_idx*SHOT_SEGMENT_SEC therefore loses a fixed
+        # PERCENTAGE of elapsed time -- 13% on those games, which is four minutes
+        # of error by the end of a game and cuts the clip nowhere near the shot.
+        # Anchoring on the segment file's own close time fixes it without any fps
+        # constant, and keeps working when the cameras slow further under
+        # different lighting (exposure drives their real frame rate).
+        seg_close, seg_real = _seg_real_time(path, prev)
+        n_segs = (idx - base_idx) + 1
         side = _HOOP_SIDE.get(angle)
         for v in logic.decide(G, track):
             if "verdict" not in v:
                 continue
             t_shot = float(v.get("t", 0.0))
-            wc_iso = self._wallclock(spawned_iso, window_base + t_shot)
-            wc_epoch = self._epoch(wc_iso)
+            if seg_close is not None and seg_real is not None:
+                # t_shot is media seconds inside a nominal window; stretch it by
+                # the same ratio the segments themselves are stretched.
+                win_start = seg_close - n_segs * seg_real
+                wc_epoch = win_start + t_shot * (seg_real / SHOT_SEGMENT_SEC)
+                wc_iso = datetime.fromtimestamp(wc_epoch, timezone.utc).isoformat()
+            else:
+                # mtimes unusable (first segment of a run, or a filesystem that
+                # lost them) -- fall back to the nominal math rather than drop
+                # the shot, and let the drift show up in latency_s as before.
+                wc_iso = self._wallclock(spawned_iso, window_base + t_shot)
+                wc_epoch = self._epoch(wc_iso)
             if self._is_dup(scored, wc_epoch, side):
                 continue   # overlap between consecutive windows -> one shot
             scored.append({"wc": wc_epoch, "side": side})
@@ -294,6 +367,14 @@ class LiveShotScorer:
                         rec["latency_s"], scan_s)
             if rec["made"] and autoscore_enabled():
                 self._maybe_autoscore(game_id, rec, starting_side)
+            # MAKES ONLY. A reel of missed shots is not something anyone wants to
+            # watch, and cutting them roughly doubled clip volume -- misses
+            # outnumber makes -- for no viewer value, while doubling the work the
+            # live loop has to finish before the next segment lands.
+            #
+            # Misses are NOT discarded: the record above (with its verdict and
+            # time) is what plays_sync turns into FG_MISS annotation cards. A
+            # miss needs a timestamp, not a clip.
             if rec["made"] and autohighlight_enabled():
                 self._maybe_highlight(game_id, rec)
         self._advance_prev(prev_seg, angle, idx, path)
@@ -329,7 +410,7 @@ class LiveShotScorer:
 
     # ---- Phase C seam (NOT yet wired to the visible scoreboard) ------------- #
     def _maybe_highlight(self, game_id: str, shot: Dict) -> None:
-        """Cut a highlight clip for a CV-detected make — the SAME pipeline as a
+        """Cut a highlight clip for a CV-detected shot — the SAME pipeline as a
         scorekeeper score row (buffer -> transcode -> S3 -> highlights.{id} on the
         game doc), keyed `cv_<epoch>_<side>` so the frontend's CV timeline rows can
         grow the green play button. Best-effort: a failed cut never affects
@@ -342,14 +423,17 @@ class LiveShotScorer:
             logger.info("shot-live highlight skipped (wc=%s side=%s)", wc, side)
             return
         epoch = self._epoch(wc)
+        pre_s, post_s = clip_window(bool(shot.get("made")))
         cmd = {"logId": f"cv_{int(epoch)}_{side}" if epoch else f"cv_{wc}_{side}",
-               "ts": wc, "side": side, "firebase_game_id": game_id}
+               "ts": wc, "side": side, "firebase_game_id": game_id,
+               "pre": pre_s, "post": post_s}
         try:
             resp = self._on_make(cmd)
             # detect_latency + this log's timestamp vs the highlight doc's ready
             # time = the full basket->green-button chain, measured per make.
-            logger.info("shot-live AUTO-HIGHLIGHT %s (detect_latency=%ss) -> %s",
-                        cmd["logId"], shot.get("latency_s"), resp)
+            logger.info("shot-live AUTO-HIGHLIGHT %s %s pre=%.1f post=%.1f (detect_latency=%ss) -> %s",
+                        cmd["logId"], shot.get("verdict"), pre_s, post_s,
+                        shot.get("latency_s"), resp)
         except Exception as e:  # noqa: BLE001 — never break the detector
             logger.warning("shot-live auto-highlight failed for %s: %s", cmd["logId"], e)
 

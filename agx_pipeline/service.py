@@ -466,7 +466,8 @@ def _do_highlight(cmd: Dict):
     recorder = HIGHLIGHT.recorder_for(side)
     req = {"game_id": game_id, "log_id": str(log_id), "ts_epoch": t_epoch,
            "label": label or recorder.status().get("label"),
-           "pre": cmd.get("pre"), "post": cmd.get("post")}
+           "pre": cmd.get("pre"), "post": cmd.get("post"),
+           "made": cmd.get("made"), "verdict": cmd.get("verdict")}
     threading.Thread(target=cut_highlight, args=(FB, CFG, recorder, req),
                      name=f"highlight-{str(log_id)[:8]}", daemon=True).start()
     # Env-gated shadow shot-detection validation (SHOT_VALIDATION_ENABLED, default
@@ -560,7 +561,62 @@ def _start_ingestion(pipeline_id: str, state: Dict, stopped: Dict) -> None:
             _active_ingests = max(0, _active_ingests - 1)
 
 
+def _finalize_for_shutdown(signum, _frame) -> None:
+    """SIGTERM/SIGINT: finalize the in-flight recording before we die.
+
+    `systemctl restart` sends SIGTERM to the WHOLE cgroup (KillMode=control-group
+    is systemd's default), so every child ffmpeg gets SIGTERM too — and ffmpeg on
+    SIGTERM exits WITHOUT writing the moov atom. That is why this codebase signals
+    its own recorders with SIGINT everywhere (_ff_finalize, _teardown_locked,
+    `--signal=INT`): SIGINT finalizes, SIGTERM truncates.
+
+    Cost of not doing this, measured: on 2026-08-21 a restart 7 minutes into a
+    57-minute game left all five angles headerless ("moov atom not found") and
+    recording never resumed — ~50 minutes of that game never existed. The files
+    were recoverable only by rebuilding the index by hand.
+
+    So: SIGINT the recorders and let them write their headers. Ingestion is NOT
+    started — this process is going away and would take it with us; the finalized
+    masters stay on disk, and auto-follow resumes recording on the way back up.
+
+    Pair this with `KillMode=mixed` + a generous `TimeoutStopSec` in the unit
+    (deploy/agx-ingestion.service.d/), or systemd will SIGTERM the children out
+    from under us before this runs."""
+    logger.warning("signal %d — finalizing recording before shutdown", signum)
+    with _lock:
+        state = dict(_current)
+        _current.clear()
+    if state:
+        outs = state.get("outputs") or []
+        track = [o for o in outs if o.get("role") != "shot_detection"]
+        shot = [o for o in outs if o.get("role") == "shot_detection"]
+        # Concurrent, same as the normal stop, so both families' SIGINT lands at
+        # ~the same instant and the angles keep matching end times.
+        with ThreadPoolExecutor(max_workers=2) as ex:
+            futs = [ex.submit(CONTROLLER.stop, state["label"], track)]
+            if SHOT and shot:
+                futs.append(ex.submit(SHOT.stop, state["label"], shot))
+            for f in futs:
+                try:
+                    f.result()
+                except Exception as e:  # noqa: BLE001
+                    logger.error("shutdown finalize failed: %s", e)
+        logger.warning("recording %s finalized on shutdown — masters kept on disk, "
+                       "ingestion NOT started", state.get("label"))
+    for name, obj in (("highlight", HIGHLIGHT), ("live", LIVE)):
+        try:
+            if obj:
+                obj.stop()
+        except Exception as e:  # noqa: BLE001
+            logger.warning("%s stop failed on shutdown: %s", name, e)
+    os._exit(0)
+
+
 if __name__ == "__main__":
+    import signal as _signal
+
+    for _sig in (_signal.SIGTERM, _signal.SIGINT):
+        _signal.signal(_sig, _finalize_for_shutdown)
     port = int(os.getenv("AGX_SERVICE_PORT", "5000"))
     if FB:
         from agx_pipeline.relay import Relay
