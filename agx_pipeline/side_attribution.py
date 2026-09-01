@@ -8,8 +8,8 @@ actually filmed the basket, we translate:
 
     scoring team + period + startingSideTeam1  ->  physical hoop side (left/right)
 
-which flips at halftime. Left-hoop cameras are FL/NL, right-hoop cameras FR/NR.
-Pure functions only — unit-testable, no I/O.
+which flips at halftime. Left-hoop cameras are FL/NL, right-hoop cameras FR/NR
+(see cv_merge/team_attribution.py). Pure functions only — unit-testable, no I/O.
 """
 
 from __future__ import annotations
@@ -19,7 +19,8 @@ from typing import Optional
 LEFT = "left"
 RIGHT = "right"
 
-# Physical camera layout: FL/NL film the left hoop, FR/NR the right hoop.
+# Physical camera layout (cv_merge/team_attribution.py): FL/NL film the left
+# hoop, FR/NR the right hoop.
 HOOP_CAMERAS = {LEFT: ("FL", "NL"), RIGHT: ("FR", "NR")}
 
 
@@ -34,7 +35,7 @@ def team1_attacking_side(
 
     ``starting_side_team1`` is the hoop team1 attacks at tip-off, set by the
     operator at check-in; it flips in the 2nd half. Defaults to "left" when
-    unknown.
+    unknown, matching cv_merge.team_attribution.attribute_team.
     """
     starting = starting_side_team1 if starting_side_team1 in (LEFT, RIGHT) else LEFT
     return _opposite(starting) if period == "2nd" else starting

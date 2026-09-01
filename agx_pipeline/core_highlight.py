@@ -57,6 +57,27 @@ def build_reel(firebase_game_id: str, game: Dict, game_date: Optional[str] = Non
     logs = game.get("logs") or []
     by_id = {str(l.get("id")): l for l in logs if l.get("id")}
 
+    # Running score at each scoring event (chronological), keyed by the log id →
+    # (team1_score, team2_score) AFTER that shot — for the recap scorebug. Sum
+    # operator-entered scoreboard points per side over ALL scores (incl. free
+    # throws / non-clipped plays, so a clip's on-screen score reflects every
+    # prior point); skip CV shadow events so totals reconcile with finalScore.
+    running: Dict[str, tuple] = {}
+    l_run = r_run = 0
+    for lg in sorted(logs, key=lambda x: (x.get("timestamp") is None, x.get("timestamp") or "")):
+        if lg.get("actionType") not in ("score_added", "player_score_added"):
+            continue
+        p = lg.get("payload") or {}
+        if p.get("source") == "cv":
+            continue
+        pts = p.get("points", 0) or 0
+        if lg.get("team") == "left":
+            l_run += pts
+        elif lg.get("team") == "right":
+            r_run += pts
+        if lg.get("id"):
+            running[str(lg["id"])] = (l_run, r_run)
+
     clips: List[Dict] = []
     for log_id, h in highlights.items():
         if h.get("status") != "ready" or not h.get("url"):
@@ -74,12 +95,15 @@ def build_reel(firebase_game_id: str, game: Dict, game_date: Optional[str] = Non
         if h.get("made") is False and not _include_misses():
             continue
         log = by_id.get(str(log_id), {})
+        score = running.get(str(log_id))
         clips.append({
             "url": h["url"],
             "play_type": _play_type(log),
             "team": log.get("team"),          # "left"/"right" (team identity)
             "ts": log.get("timestamp"),        # ISO — reel ordering key
             "angle": h.get("angle"),           # camera the clip was cut from
+            "team1_score": score[0] if score else None,  # running, after this shot
+            "team2_score": score[1] if score else None,
         })
     if not clips:
         return None
