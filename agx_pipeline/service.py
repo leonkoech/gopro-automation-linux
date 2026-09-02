@@ -36,6 +36,7 @@ from agx_pipeline.recording import RecordingController, load_config
 from agx_pipeline.camrec_controller import CamrecController
 from agx_pipeline.shot_recording import AravisRecorder
 from agx_pipeline.highlight import HighlightBuffer, cut_highlight
+from agx_pipeline.grafana_annotate import annotate
 from agx_pipeline.shot_detect.live import LiveShotScorer, live_enabled
 from agx_pipeline.side_attribution import scoring_hoop_side
 from agx_pipeline.sessions import AgxSessionTracker, get_active_game
@@ -444,6 +445,10 @@ def _do_highlight(cmd: Dict):
         return {"success": False, "error": "highlight recorder disabled"}, 501
     log_id = cmd.get("logId") or cmd.get("log_id")
     ts = cmd.get("ts")
+    if log_id:
+        # Earliest point in the whole chain: a make was detected (or a
+        # scorekeeper log) and this request reached the service.
+        annotate(f"highlight detected: {log_id}", ["highlight", "detected", str(log_id)])
     with _lock:
         game_id = cmd.get("firebase_game_id") or _current.get("firebase_game_id")
         label = _current.get("label")
@@ -475,6 +480,7 @@ def _do_highlight(cmd: Dict):
            "label": label or recorder.status().get("label"),
            "pre": cmd.get("pre"), "post": cmd.get("post"),
            "made": cmd.get("made"), "verdict": cmd.get("verdict")}
+    annotate(f"highlight queued: {log_id}", ["highlight", "queued", str(log_id)])
     threading.Thread(target=cut_highlight, args=(FB, CFG, recorder, req),
                      name=f"highlight-{str(log_id)[:8]}", daemon=True).start()
     # Env-gated shadow shot-detection validation (SHOT_VALIDATION_ENABLED, default
