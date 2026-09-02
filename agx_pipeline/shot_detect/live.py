@@ -212,6 +212,7 @@ class LiveShotScorer:
         n_seg = 0
         backlog = {"now": 0, "max": 0}   # unprocessed-closed-segments queue depth
         t0 = time.time()
+        last_cache_clear = 0.0           # wall-clock of the last torch.cuda.empty_cache()
         self._write_shadow(game_id, shadow, n_seg, t0, status="running", backlog=backlog)
 
         pause_since: Optional[float] = None
@@ -220,6 +221,12 @@ class LiveShotScorer:
                 # visible pause: night 1's 54-min silent pause hid the outage
                 if pause_since is None:
                     pause_since = time.time()
+                    # Hand the CUDA pool back so the ingest transcode we're
+                    # yielding to has the memory — this is the one place a full
+                    # release is worth its cost (we're idle anyway).
+                    if detector is not None and hasattr(detector, "empty_cache"):
+                        detector.empty_cache()
+                        last_cache_clear = time.time()
                 elif time.time() - pause_since > 60:
                     logger.warning("shot-live paused %ds (ingest transcode)",
                                    int(time.time() - pause_since))
@@ -257,8 +264,6 @@ class LiveShotScorer:
                                          fps, imgsz, stride, spawned.get(angle),
                                          starting_side, scored, shadow, game_id,
                                          prev_seg, hoop_acc)
-                    if hasattr(detector, "empty_cache"):
-                        detector.empty_cache()
                     # publish after EACH segment so a fresh make reaches the shadow
                     # (and, in Phase C, the scoreboard) within a segment of the
                     # shot — not in a burst after a whole backlog drains.
@@ -267,9 +272,20 @@ class LiveShotScorer:
                 if n_stale:
                     logger.warning("shot-live skipped %d stale segments (>%.0fs old)",
                                    n_stale, MAX_AGE_S)
+                # CUDA cache: release once a minute, NOT after every window. On
+                # Tegra unified memory empty_cache() returns pool blocks to the
+                # driver and the next predict() re-allocates them cold; doing it
+                # per-window (as this did) added a cold alloc to every inference
+                # while the loop was already ~2x too slow to keep up.
+                if (detector is not None and hasattr(detector, "empty_cache")
+                        and time.time() - last_cache_clear > 60):
+                    detector.empty_cache()
+                    last_cache_clear = time.time()
             except Exception as e:  # noqa: BLE001 — a bad segment must not kill the loop
                 logger.warning("shot-live segment pass failed: %s", e)
 
+        if detector is not None and hasattr(detector, "empty_cache"):
+            detector.empty_cache()   # free the pool on the way out
         self._write_shadow(game_id, shadow, n_seg, t0, status="stopped")
         shutil.rmtree(seg_dir, ignore_errors=True)   # segments are ephemeral; master is durable
         logger.info("shot-live stopped game=%s segments=%d shots=%d",

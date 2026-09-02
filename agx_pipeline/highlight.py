@@ -68,6 +68,23 @@ URL_TTL = min(int(os.getenv("HIGHLIGHT_URL_TTL", str(7 * 24 * 3600))), 604800)
 
 _SEG_RE = re.compile(r"^seg_(\d{10,})_([A-Z]{2})\.mp4$")
 
+# One S3 client for the process. Cut threads are per-clip and short-lived, so a
+# fresh boto3 client per cut re-did DNS + a TLS handshake on every upload. boto3
+# low-level clients are thread-safe; one shared client keeps its connection pool
+# warm across cuts.
+_s3_lock = threading.Lock()
+_s3_singleton = None
+
+
+def _s3_client():
+    global _s3_singleton
+    if _s3_singleton is None:
+        with _s3_lock:
+            if _s3_singleton is None:
+                import boto3
+                _s3_singleton = boto3.client("s3", region_name=AWS_REGION)
+    return _s3_singleton
+
 
 def _utcnow() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
@@ -411,10 +428,9 @@ def cut_highlight(fb, cfg, recorder: HighlightRecorder, req: Dict) -> None:
 
         # 5. Upload + presign.
         annotate(f"upload start: {log_id}", ["highlight", "upload_start", log_id])
-        import boto3
         date = datetime.fromtimestamp(t, tz=timezone.utc).strftime("%Y-%m-%d")
         key = f"{S3_PREFIX}/{date}/{game_id}/{log_id}_{angle}.mp4"
-        s3 = boto3.client("s3", region_name=AWS_REGION)
+        s3 = _s3_client()
         s3.upload_file(final, S3_BUCKET, key,
                        ExtraArgs={"ContentType": "video/mp4"})
         url = (f"https://{CLOUDFRONT_DOMAIN}/{key}" if CLOUDFRONT_DOMAIN

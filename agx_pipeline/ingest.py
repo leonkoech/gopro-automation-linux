@@ -149,13 +149,19 @@ def _transcode_hw(src: str, dst: str, cfg) -> bool:
         "-v", f"{cfg.app_mount}:/app/data", "--workdir", "/app/data", cfg.docker_image,
         "gst-launch-1.0", "-e",
         "filesrc", f"location={cin}", "!", "qtdemux", "!", "h265parse", "!",
+        # nvv4l2decoder -> nvvideoconvert (scale, on the VIC by default on Jetson)
+        # -> nvv4l2h264enc.
         "nvv4l2decoder", "!", "nvvideoconvert", "!",
         "video/x-raw(memory:NVMM),width=1920,height=1080", "!",
         # idrinterval matters, not just iframeinterval: browsers/ffmpeg can only
         # seek to IDR frames, and nvv4l2h264enc defaults idrinterval to 256
         # (~8.5s at 30fps) — the cause of multi-second seek stalls in the
         # annotation editor. IDR every 30 frames = seekable every second.
-        "nvv4l2h264enc", f"bitrate={HW_BITRATE}", "iframeinterval=30", "idrinterval=30", "!",
+        # maxperf-enable=1: run NVENC at max clock (matches shot_recording.py) so
+        # the encode finishes sooner and the engine clock-gates back down — a
+        # race-to-idle win, not extra steady load.
+        "nvv4l2h264enc", f"bitrate={HW_BITRATE}", "iframeinterval=30", "idrinterval=30",
+        "maxperf-enable=1", "!",
         "h264parse", "!", "mp4mux", "!", "filesink", f"location={cout}",
     ]
     cp = subprocess.run(cmd, capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=10800)
@@ -207,13 +213,28 @@ def _probe_dur(path: str) -> Optional[float]:
         return None
 
 
+_s3_lock = threading.Lock()
+_s3_singleton = None
+
+
+def _s3_client():
+    """One shared, thread-safe boto3 S3 client for the process, reused across
+    every angle's upload instead of a fresh client (DNS + TLS) per file."""
+    global _s3_singleton
+    if _s3_singleton is None:
+        with _s3_lock:
+            if _s3_singleton is None:
+                import boto3
+                _s3_singleton = boto3.client("s3", region_name=REGION)
+    return _s3_singleton
+
+
 def _upload(local: str, key: str, content_type: str = "video/mp4") -> None:
-    import boto3
     from boto3.s3.transfer import TransferConfig
-    s3 = boto3.client("s3", region_name=REGION)
-    s3.upload_file(local, BUCKET, key, ExtraArgs={"ContentType": content_type},
-                   Config=TransferConfig(multipart_threshold=64 * 1024 * 1024,
-                                         multipart_chunksize=64 * 1024 * 1024, max_concurrency=4))
+    _s3_client().upload_file(
+        local, BUCKET, key, ExtraArgs={"ContentType": content_type},
+        Config=TransferConfig(multipart_threshold=64 * 1024 * 1024,
+                              multipart_chunksize=64 * 1024 * 1024, max_concurrency=4))
 
 
 def _ingest_audio_sync(run, date: str, folder: str, audio_list) -> None:
