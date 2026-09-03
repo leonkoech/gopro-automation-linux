@@ -564,6 +564,9 @@ def _create_pipeline_run(pipeline_id: str, state: Dict, stopped: Dict) -> None:
 _ingest_serial = threading.Semaphore(1)
 
 
+_NIGHT_END_POLL_S = 5.0   # gate has 30-min granularity; no need to spin
+
+
 def _wait_for_night_end(pipeline_id: str) -> None:
     """Block until recording has been idle INGEST_DEFER_MIN consecutive minutes.
 
@@ -589,6 +592,10 @@ def _wait_for_night_end(pipeline_id: str) -> None:
             logger.info("ingestion %s deferred (recording=%s, quiet %.0fm/%.0fm)",
                         pipeline_id, rec, (now - quiet_since) / 60, defer_min)
             last_log = now
+        # sleep between checks — without this the loop busy-spins on _lock (the
+        # capture path's lock) for up to defer_min minutes per pending ingest,
+        # pegging a core.
+        time.sleep(_NIGHT_END_POLL_S)
 
 
 def _retry_failed_highlights(state: Dict) -> None:
