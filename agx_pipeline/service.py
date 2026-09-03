@@ -448,7 +448,7 @@ def _do_highlight(cmd: Dict):
     if log_id:
         # Earliest point in the whole chain: a make was detected (or a
         # scorekeeper log) and this request reached the service.
-        annotate(f"highlight detected: {log_id}", ["highlight", "detected", str(log_id)])
+        annotate(f"highlight detected: {log_id}", ["highlight", "detected"])
     with _lock:
         game_id = cmd.get("firebase_game_id") or _current.get("firebase_game_id")
         label = _current.get("label")
@@ -480,7 +480,7 @@ def _do_highlight(cmd: Dict):
            "label": label or recorder.status().get("label"),
            "pre": cmd.get("pre"), "post": cmd.get("post"),
            "made": cmd.get("made"), "verdict": cmd.get("verdict")}
-    annotate(f"highlight queued: {log_id}", ["highlight", "queued", str(log_id)])
+    annotate(f"highlight queued: {log_id}", ["highlight", "queued"])
     threading.Thread(target=cut_highlight, args=(FB, CFG, recorder, req),
                      name=f"highlight-{str(log_id)[:8]}", daemon=True).start()
     # Env-gated shadow shot-detection validation (SHOT_VALIDATION_ENABLED, default

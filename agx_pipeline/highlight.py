@@ -345,7 +345,7 @@ def cut_highlight(fb, cfg, recorder: HighlightRecorder, req: Dict) -> None:
                                 **({"verdict": req["verdict"]} if req.get("verdict") else {}),
                                 "requestedAt": _utcnow(),
                                 "angle": recorder.angle()})
-    annotate(f"highlight cut start: {log_id}", ["highlight", "cut_start", log_id])
+    annotate(f"highlight cut start: {log_id}", ["highlight", "cut_start"])
     try:
         # 1. Wait for the covering segments to close: either a segment starting
         #    after the window end exists, or enough wall-clock has passed.
@@ -360,7 +360,7 @@ def cut_highlight(fb, cfg, recorder: HighlightRecorder, req: Dict) -> None:
         if not picked:
             raise RuntimeError(
                 f"window not in highlight buffer ({len(segs)} segments)")
-        annotate(f"segments ready: {log_id}", ["highlight", "segments_ready", log_id])
+        annotate(f"segments ready: {log_id}", ["highlight", "segments_ready"])
 
         angle = picked[0][1]
         work = os.path.join(cfg.output_dir, "highlight_clips", label or "unlabeled")
@@ -376,18 +376,18 @@ def cut_highlight(fb, cfg, recorder: HighlightRecorder, req: Dict) -> None:
         if not _run(["ffmpeg", "-nostdin", "-y", "-f", "concat", "-safe", "0",
                      "-i", lst, "-c", "copy", merged]):
             raise RuntimeError("segment concat failed")
-        annotate(f"concat done: {log_id}", ["highlight", "concat_done", log_id])
+        annotate(f"concat done: {log_id}", ["highlight", "concat_done"])
 
         # 3. 4K H.265 → 1080p H.264, IDR every 30 frames (ingest's HW path with
         #    SW fallback) so the trim below and browser seeking are accurate.
         # This is the GPU stage (NVDEC decode + NVENC encode) — tagged
         # separately from step 4's CPU-only trim so the two can be told
         # apart against jetson_nvenc_utilization_percent / _nvdec_.
-        annotate(f"transcode start: {log_id}", ["highlight", "transcode_start", log_id])
+        annotate(f"transcode start: {log_id}", ["highlight", "transcode_start"])
         from agx_pipeline.ingest import _transcode_1080p, PRESET, CRF
         if not _transcode_1080p(merged, hd, cfg):
             raise RuntimeError("transcode failed")
-        annotate(f"transcode done: {log_id}", ["highlight", "transcode_done", log_id])
+        annotate(f"transcode done: {log_id}", ["highlight", "transcode_done"])
 
         # 4. Trim to [T-pre, T+post] with a RE-ENCODE (not stream copy). A copy
         #    trim snapped to a ≤1s-early IDR and started mid-GOP, which played
@@ -397,7 +397,7 @@ def cut_highlight(fb, cfg, recorder: HighlightRecorder, req: Dict) -> None:
         #    variable frame timing — smooth playback. Cheap: 1080p H.264,
         #    veryfast, only ~8s (the heavy 4K decode/scale already ran on the GPU
         #    in step 3).
-        annotate(f"trim start: {log_id}", ["highlight", "trim_start", log_id])
+        annotate(f"trim start: {log_id}", ["highlight", "trim_start"])
         offset = max(0.0, t0 - picked[0][0])
         if not _run(["ffmpeg", "-nostdin", "-y",
                      "-ss", f"{offset:.2f}", "-i", hd, "-t", f"{pre + post:.2f}",
@@ -407,10 +407,10 @@ def cut_highlight(fb, cfg, recorder: HighlightRecorder, req: Dict) -> None:
             raise RuntimeError("trim/re-encode failed")
         if not (os.path.isfile(final) and os.path.getsize(final) > 0):
             raise RuntimeError("empty clip")
-        annotate(f"trim done: {log_id}", ["highlight", "trim_done", log_id])
+        annotate(f"trim done: {log_id}", ["highlight", "trim_done"])
 
         # 5. Upload + presign.
-        annotate(f"upload start: {log_id}", ["highlight", "upload_start", log_id])
+        annotate(f"upload start: {log_id}", ["highlight", "upload_start"])
         import boto3
         date = datetime.fromtimestamp(t, tz=timezone.utc).strftime("%Y-%m-%d")
         key = f"{S3_PREFIX}/{date}/{game_id}/{log_id}_{angle}.mp4"
@@ -421,12 +421,12 @@ def cut_highlight(fb, cfg, recorder: HighlightRecorder, req: Dict) -> None:
                else s3.generate_presigned_url(
                    "get_object", Params={"Bucket": S3_BUCKET, "Key": key},
                    ExpiresIn=URL_TTL))
-        annotate(f"upload done: {log_id}", ["highlight", "upload_done", log_id])
+        annotate(f"upload done: {log_id}", ["highlight", "upload_done"])
 
         _mark(fb, game_id, log_id, {"status": "ready", "url": url,
                                     "s3_key": key, "angle": angle,
                                     "duration": pre + post})
-        annotate(f"clip ready: {log_id}", ["highlight", "ready", log_id])
+        annotate(f"clip ready: {log_id}", ["highlight", "ready"])
         logger.info("highlight ready %s/%s angle=%s key=%s", game_id, log_id, angle, key)
         # CV makes: queue the finished clip for live shot-value typing (2/3/4pt
         # onto cv_points.{logId} -> the CV scorecard). After the ready-mark so
@@ -445,5 +445,5 @@ def cut_highlight(fb, cfg, recorder: HighlightRecorder, req: Dict) -> None:
                 pass
     except Exception as e:  # noqa: BLE001
         logger.error("highlight cut failed (%s/%s): %s", game_id, log_id, e)
-        annotate(f"clip failed: {log_id} ({str(e)[:80]})", ["highlight", "error", log_id])
+        annotate(f"clip failed: {log_id} ({str(e)[:80]})", ["highlight", "error"])
         _mark(fb, game_id, log_id, {"status": "error", "error": str(e)[:300]})
