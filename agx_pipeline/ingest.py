@@ -97,28 +97,59 @@ def _transcode_end() -> None:
         _transcoding = max(0, _transcoding - 1)
 
 
+def _capture_active() -> Optional[bool]:
+    """Is a game being captured right now? None when that cannot be determined.
+
+    ImportError means there is no service context at all (tests, CLI) — nothing
+    is recording, so that is a definite False. Any other failure leaves the
+    answer genuinely unknown, and callers must treat unknown as "a game might
+    be running": guessing the permissive way here is what would starve a live
+    capture (the 2026-08-19 freeze).
+    """
+    try:
+        from agx_pipeline import service
+    except ImportError:
+        return False
+    try:
+        return bool(service.is_recording())
+    except Exception:  # noqa: BLE001 — unknown, not "idle"
+        logger.warning("could not read capture state; assuming a game may be recording")
+        return None
+
+
+# Throttle for a game that starts mid-STAGE-1. A job about to *launch* while
+# capture is live waits here, so concurrency decays back toward MAX_PARALLEL as
+# in-flight jobs finish.
+#
+# Know its limits. It cannot preempt — a transcode cannot be killed mid-encode
+# without losing the work — so it bounds new load, never sheds existing load.
+# With one angle per pool slot (4 angles, 4 wide) every job launches before a
+# game could plausibly start, and this is inert; it only bites once angles
+# outnumber pool slots. The real protection against overlap is still the
+# 30-minute night-end gate in service._wait_for_night_end.
+#
+# It is here because --cpu-shares=128 (the 2026-08-19 fix) arbitrates CPU only,
+# while a wide wave also loads NVDEC/VIC/NVENC and DRAM bandwidth, which nothing
+# arbitrates. If INGEST_DEFER_MIN is ever lowered, this stops being theoretical
+# and true preemption (docker pause on a named container) becomes worth its own
+# failure modes.
+_capture_throttle = threading.Semaphore(MAX_PARALLEL)
+
+
 def _stage1_parallel(n_files: int) -> int:
     """How many angles to transcode at once in STAGE 1.
 
     The night-end defer (service._wait_for_night_end) means the box is normally
     idle at ingest time, so transcode every angle in one wave — with
-    maxperf-enable on the encoder it is a race to idle. Fall back to
-    TRANSCODE_PARALLEL while a game is being captured: a wide 4K decode/scale
-    burst must not contend with the capture path (the 2026-08-19 freeze fix).
-
-    Sized once at stage start; a game that starts mid-transcode still rides the
-    per-job --cpu-shares=128 deprioritisation in _transcode_hw.
+    maxperf-enable on the encoder it is a race to idle. Hold at
+    TRANSCODE_PARALLEL while a game is being captured, or whenever the capture
+    state is unknown: TRANSCODE_PARALLEL is today's behaviour, so the cautious
+    branch can only ever be a no-op, while the wide branch risks a live game.
     """
     want = min(max(n_files, 1), MAX_PARALLEL_IDLE)
     if want <= MAX_PARALLEL:
         return want
-    try:
-        from agx_pipeline import service
-        if service.is_recording():
-            return MAX_PARALLEL
-    except Exception:  # noqa: BLE001 — no service context (tests / CLI): batch mode
-        pass
-    return want
+    return want if _capture_active() is False else MAX_PARALLEL
 
 
 def _transcode_enabled(fb, jetson_id: str) -> bool:
@@ -463,14 +494,23 @@ def run_ingestion(fb, cfg, pipeline_id: str, state: Dict, stopped: Dict, tracker
         # is every angle at once when the box is idle, TRANSCODE_PARALLEL if a
         # game is being captured (_stage1_parallel).
         run.start_stage("transcode")
-        run.start_stage("upload")
         parallel = _stage1_parallel(len(files))
         logger.info("ingest %s: %d angle(s), %d-wide transcode", pipeline_id, len(files), parallel)
 
         def _do(f: Dict) -> tuple:
             key, fn = _s3_key(date, folder, f["angle"])
             dst = os.path.join(work_dir, fn)
-            ok = _transcode_1080p(f["path"], dst, cfg)
+            # Only meaningful when the wave is wider than the safe width: if a
+            # game started after _stage1_parallel sized the pool, hold new jobs
+            # at MAX_PARALLEL rather than launching into a live capture.
+            throttled = parallel > MAX_PARALLEL and _capture_active() is not False
+            if throttled:
+                _capture_throttle.acquire()
+            try:
+                ok = _transcode_1080p(f["path"], dst, cfg)
+            finally:
+                if throttled:
+                    _capture_throttle.release()
             return f["angle"], {"src": f["path"], "dst": dst, "filename": fn,
                                 "key": key, "ok": ok,
                                 "dur": _probe_dur(dst) if ok else None,
@@ -501,6 +541,13 @@ def run_ingestion(fb, cfg, pipeline_id: str, state: Dict, stopped: Dict, tracker
                         tr[angle] = r
                         if r["ok"]:
                             run.angle_done("transcode", angle)
+                            # Start the upload stage on the FIRST submit, not at
+                            # stage-1 start: the stage span is a duration people
+                            # read, and anchoring it to the transcode's start
+                            # would report the whole overlapped window as upload
+                            # time (~29 min for ~2 min of work on a 3-angle game).
+                            if not up_futs:
+                                run.start_stage("upload")
                             up_futs.append(up_ex.submit(_do_upload, angle, r))
                         else:
                             run.angle_failed("transcode", angle, "ffmpeg failed")
