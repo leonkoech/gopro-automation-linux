@@ -84,6 +84,14 @@ def is_gpu_free() -> bool:
         return not _current and _active_ingests == 0
 
 
+def is_recording() -> bool:
+    """True while a game is being captured. run_ingestion reads this to size its
+    transcode pool — wide when the box is idle, conservative if capture could be
+    contending."""
+    with _lock:
+        return bool(_current)
+
+
 def transcode_active() -> bool:
     """True only while an ingestion is in its GPU TRANSCODE stage — NOT its long
     upload/register phases. The LIVE shot loop pauses on this so it yields the GPU

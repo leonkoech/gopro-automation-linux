@@ -62,6 +62,10 @@ CRF = os.getenv("TRANSCODE_CRF", "23")
 PRESET = os.getenv("TRANSCODE_PRESET", "veryfast")
 HW_BITRATE = os.getenv("TRANSCODE_HW_BITRATE", "8000000")  # NVENC bits/sec for 1080p
 MAX_PARALLEL = int(os.getenv("TRANSCODE_PARALLEL", "2"))
+# Wider cap used only when the box is idle at ingest time (the night-end defer
+# means it usually is) — transcode every angle in one wave. Falls back to
+# MAX_PARALLEL if a game is being captured. See _stage1_parallel().
+MAX_PARALLEL_IDLE = int(os.getenv("TRANSCODE_PARALLEL_IDLE", "4"))
 UBALL_ANGLE = {"FL": "LEFT", "FR": "RIGHT"}  # registered angles (annotation is 2-angle today)
 SETTINGS_COLLECTION = "agx-settings"
 TRANSCODE_DEFAULT = os.getenv("TRANSCODE_ENABLED", "true").lower() in ("1", "true", "yes")
@@ -91,6 +95,61 @@ def _transcode_end() -> None:
     global _transcoding
     with _transcode_lock:
         _transcoding = max(0, _transcoding - 1)
+
+
+def _capture_active() -> Optional[bool]:
+    """Is a game being captured right now? None when that cannot be determined.
+
+    ImportError means there is no service context at all (tests, CLI) — nothing
+    is recording, so that is a definite False. Any other failure leaves the
+    answer genuinely unknown, and callers must treat unknown as "a game might
+    be running": guessing the permissive way here is what would starve a live
+    capture (the 2026-08-19 freeze).
+    """
+    try:
+        from agx_pipeline import service
+    except ImportError:
+        return False
+    try:
+        return bool(service.is_recording())
+    except Exception:  # noqa: BLE001 — unknown, not "idle"
+        logger.warning("could not read capture state; assuming a game may be recording")
+        return None
+
+
+# Throttle for a game that starts mid-STAGE-1. A job about to *launch* while
+# capture is live waits here, so concurrency decays back toward MAX_PARALLEL as
+# in-flight jobs finish.
+#
+# Know its limits. It cannot preempt — a transcode cannot be killed mid-encode
+# without losing the work — so it bounds new load, never sheds existing load.
+# With one angle per pool slot (4 angles, 4 wide) every job launches before a
+# game could plausibly start, and this is inert; it only bites once angles
+# outnumber pool slots. The real protection against overlap is still the
+# 30-minute night-end gate in service._wait_for_night_end.
+#
+# It is here because --cpu-shares=128 (the 2026-08-19 fix) arbitrates CPU only,
+# while a wide wave also loads NVDEC/VIC/NVENC and DRAM bandwidth, which nothing
+# arbitrates. If INGEST_DEFER_MIN is ever lowered, this stops being theoretical
+# and true preemption (docker pause on a named container) becomes worth its own
+# failure modes.
+_capture_throttle = threading.Semaphore(MAX_PARALLEL)
+
+
+def _stage1_parallel(n_files: int) -> int:
+    """How many angles to transcode at once in STAGE 1.
+
+    The night-end defer (service._wait_for_night_end) means the box is normally
+    idle at ingest time, so transcode every angle in one wave — with
+    maxperf-enable on the encoder it is a race to idle. Hold at
+    TRANSCODE_PARALLEL while a game is being captured, or whenever the capture
+    state is unknown: TRANSCODE_PARALLEL is today's behaviour, so the cautious
+    branch can only ever be a no-op, while the wide branch risks a live game.
+    """
+    want = min(max(n_files, 1), MAX_PARALLEL_IDLE)
+    if want <= MAX_PARALLEL:
+        return want
+    return want if _capture_active() is False else MAX_PARALLEL
 
 
 def _transcode_enabled(fb, jetson_id: str) -> bool:
@@ -427,51 +486,88 @@ def run_ingestion(fb, cfg, pipeline_id: str, state: Dict, stopped: Dict, tracker
         run.set_s3(BUCKET, f"{LOCATION}/{date}/{folder}/")
         work_dir = os.path.join(cfg.output_dir, label, "1080p")
 
-        # STAGE 1 — transcode (parallel, bounded); mark each angle as it finishes.
-        # _transcode_begin/end flag the GPU-busy window so the live shot loop yields
-        # only for the transcode, not the whole (upload-heavy) ingest.
+        # STAGE 1 (transcode) + STAGE 2 (upload), OVERLAPPED: each angle's 1080p
+        # upload starts the moment its own transcode finishes, so every upload
+        # but the last hides behind the transcode tail. _transcode_begin/end
+        # still bracket ONLY the transcode pool — that is the GPU-busy window the
+        # live shot loop yields for; the uploads are network, not GPU. Pool width
+        # is every angle at once when the box is idle, TRANSCODE_PARALLEL if a
+        # game is being captured (_stage1_parallel).
         run.start_stage("transcode")
+        parallel = _stage1_parallel(len(files))
+        logger.info("ingest %s: %d angle(s), %d-wide transcode", pipeline_id, len(files), parallel)
 
         def _do(f: Dict) -> tuple:
             key, fn = _s3_key(date, folder, f["angle"])
             dst = os.path.join(work_dir, fn)
-            ok = _transcode_1080p(f["path"], dst, cfg)
+            # Only meaningful when the wave is wider than the safe width: if a
+            # game started after _stage1_parallel sized the pool, hold new jobs
+            # at MAX_PARALLEL rather than launching into a live capture.
+            throttled = parallel > MAX_PARALLEL and _capture_active() is not False
+            if throttled:
+                _capture_throttle.acquire()
+            try:
+                ok = _transcode_1080p(f["path"], dst, cfg)
+            finally:
+                if throttled:
+                    _capture_throttle.release()
             return f["angle"], {"src": f["path"], "dst": dst, "filename": fn,
                                 "key": key, "ok": ok,
                                 "dur": _probe_dur(dst) if ok else None,
                                 "size": os.path.getsize(dst) if ok and os.path.exists(dst) else 0,
                                 "uploaded": False}
-        tr: Dict[str, Dict] = {}
-        _transcode_begin()
-        try:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_PARALLEL) as ex:
-                futs = [ex.submit(_do, f) for f in files]
-                for fut in concurrent.futures.as_completed(futs):
-                    angle, r = fut.result()
-                    tr[angle] = r
-                    run.angle_done("transcode", angle) if r["ok"] else \
-                        run.angle_failed("transcode", angle, "ffmpeg failed")
-        finally:
-            _transcode_end()
-        run.finish_stage("transcode")
 
-        # STAGE 2 — upload 1080p to S3
-        run.start_stage("upload")
-        for angle, r in tr.items():
-            if not r["ok"]:
-                continue
+        def _do_upload(angle: str, r: Dict) -> tuple:
+            """On the upload pool; the outcome goes back to the main thread to
+            record, so IngestionRun stays single-writer."""
             try:
                 _upload(r["dst"], r["key"])
-                r["uploaded"] = True
-                run.set_upload(angle, r["key"], r.get("size"))
-                # full copy-pasteable path in the run log — this is how the
-                # operator finds the footage (especially 4K passthrough, which
-                # never touches the annotation tool)
-                mb = f" ({r['size'] / 1e6:.0f} MB)" if r.get("size") else ""
-                run.log("info", f"{angle} uploaded -> s3://{BUCKET}/{r['key']}{mb}")
-                run.angle_done("upload", angle)
+                return angle, r, None
             except Exception as e:  # noqa: BLE001
-                run.angle_failed("upload", angle, str(e)[:200])
+                return angle, r, str(e)[:200]
+
+        tr: Dict[str, Dict] = {}
+        up_futs = []
+        # 2 upload workers: the tail after the last transcode is rarely deeper
+        # than that, and it keeps the shared S3 client's connection pool clear.
+        with concurrent.futures.ThreadPoolExecutor(
+                max_workers=2, thread_name_prefix="ingest-up") as up_ex:
+            _transcode_begin()
+            try:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=parallel) as ex:
+                    for fut in concurrent.futures.as_completed(
+                            [ex.submit(_do, f) for f in files]):
+                        angle, r = fut.result()
+                        tr[angle] = r
+                        if r["ok"]:
+                            run.angle_done("transcode", angle)
+                            # Start the upload stage on the FIRST submit, not at
+                            # stage-1 start: the stage span is a duration people
+                            # read, and anchoring it to the transcode's start
+                            # would report the whole overlapped window as upload
+                            # time (~29 min for ~2 min of work on a 3-angle game).
+                            if not up_futs:
+                                run.start_stage("upload")
+                            up_futs.append(up_ex.submit(_do_upload, angle, r))
+                        else:
+                            run.angle_failed("transcode", angle, "ffmpeg failed")
+            finally:
+                _transcode_end()
+            run.finish_stage("transcode")
+
+            for uf in concurrent.futures.as_completed(up_futs):
+                angle, r, err = uf.result()
+                if err is None:
+                    r["uploaded"] = True
+                    run.set_upload(angle, r["key"], r.get("size"))
+                    # full copy-pasteable path in the run log — this is how the
+                    # operator finds the footage (especially 4K passthrough, which
+                    # never touches the annotation tool)
+                    mb = f" ({r['size'] / 1e6:.0f} MB)" if r.get("size") else ""
+                    run.log("info", f"{angle} uploaded -> s3://{BUCKET}/{r['key']}{mb}")
+                    run.angle_done("upload", angle)
+                else:
+                    run.angle_failed("upload", angle, err)
         run.finish_stage("upload")
 
         # STAGE 3 — register FL/FR in the annotation tool
