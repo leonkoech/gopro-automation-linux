@@ -454,6 +454,16 @@ def cut_highlight(fb, cfg, recorder: HighlightRecorder, req: Dict) -> None:
                     get_typer(fb).enqueue(game_id, log_id, angle, final, pre)
             except Exception as e:  # noqa: BLE001
                 logger.warning("typing enqueue failed for %s: %s", log_id, e)
+            # WHO v1 (gated): left-end makes only — NL films the left hoop,
+            # and NL segments live in this same left buffer.
+            try:
+                from agx_pipeline.shot_who_live import get_who, who_enabled
+                if who_enabled() and recorder.side == "left":
+                    get_who(fb, recorder).enqueue(game_id, log_id,
+                                                  float(req["ts_epoch"]),
+                                                  label)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("who enqueue failed for %s: %s", log_id, e)
         for p in (merged, hd, lst):
             try:
                 os.unlink(p)
