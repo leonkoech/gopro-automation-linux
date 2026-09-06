@@ -52,8 +52,21 @@ def _classify_env() -> Dict[str, str]:
     env["LD_LIBRARY_PATH"] = (
         f"{nvlibs}:/usr/local/cuda-12.6/targets/aarch64-linux/lib:"
         f"/usr/local/cuda-12.6/lib64:" + env.get("LD_LIBRARY_PATH", ""))
-    env["SHOT_ATTRIB"] = "possession"
+    # v2 stack — every element fleet-validated on the 505-shot benchmark
+    # (2026-09-05, 86.9%): release-moment attribution, hybrid bbox+ankle feet,
+    # parked-ball filter, catch-and-shoot receiver rescue, fine-tuned ball
+    # detector, and STRICT mode so a degenerate call emits UNKNOWN instead of
+    # a coin flip (the scoreboard never shows a guess).
+    env["SHOT_ATTRIB"] = "release_pose"
     env["SHOT_FEET"] = "bbox"
+    env["SHOT_RP_FEET"] = "ankle+mix"
+    env["SHOT_BALL_PARKFILTER"] = "1"
+    env["SHOT_CS_FIX"] = "1"
+    env["SHOT_TYPE_STRICT"] = "1"
+    ball_w = os.getenv("SHOT_BALL_WEIGHTS_PATH",
+                       os.path.join(TYPING_CWD, "yolo26s_ball_hoop_ft_evalweek_v1.pt"))
+    if os.path.isfile(ball_w):
+        env["SHOT_BALL_WEIGHTS"] = ball_w
     return env
 
 
@@ -104,6 +117,24 @@ class LiveTyper:
             ["python3", "agx_classify.py", angle, clip, f"{item['pre']:.2f}", log_id],
             cwd=TYPING_CWD, env=env, capture_output=True, text=True,
             timeout=CLASSIFY_TIMEOUT_S)
+        # HEALTH-GATED RESCUE (fleet-validated pattern): when the first pass
+        # admits confusion (degenerate scores / no release), one retry with the
+        # rim-anchored ball-path solver — its answer is adopted only when that
+        # pass is itself healthy. Healthy first passes are never touched.
+        deg = re.search(r"pose_degenerate=True", cp.stdout) or             re.search(r"release_f=None", cp.stdout)
+        if deg:
+            env2 = dict(env, SHOT_BALL_SOLVER="1")
+            cp2 = subprocess.run(
+                ["python3", "agx_classify.py", angle, clip,
+                 f"{item['pre']:.2f}", log_id],
+                cwd=TYPING_CWD, env=env2, capture_output=True, text=True,
+                timeout=CLASSIFY_TIMEOUT_S)
+            healthy2 = ("pose_degenerate=False" in cp2.stdout
+                        and "release_f=None" not in cp2.stdout
+                        and "rim_end=no" not in cp2.stdout)
+            if healthy2 and re.search(r"ZONE_NEW=(\w+)", cp2.stdout):
+                cp = cp2
+                logger.info("typing rescue adopted for %s", log_id)
         m_zone = re.search(r"ZONE_NEW=(\w+)", cp.stdout)
         m_who = re.search(r"WHO=#(\w+)", cp.stdout)
         m_proc = re.search(r"([\d.]+)s proc", cp.stdout)
