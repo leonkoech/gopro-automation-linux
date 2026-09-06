@@ -85,7 +85,7 @@ def uploads(monkeypatch):
 def fake_transcode(monkeypatch):
     transcoded = []
 
-    def _fake(src, dst, cfg):
+    def _fake(src, dst, cfg, priority="high"):
         Path(dst).parent.mkdir(parents=True, exist_ok=True)
         Path(dst).write_bytes(b"\x00" * 64)
         transcoded.append(src)

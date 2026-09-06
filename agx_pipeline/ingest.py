@@ -35,8 +35,11 @@ import logging
 import os
 import subprocess
 import threading
+import time
 from datetime import datetime, timezone
 from typing import Dict, Optional
+
+import requests
 
 from uball_client import get_uball_client
 from email_notifier import GameNotification, send_games_ready_email
@@ -66,6 +69,27 @@ MAX_PARALLEL = int(os.getenv("TRANSCODE_PARALLEL", "2"))
 # means it usually is) — transcode every angle in one wave. Falls back to
 # MAX_PARALLEL if a game is being captured. See _stage1_parallel().
 MAX_PARALLEL_IDLE = int(os.getenv("TRANSCODE_PARALLEL_IDLE", "4"))
+# Warm transcode worker (item 1.1, client half). The resident camrec service
+# exposes POST /api/transcode running the same pipeline as _transcode_hw in an
+# already-running container, so the 2-6s docker+CUDA start per clip disappears
+# and one bounded queue arbitrates instead of N racing containers.
+#   auto  try the service, fall back to the container on ANY failure (default)
+#   off   container only — today's behaviour
+#   only  service only, no container fallback; for A/B measurement, not prod
+# Paths are resolved against camrec's RECORD_DIR, whose host side we take from
+# CAMREC_RECORD_DIR — the same value camrec_controller already uses to find
+# recorded masters, so no new deployment assumption. See _warm_host_root().
+WARM_MODE = os.getenv("TRANSCODE_WORKER", "auto").strip().lower()
+WARM_URL = os.getenv("CAMREC_URL", "http://localhost:8000").rstrip("/")
+WARM_ROOT = os.getenv("CAMREC_CONTAINER_ROOT", "/app/data")
+# Output is staged here, inside camrec's root, then moved to the real
+# destination — see _transcode_warm. Dot-prefixed to stay out of camrec's own
+# `camera*_<label>*.mp4` globbing.
+WARM_STAGE_DIR = os.getenv("TRANSCODE_WORKER_STAGE_DIR", ".warm-transcode")
+WARM_HTTP_TIMEOUT = float(os.getenv("TRANSCODE_WORKER_HTTP_TIMEOUT", "20"))
+WARM_POLL_S = float(os.getenv("TRANSCODE_WORKER_POLL_S", "15"))
+# Matches the container path's own `timeout=10800` on subprocess.run.
+WARM_JOB_TIMEOUT = float(os.getenv("TRANSCODE_WORKER_JOB_TIMEOUT", "10800"))
 UBALL_ANGLE = {"FL": "LEFT", "FR": "RIGHT"}  # registered angles (annotation is 2-angle today)
 SETTINGS_COLLECTION = "agx-settings"
 TRANSCODE_DEFAULT = os.getenv("TRANSCODE_ENABLED", "true").lower() in ("1", "true", "yes")
@@ -230,6 +254,144 @@ def _transcode_hw(src: str, dst: str, cfg) -> bool:
     return os.path.isfile(dst) and os.path.getsize(dst) > 0
 
 
+def _warm_host_root(cfg) -> str:
+    """The host directory camrec exposes as WARM_ROOT (its RECORD_DIR).
+
+    Deliberately the SAME value camrec_controller uses to find recorded files
+    (camrec_controller.py:53), so it is correct by construction anywhere the
+    camrec recording backend works at all — no new deployment assumption, and
+    no compose change. Overridable if the two ever diverge.
+    """
+    return (os.getenv("CAMREC_HOST_MOUNT")
+            or os.getenv("CAMREC_RECORD_DIR")
+            or os.path.join(cfg.app_mount, "camrec"))
+
+
+def _warm_path(host_path: str, host_mount: str) -> Optional[str]:
+    """Host path -> the camrec service's view of it, or None if it lies outside
+    the directory camrec exposes.
+
+    The service resolves caller paths against its own RECORD_DIR and refuses
+    anything outside it, so returning None here is the same answer the service
+    would give — we just skip the round trip and fall back to the container.
+    """
+    try:
+        rel = os.path.relpath(os.path.realpath(host_path), os.path.realpath(host_mount))
+    except (ValueError, OSError):
+        return None
+    if os.path.isabs(rel) or rel == os.pardir or rel.startswith(os.pardir + os.sep):
+        return None
+    return os.path.join(WARM_ROOT, rel)
+
+
+def _warm_poll(job_id: str, deadline: float) -> Optional[Dict]:
+    """Long-poll one job to a terminal state. None on any transport failure —
+    the caller treats that as 'use the container instead'."""
+    while True:
+        left = deadline - time.time()
+        if left <= 0:
+            logger.warning("warm transcode %s still running at deadline", job_id)
+            return None
+        try:
+            r = requests.get(f"{WARM_URL}/api/transcode/{job_id}",
+                             params={"wait_s": min(WARM_POLL_S, left)},
+                             timeout=WARM_POLL_S + WARM_HTTP_TIMEOUT)
+            r.raise_for_status()
+            job = r.json()
+        except Exception as e:  # noqa: BLE001
+            logger.warning("warm transcode %s: status read failed: %s", job_id, e)
+            return None
+        if job.get("state") in ("done", "failed", "cancelled"):
+            return job
+
+
+def _transcode_warm(src: str, dst: str, cfg, priority: str = "high") -> bool:
+    """Transcode via the resident camrec service (item 1.1) instead of a fresh
+    container. Same GStreamer pipeline, but the CUDA/NVENC context is already
+    warm — that is the 2-6s per-clip docker+CUDA start this removes — and one
+    bounded queue arbitrates instead of N unrelated containers racing at the
+    end of a quarter.
+
+    Returns True only on a verified output file. EVERY other outcome returns
+    False so the caller falls back to _transcode_hw: this must never be the
+    reason a clip fails to appear.
+    """
+    root = _warm_host_root(cfg)
+    csrc = _warm_path(src, root)
+    if not csrc:
+        # Not a bug: the source was recorded by something other than camrec (the
+        # built-in RecordingController writes under output_dir), so the service
+        # cannot see it. Fall back quietly.
+        logger.debug("warm transcode skipped: %s not under %s", src, root)
+        return False
+    # The service confines writes to its RECORD_DIR too, and ingest's real
+    # destination is output_dir/<label>/1080p — outside it. So stage the output
+    # inside the root and move it after. Same filesystem, so the move is a
+    # rename; a dot-directory keeps it clear of camrec's own file globbing.
+    stage_dir = os.path.join(root, WARM_STAGE_DIR)
+    staged = os.path.join(stage_dir, os.path.basename(dst))
+    cdst = _warm_path(staged, root)
+    if not cdst:
+        return False
+    try:
+        os.makedirs(stage_dir, exist_ok=True)
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+    except OSError as e:
+        logger.warning("warm transcode: cannot prepare %s: %s", stage_dir, e)
+        return False
+    body = {
+        "src": csrc, "dst": cdst,
+        "width": 1920, "height": 1080,
+        "bitrate": int(HW_BITRATE),
+        # Same reasoning as _transcode_hw: IDR every 30 frames keeps the
+        # annotation editor seekable to the second.
+        "iframe_interval": 30, "idr_interval": 30,
+        "priority": priority,
+        "label": os.path.basename(dst),
+        "overwrite": True,
+    }
+    try:
+        r = requests.post(f"{WARM_URL}/api/transcode", json=body, timeout=WARM_HTTP_TIMEOUT)
+        if r.status_code != 201:
+            logger.warning("warm transcode refused (%s): %s",
+                           r.status_code, r.text.strip()[:200])
+            return False
+        job_id = (r.json() or {}).get("id")
+    except Exception as e:  # noqa: BLE001
+        logger.warning("warm transcode unreachable at %s: %s", WARM_URL, e)
+        return False
+    if not job_id:
+        logger.warning("warm transcode accepted but returned no job id")
+        return False
+
+    job = _warm_poll(job_id, time.time() + WARM_JOB_TIMEOUT)
+    if job is None or job.get("state") != "done":
+        state = (job or {}).get("state", "unknown")
+        logger.warning("warm transcode %s ended %s: %s", job_id, state,
+                       str((job or {}).get("error", ""))[:200])
+        _rm(staged)
+        return False
+    if not (os.path.isfile(staged) and os.path.getsize(staged) > 0):
+        # The service reported success but we cannot see its output: the root
+        # is not the directory we think it is. Falling back keeps the clip
+        # alive, and this log is the only symptom a wrong mount produces.
+        logger.warning("warm transcode %s reported done but %s is missing/empty "
+                       "— is %s really camrec's RECORD_DIR?", job_id, staged, root)
+        return False
+    try:
+        os.replace(staged, dst)          # same filesystem: a rename, not a copy
+    except OSError:
+        import shutil
+        try:
+            shutil.move(staged, dst)     # cross-device: correct but slow
+        except OSError as e:
+            logger.warning("warm transcode %s: cannot move %s -> %s: %s",
+                           job_id, staged, dst, e)
+            _rm(staged)
+            return False
+    return os.path.isfile(dst) and os.path.getsize(dst) > 0
+
+
 def _transcode_sw(src: str, dst: str) -> bool:
     """Software libx264 fallback (CPU-heavy; correct but saturates the box)."""
     os.makedirs(os.path.dirname(dst), exist_ok=True)
@@ -250,10 +412,19 @@ def _transcode_sw(src: str, dst: str) -> bool:
     return os.path.isfile(dst) and os.path.getsize(dst) > 0
 
 
-def _transcode_1080p(src: str, dst: str, cfg) -> bool:
-    """Hardware transcode by default, software fallback. TRANSCODE_MODE=hw|sw|auto."""
+def _transcode_1080p(src: str, dst: str, cfg, priority: str = "high") -> bool:
+    """Hardware transcode by default, software fallback. TRANSCODE_MODE=hw|sw|auto.
+
+    `priority` picks the warm worker's lane: "high" for a clip somebody is
+    waiting on (the default — highlight.py's call site), "low" for batch
+    ingest, so a clip cut during a game jumps the ingest queue.
+    """
     mode = os.getenv("TRANSCODE_MODE", "auto")
     if mode in ("hw", "auto"):
+        if WARM_MODE in ("auto", "only") and _transcode_warm(src, dst, cfg, priority):
+            return True
+        if WARM_MODE == "only":
+            return False
         if _transcode_hw(src, dst, cfg):
             return True
         if mode == "hw":
@@ -507,7 +678,9 @@ def run_ingestion(fb, cfg, pipeline_id: str, state: Dict, stopped: Dict, tracker
             if throttled:
                 _capture_throttle.acquire()
             try:
-                ok = _transcode_1080p(f["path"], dst, cfg)
+                # "low" lane: batch work yields to a highlight clip somebody is
+                # waiting on, if one is cut while this ingest is still running.
+                ok = _transcode_1080p(f["path"], dst, cfg, priority="low")
             finally:
                 if throttled:
                     _capture_throttle.release()
