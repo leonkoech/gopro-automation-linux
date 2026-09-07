@@ -147,6 +147,27 @@ class LiveTyper:
         rec = {"zone": zone, "points": _POINTS[zone], "who": who,
                "angle": angle, "typed_at": _utcnow_iso(),
                "proc_s": float(m_proc.group(1)) if m_proc else None}
+        # WHO scan (eval-validated 2026-09-08: ~80% correct-when-spoken, every
+        # game >=75%): seed from this pass's release feet, track that one
+        # player +/-2.5s in the same clip, jersey-vote, speak only on a
+        # dominant vote. Runs on the already-cut clip — no extra I/O.
+        m_feet = re.search(r"feet_px=\((\d+), (\d+)\)", cp.stdout)
+        if (os.getenv("SHOT_LIVE_WHO_SCAN", "false").strip().lower()
+                in ("1", "true", "yes", "on") and m_feet):
+            try:
+                sp = subprocess.run(
+                    ["python3", "who_scan_live.py", clip, "-",
+                     f"{item['pre']:.2f}", m_feet.group(1), m_feet.group(2),
+                     log_id],
+                    cwd=TYPING_CWD, env=env, capture_output=True, text=True,
+                    timeout=int(os.getenv("SHOT_WHO_SCAN_TIMEOUT_S", "150")))
+                m_scan = re.search(r"WHO_SCAN=#(\w+) conf=([\d.]+)", sp.stdout)
+                if m_scan and m_scan.group(1) != "None":
+                    rec["who_scan"] = {"number": m_scan.group(1),
+                                       "conf": float(m_scan.group(2))}
+                    rec["who"] = m_scan.group(1)
+            except Exception as e:  # noqa: BLE001 — scan never blocks typing
+                logger.warning("who-scan failed for %s: %s", log_id, e)
         try:
             self.fb.db.collection("basketball-games").document(item["game_id"]).set(
                 {"cv_points": {log_id: rec}}, merge=True)
