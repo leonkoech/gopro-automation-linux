@@ -15,7 +15,10 @@ Environment variables:
     CHECK_TIMEOUT           — seconds per HTTP attempt (default: 20)
     CHECK_RETRIES           — extra retries after first failure (default: 2)
     CHECK_RETRY_BACKOFF_SEC — seconds between retries (default: 3)
-    STALE_THRESHOLD_MIN     — minutes before a device is considered offline (default: 5)
+    STALE_THRESHOLD_MIN     — fallback: minutes before a device with no
+                              Tailscale "online" flag is considered offline
+                              (default: 5). The API's own "online" flag is
+                              preferred when present.
 """
 
 from __future__ import annotations
@@ -32,7 +35,7 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from typing import Optional
 from urllib.request import Request, urlopen
-from urllib.error import URLError
+from urllib.error import HTTPError, URLError
 
 logging.basicConfig(
     level=logging.INFO,
@@ -47,11 +50,19 @@ TAILSCALE_API_KEY = os.environ.get("TAILSCALE_API_KEY", "")
 # Jetson devices to monitor — hostname must match Tailscale device hostname.
 # Treat empty string the same as unset so callers (e.g. GitHub Actions) can
 # pass JETSON_DEVICES="" without crashing on json.loads.
+# Per-device keys:
+#   name, tailscale_hostname, tailscale_ip  — required
+#   check_service (default True)            — also query the device's
+#       :5000 API for recorder count + disk free. Set False to only check
+#       Tailscale online/offline (e.g. the AGX, which doesn't serve that API;
+#       its recorder health is covered by the camrec exporter + Prometheus).
 _jetson_devices_raw = os.getenv("JETSON_DEVICES", "").strip()
 JETSON_DEVICES = json.loads(_jetson_devices_raw) if _jetson_devices_raw else [
-    {"name": "AGX Orin (agx-1)", "tailscale_hostname": "agxorin001", "tailscale_ip": "100.116.99.109"},
-    {"name": "Jetson Nano 1", "tailscale_hostname": "jetson-nano-002", "tailscale_ip": "100.87.190.71"},
-    {"name": "Jetson Nano 2", "tailscale_hostname": "jetson-nano-001", "tailscale_ip": "100.106.30.98"},
+    {"name": "AGX Orin (agx-1)", "tailscale_hostname": "agxorin001",
+     "tailscale_ip": "100.116.99.109", "check_service": False},
+    # The two Jetson Nanos are decommissioned — intentionally off, so we don't
+    # monitor them (they would just alert as permanently OFFLINE). Add the next
+    # AGX Orin(s) here, or override the whole list via the JETSON_DEVICES env.
 ]
 
 SMTP_HOST = os.environ.get("SMTP_HOST", "smtpout.secureserver.net")
@@ -87,16 +98,29 @@ class JetsonStatus:
     gopro_count: int = 0
     gopro_names: tuple[str, ...] = field(default_factory=tuple)
     gopro_error: Optional[str] = None
+    service_checked: bool = True  # False => only Tailscale online/offline was checked
     error: Optional[str] = None
 
 
 # --- Tailscale API ---
 
+class TailscaleAPIError(RuntimeError):
+    """The Tailscale API itself could not be queried.
+
+    Raised for an expired/revoked key, a network failure, or a malformed
+    response — i.e. cases where we simply do not know any device's state.
+    Distinct from a successful call that happens to return no matching
+    devices, so callers can avoid the false "everything is OFFLINE" alarm.
+    """
+
+
 def get_tailscale_devices() -> dict[str, dict]:
-    """Fetch all devices from Tailscale API, keyed by lowercase hostname."""
+    """Fetch all devices from Tailscale API, keyed by lowercase hostname.
+
+    Raises TailscaleAPIError if the API cannot be queried.
+    """
     if not TAILSCALE_API_KEY:
-        log.error("TAILSCALE_API_KEY not set")
-        return {}
+        raise TailscaleAPIError("TAILSCALE_API_KEY is not set")
 
     req = Request(
         "https://api.tailscale.com/api/v2/tailnet/-/devices?fields=all",
@@ -105,9 +129,17 @@ def get_tailscale_devices() -> dict[str, dict]:
     try:
         with urlopen(req, timeout=CHECK_TIMEOUT) as resp:
             data = json.loads(resp.read())
+    except HTTPError as exc:
+        if exc.code in (401, 403):
+            detail = (
+                f"HTTP {exc.code} - the TAILSCALE_API_KEY has expired or been "
+                f"revoked (Tailscale API keys expire, 90 days by default)"
+            )
+        else:
+            detail = f"HTTP {exc.code} {exc.reason}"
+        raise TailscaleAPIError(detail) from exc
     except (URLError, OSError, json.JSONDecodeError) as exc:
-        log.error("Tailscale API error: %s", exc)
-        return {}
+        raise TailscaleAPIError(f"{type(exc).__name__}: {exc}") from exc
 
     return {
         d["hostname"].lower(): d
@@ -163,7 +195,11 @@ def check_gopros(tailscale_ip: str) -> tuple[int, tuple[str, ...], Optional[floa
 # --- Main check ---
 
 def check_all_jetsons() -> list[JetsonStatus]:
-    """Check all configured Jetsons via Tailscale API + direct GoPro query."""
+    """Check all configured Jetsons via Tailscale API + direct GoPro query.
+
+    Propagates TailscaleAPIError so main() can distinguish "the monitor
+    couldn't check" from "the devices are down".
+    """
     ts_devices = get_tailscale_devices()
     now = datetime.now(timezone.utc)
     statuses: list[JetsonStatus] = []
@@ -172,6 +208,7 @@ def check_all_jetsons() -> list[JetsonStatus]:
         name = cfg["name"]
         ts_hostname = cfg["tailscale_hostname"]
         ts_ip = cfg["tailscale_ip"]
+        check_service = cfg.get("check_service", True)
 
         device = ts_devices.get(ts_hostname.lower())
 
@@ -183,25 +220,34 @@ def check_all_jetsons() -> list[JetsonStatus]:
             ))
             continue
 
-        # Parse lastSeen
+        # Parse lastSeen (used for the "X min ago" display and as a fallback).
         last_seen_str = device.get("lastSeen", "")
         last_seen_ago: Optional[float] = None
-        is_online = False
         if last_seen_str:
             try:
                 last_seen_dt = datetime.fromisoformat(last_seen_str.replace("Z", "+00:00"))
                 last_seen_ago = (now - last_seen_dt).total_seconds() / 60.0
-                is_online = last_seen_ago < STALE_THRESHOLD_MIN
             except ValueError:
                 pass
 
-        # If online, query GoPros directly
+        # Prefer Tailscale's own "online" flag — it reflects the live control-
+        # plane connection. lastSeen can lag several minutes on a device that
+        # is fully connected (relayed heartbeats, clock skew), so the old
+        # "lastSeen < 5 min" heuristic produced false OFFLINE alerts. Fall back
+        # to the staleness check only when the flag is absent.
+        online_flag = device.get("online")
+        if isinstance(online_flag, bool):
+            is_online = online_flag
+        else:
+            is_online = last_seen_ago is not None and last_seen_ago < STALE_THRESHOLD_MIN
+
+        # If online (and configured for it), query the device's :5000 API.
         gopro_count = 0
         gopro_names: tuple[str, ...] = ()
         disk_free_gb: Optional[float] = None
         gopro_error: Optional[str] = None
 
-        if is_online:
+        if is_online and check_service:
             gopro_count, gopro_names, disk_free_gb, gopro_error = check_gopros(ts_ip)
 
         statuses.append(JetsonStatus(
@@ -211,6 +257,7 @@ def check_all_jetsons() -> list[JetsonStatus]:
             disk_free_gb=disk_free_gb,
             gopro_count=gopro_count, gopro_names=gopro_names,
             gopro_error=gopro_error,
+            service_checked=check_service,
         ))
 
     return statuses
@@ -229,7 +276,7 @@ def build_alert(statuses: list[JetsonStatus]) -> Optional[str]:
                 f"CRITICAL — {s.name} ({s.tailscale_hostname}) is OFFLINE{ago}"
                 + (f"\n   {s.error}" if s.error else "")
             )
-        else:
+        elif s.service_checked:
             if s.gopro_error:
                 issues.append(f"WARNING — {s.name}: {s.gopro_error}")
             elif s.gopro_count < EXPECTED_GOPROS:
@@ -254,6 +301,8 @@ def build_alert(statuses: list[JetsonStatus]) -> Optional[str]:
         status_str = "ONLINE" if s.tailscale_online else "OFFLINE"
         if not s.tailscale_online:
             gopro_info = "N/A"
+        elif not s.service_checked:
+            gopro_info = "reachability only"
         elif s.gopro_error:
             gopro_info = "GoPro check unreachable"
         else:
@@ -276,6 +325,8 @@ def compute_alert_signature(statuses: list[JetsonStatus]) -> str:
     for s in sorted(statuses, key=lambda x: x.name):
         if not s.tailscale_online:
             parts.append(f"{s.name}:offline")
+            continue
+        if not s.service_checked:
             continue
         if s.gopro_error:
             parts.append(f"{s.name}:gopro_api_unreachable")
@@ -348,15 +399,58 @@ def send_email(subject: str, body: str) -> None:
 
 # --- Main ---
 
+def handle_api_failure(detail: str) -> None:
+    """Alert (deduped) that the monitor itself couldn't reach the Tailscale API.
+
+    Device state is UNKNOWN for this run — sending the normal "all devices
+    OFFLINE" alert here would be a false alarm.
+    """
+    now = datetime.now(timezone.utc)
+    today_utc = now.strftime("%Y-%m-%d")
+    signature = "tailscale_api:unreachable"
+    subject = "UBALL Alert: Tailscale API check failed (device state unknown)"
+    body = (
+        f"UBALL System Alert — {now.strftime('%Y-%m-%d %H:%M UTC')}\n"
+        + "=" * 50
+        + "\n\n"
+        "The health monitor could not query the Tailscale API, so Jetson / "
+        "GoPro state is UNKNOWN for this run.\n"
+        "This does NOT mean the devices are offline.\n\n"
+        f"   {detail}\n\n"
+        "If this is an auth error, rotate TAILSCALE_API_KEY in the Tailscale "
+        "admin console (Settings -> Keys) and update the monitor's environment.\n"
+    )
+
+    log.error("Tailscale API unreachable — %s", detail)
+
+    if not should_send_alert(signature, today_utc):
+        log.info("API-failure alert suppressed — already emailed today")
+        return
+
+    send_email(subject, body)
+    save_alert_state({
+        "signature": signature,
+        "date": today_utc,
+        "last_sent_at": now.isoformat(),
+        "subject": subject,
+    })
+
+
 def main() -> None:
     log.info("Starting Jetson health check (%d devices)", len(JETSON_DEVICES))
 
-    statuses = check_all_jetsons()
+    try:
+        statuses = check_all_jetsons()
+    except TailscaleAPIError as exc:
+        handle_api_failure(str(exc))
+        return
 
     for s in statuses:
         if not s.tailscale_online:
             log.warning("%s: OFFLINE — last seen %.0f min ago",
                         s.name, s.last_seen_ago_min or -1)
+        elif not s.service_checked:
+            log.info("%s: ONLINE (Tailscale reachability check only)", s.name)
         elif s.gopro_error:
             log.warning("%s: ONLINE but GoPro API unreachable — %s",
                         s.name, s.gopro_error)
@@ -383,10 +477,14 @@ def main() -> None:
         return
 
     offline = [s.name for s in statuses if not s.tailscale_online]
-    unreachable = [s.name for s in statuses if s.tailscale_online and s.gopro_error]
+    unreachable = [
+        s.name for s in statuses
+        if s.tailscale_online and s.service_checked and s.gopro_error
+    ]
     low_gopros = [
         s.name for s in statuses
-        if s.tailscale_online and not s.gopro_error and s.gopro_count < EXPECTED_GOPROS
+        if s.tailscale_online and s.service_checked
+        and not s.gopro_error and s.gopro_count < EXPECTED_GOPROS
     ]
 
     if offline:
