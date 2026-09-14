@@ -1,0 +1,245 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>Orin Scoreboard</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body {
+    width: 100%; height: 100%; background: #000; color: #fff; overflow: hidden;
+    font-family: -apple-system, "Segoe UI", Roboto, system-ui, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  #app { display: flex; flex-direction: column; width: 100vw; height: 100vh; }
+
+  .row { flex: 1; display: flex; align-items: stretch; }
+  .team {
+    flex: 1; display: flex; flex-direction: column; align-items: center;
+    justify-content: center; padding: 2vh 2vw; min-width: 0; position: relative;
+    transition: background 240ms ease;
+  }
+  .team .name {
+    font-size: 5.2vw; font-weight: 800; letter-spacing: 0.01em; text-transform: uppercase;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%;
+    text-shadow: 0 2px 12px rgba(0,0,0,0.5);
+  }
+  .team .score {
+    font-size: 22vw; font-weight: 900; line-height: 0.95;
+    font-variant-numeric: tabular-nums; text-shadow: 0 4px 24px rgba(0,0,0,0.55);
+  }
+  .team .meta {
+    font-size: 2.4vw; font-weight: 700; opacity: 0.9; margin-top: 1vh;
+    font-variant-numeric: tabular-nums;
+  }
+  .poss {
+    position: absolute; top: 3vh; width: 0; height: 0; opacity: 0;
+    border-left: 1.6vw solid transparent; border-right: 1.6vw solid transparent;
+    border-top: 2.4vw solid #ffd54a; transition: opacity 200ms ease;
+  }
+  .team.has-poss .poss { opacity: 1; }
+
+  .center {
+    flex: 0 0 30vw; display: flex; flex-direction: column;
+    align-items: center; justify-content: center; background: #050505;
+    border-left: 2px solid #1a1a1a; border-right: 2px solid #1a1a1a;
+  }
+  #clock {
+    font-size: 13vw; font-weight: 900; font-variant-numeric: tabular-nums;
+    letter-spacing: 0.02em;
+  }
+  #clock.stopped { color: #ff5a5a; }
+  #period { font-size: 3.4vw; font-weight: 800; opacity: 0.85; margin-top: 1vh; text-transform: uppercase; }
+  #bannermsg { font-size: 4vw; font-weight: 800; opacity: 0.9; text-align: center; padding: 0 2vw; }
+
+  #footer {
+    flex: 0 0 auto; display: flex; justify-content: space-between; align-items: center;
+    padding: 0.8vh 1.6vw; font-family: ui-monospace, "SF Mono", Menlo, monospace;
+    font-size: 1.4vh; color: rgba(255,255,255,0.5); background: #000;
+  }
+  #footer .dot { display: inline-block; width: 0.9em; height: 0.9em; border-radius: 50%;
+    background: #888; margin-right: 0.5em; vertical-align: -0.05em; }
+  #footer .dot.ok { background: #35d07f; }
+  #footer .dot.bad { background: #ff5a5a; }
+  #footer .dot.wait { background: #ffd54a; }
+
+  body.state-idle .center, body.state-error .center, body.state-completed .center { flex-basis: 40vw; }
+  .hidden { display: none !important; }
+</style>
+</head>
+<body class="state-connecting">
+<div id="app">
+  <div class="row">
+    <div class="team" id="teamLeft">
+      <div class="poss"></div>
+      <div class="name" id="nameLeft">—</div>
+      <div class="score" id="scoreLeft">0</div>
+      <div class="meta" id="metaLeft">F0 · T0</div>
+    </div>
+
+    <div class="center">
+      <div id="clock">--:--</div>
+      <div id="period">&nbsp;</div>
+      <div id="bannermsg" class="hidden"></div>
+    </div>
+
+    <div class="team" id="teamRight">
+      <div class="poss"></div>
+      <div class="name" id="nameRight">—</div>
+      <div class="score" id="scoreRight">0</div>
+      <div class="meta" id="metaRight">F0 · T0</div>
+    </div>
+  </div>
+
+  <div id="footer">
+    <span id="conn"><span class="dot wait"></span>connecting…</span>
+    <span id="build">orin-display</span>
+  </div>
+</div>
+
+<script>
+(function () {
+  "use strict";
+
+  var els = {
+    body: document.body,
+    nameL: document.getElementById("nameLeft"),
+    nameR: document.getElementById("nameRight"),
+    scoreL: document.getElementById("scoreLeft"),
+    scoreR: document.getElementById("scoreRight"),
+    metaL: document.getElementById("metaLeft"),
+    metaR: document.getElementById("metaRight"),
+    teamL: document.getElementById("teamLeft"),
+    teamR: document.getElementById("teamRight"),
+    clock: document.getElementById("clock"),
+    period: document.getElementById("period"),
+    banner: document.getElementById("bannermsg"),
+    conn: document.getElementById("conn"),
+    build: document.getElementById("build"),
+  };
+
+  var state = null;
+  var skewMs = 0;               // serverEpochMs - Date.now() at last event
+  var lastEventAt = 0;
+  var eventCount = 0;
+  var connState = "connecting";
+  var lastClockText = "";
+
+  fetch("/build").then(function (r) { return r.json(); })
+    .then(function (d) { if (d && d.build) els.build.textContent = d.build; })
+    .catch(function () {});
+
+  function serverNow() { return Date.now() + skewMs; }
+
+  function contrastText(hex) {
+    if (!hex || hex[0] !== "#" || hex.length < 7) return "#fff";
+    var r = parseInt(hex.substr(1, 2), 16),
+        g = parseInt(hex.substr(3, 2), 16),
+        b = parseInt(hex.substr(5, 2), 16);
+    return (0.299 * r + 0.587 * g + 0.114 * b) > 140 ? "#0a0a0a" : "#ffffff";
+  }
+
+  function fmtClock(ms) {
+    if (ms < 0) ms = 0;
+    var total = Math.ceil(ms / 1000);
+    var m = Math.floor(total / 60), s = total % 60;
+    return m + ":" + (s < 10 ? "0" + s : s);
+  }
+
+  function remainingMs() {
+    if (!state || !state.clock) return 0;
+    var c = state.clock;
+    if (!c.isRunning) return c.baseGameTime || 0;
+    return (c.baseGameTime || 0) - (serverNow() - (c.anchorMs || serverNow()));
+  }
+
+  function renderClock() {
+    var st = state && state.status;
+    if (st === "idle" || st === "error" || st === "completed") return;
+    var txt = fmtClock(remainingMs());
+    if (txt !== lastClockText) {
+      els.clock.textContent = txt;
+      lastClockText = txt;
+    }
+    els.clock.classList.toggle("stopped", !(state && state.clock && state.clock.isRunning));
+  }
+
+  function applyTeam(side, t) {
+    t = t || {};
+    var nameEl = side === "left" ? els.nameL : els.nameR;
+    var scoreEl = side === "left" ? els.scoreL : els.scoreR;
+    var metaEl = side === "left" ? els.metaL : els.metaR;
+    var panel = side === "left" ? els.teamL : els.teamR;
+    nameEl.textContent = t.displayName || t.name || "—";
+    scoreEl.textContent = (t.score != null ? t.score : 0);
+    metaEl.textContent = "F" + (t.fouls || 0) + " · T" + (t.timeoutsUsed || 0);
+    var bg = t.jerseyColor || "#222";
+    panel.style.background = "linear-gradient(160deg, " + bg + " 0%, rgba(0,0,0,0.35) 130%)";
+    var fg = contrastText(bg);
+    nameEl.style.color = fg; scoreEl.style.color = fg; metaEl.style.color = fg;
+  }
+
+  function render() {
+    if (!state) return;
+    var st = state.status;
+    els.body.className = "state-" + st;
+
+    if (st === "idle" || st === "error" || st === "completed") {
+      els.banner.classList.remove("hidden");
+      els.clock.classList.add("hidden");
+      els.period.classList.add("hidden");
+      els.banner.textContent =
+        st === "idle" ? "Waiting for game…" :
+        st === "completed" ? "Final" :
+        ("Display error — " + (state.error || "check the Orin service"));
+    } else {
+      els.banner.classList.add("hidden");
+      els.clock.classList.remove("hidden");
+      els.period.classList.remove("hidden");
+      els.period.textContent = state.period || "";
+    }
+
+    applyTeam("left", state.left);
+    applyTeam("right", state.right);
+    els.teamL.classList.toggle("has-poss", state.possession === "left");
+    els.teamR.classList.toggle("has-poss", state.possession === "right");
+
+    lastClockText = "";
+    renderClock();
+  }
+
+  function setConn(s, cls) {
+    connState = s;
+    updateFooter();
+  }
+
+  function updateFooter() {
+    var age = lastEventAt ? Math.round((Date.now() - lastEventAt) / 1000) : "–";
+    var cls = connState === "open" ? "ok" : connState === "connecting" ? "wait" : "bad";
+    var src = state ? (state.source || "?") + (state.gameId ? " · " + String(state.gameId).slice(0, 8) : "") : "";
+    els.conn.innerHTML = '<span class="dot ' + cls + '"></span>' +
+      "SSE " + connState + " · upd " + age + "s · evt " + eventCount + (src ? " · " + src : "");
+  }
+
+  var es = new EventSource("/events");
+  es.onopen = function () { setConn("open"); };
+  es.onerror = function () { setConn("reconnecting"); };
+  es.onmessage = function (e) {
+    try {
+      var next = JSON.parse(e.data);
+    } catch (err) { return; }
+    if (typeof next.serverEpochMs === "number") skewMs = next.serverEpochMs - Date.now();
+    state = next;
+    lastEventAt = Date.now();
+    eventCount++;
+    setConn("open");
+    render();
+  };
+
+  setInterval(renderClock, 250);
+  setInterval(updateFooter, 1000);
+})();
+</script>
+</body>
+</html>

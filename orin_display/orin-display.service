@@ -1,0 +1,34 @@
+# Orin LAN scoreboard display — read-only relay.
+#
+# Separate service, separate port (8090). Does NOT touch agx-ingestion / recording.
+# Reuses .env.agx only for FIREBASE_CREDENTIALS_PATH.
+#
+# Install (one-time, on the AGX):
+#   sudo cp /home/dev/gopro-automation-linux/orin_display/orin-display.service \
+#           /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now orin-display
+#   systemctl status orin-display
+#
+# Paths below match the AGX layout (repo at /home/dev/gopro-automation-linux,
+# user `dev`, env file .env.agx). Adjust if yours differs.
+
+[Unit]
+Description=Orin LAN scoreboard display (read-only SSE relay)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=dev
+WorkingDirectory=/home/dev/gopro-automation-linux
+EnvironmentFile=-/home/dev/gopro-automation-linux/.env.agx
+Environment=ORIN_DISPLAY_PORT=8090
+# Uncomment to run the synthetic demo game (no Firebase):
+# Environment=ORIN_DISPLAY_DEMO=1
+ExecStart=/usr/bin/python3 -m orin_display.app
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
