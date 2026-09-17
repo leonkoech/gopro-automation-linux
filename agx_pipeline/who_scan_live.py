@@ -99,9 +99,26 @@ def spoken(vote):
 
 
 def track_and_read(cap, seed_box, t_seed, vote):
+    # WHERE to seed and WHAT STRETCH to scan are different questions. The feet
+    # are measured at TAKEOFF, 1.4-2.4s before the rim, so +/-WIN around that
+    # seed ends near the rim and misses the seconds AFTER release, where jersey
+    # numbers actually become legible (measured 2026-09-17: first read a median
+    # +3.4s after the rim).
+    #
+    # Applied ONLY on the aligned-seed path. Priced on the SHIPPING path across
+    # both games: cb9e1294 +1 correct but +1 wrong (precision 80.0 -> 77.8%),
+    # 7cef734e no change -- the same coverage-for-precision trade this pipeline
+    # already rejected for the +/-5s window. So the default path keeps its
+    # ORIGINAL bound, condition included, and is unchanged to the frame.
+    _fwd_to = max(t_seed + WIN, RIM_S + WIN)
     for direction in (1, -1):
         box, t = seed_box, t_seed
-        while abs(t - t_seed) <= WIN:
+        while True:
+            if _aligned and direction > 0:
+                if t + direction * STEP > _fwd_to:
+                    break
+            elif abs(t - t_seed) > WIN:
+                break
             t += direction * STEP
             img, boxes = players_at(cap, t)
             if img is None or not boxes:
@@ -127,16 +144,32 @@ _seed_s = os.getenv("SHOT_WHO_SEED_S", "").strip()
 # a missing/!unusable seed degrades to exactly today's behaviour
 _times = ([float(_seed_s)] if _seed_s not in ("", "None") else []) \
     + [RIM_S - 1.0, RIM_S - 1.4, RIM_S - 0.6]
-for _t in _times:
+_aligned = _seed_s not in ("", "None")
+_margin = float(os.getenv("SHOT_WHO_SEED_MARGIN_PX", "40"))
+for _i, _t in enumerate(_times):
     img, boxes = players_at(cap_fl, _t)
     if img is None or not boxes:
         continue
     d = [np.hypot((b[0]+b[2])/2 - FEET[0], b[3] - FEET[1]) for b in boxes]
     j = int(np.argmin(d))
-    if d[j] < 180:
-        seed, seed_t = boxes[j], _t
-        add_read(img, seed, vote)
-        break
+    if d[j] >= 180:
+        continue
+    # Seeding at the caller's frame MOVES the seed; it does not verify it. On
+    # 7cef734e the move landed on a different player 3 times (2 went silent,
+    # 1 read the wrong number) for 2 gained. So when two players are both
+    # plausibly "at" those feet, this is a guess -- and this module does not
+    # guess. Fall through to the legacy offsets instead. Applied ONLY to the
+    # aligned seed, so the fallback path stays byte-identical to before.
+    if _aligned and _i == 0 and len(d) > 1:
+        _second = sorted(d)[1]
+        if _second - d[j] < _margin:
+            print(f"[who_seed: {len(boxes)} players near those feet at {_t:.2f}s "
+                  f"({d[j]:.0f}px vs {_second:.0f}px) -- ambiguous, using the "
+                  f"rim-relative seed instead]", flush=True)
+            continue
+    seed, seed_t = boxes[j], _t
+    add_read(img, seed, vote)
+    break
 if seed is not None and not spoken(vote):
     track_and_read(cap_fl, seed, seed_t, vote)
 cap_fl.release()

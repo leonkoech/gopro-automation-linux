@@ -159,8 +159,19 @@ class LiveTyper:
         if (os.getenv("SHOT_LIVE_WHO_SCAN", "false").strip().lower()
                 in ("1", "true", "yes", "on") and m_feet):
             try:
+                # OFF by default. Two-game measurement (2026-09-17):
+                #   cb9e1294  +4 / -0  coverage 49.0->56.9%, precision 82.8%
+                #   7cef734e  +2 / -3  coverage 50.0->48.0%, precision 75.0%
+                # Pooled +6/-3, but it LOWERS precision on the game it was not
+                # developed against, and this pipeline is precision-first. The
+                # residual failure is seed-box QUALITY, not identity: at the
+                # takeoff frame the detector often returns a PARTIAL box (418.5:
+                # 108px wide vs 167px a second later, both the correct player),
+                # and the IoU chain breaks on the next step. Revisit with that
+                # fixed. SHOT_WHO_SEED_ALIGN=1 to enable.
                 scan_env = dict(env)
-                if m_seed:
+                if m_seed and os.getenv("SHOT_WHO_SEED_ALIGN", "").strip().lower() \
+                        in ("1", "true", "yes", "on"):
                     scan_env["SHOT_WHO_SEED_S"] = m_seed.group(1)
                 sp = subprocess.run(
                     ["python3", "who_scan_live.py", clip, "-",
