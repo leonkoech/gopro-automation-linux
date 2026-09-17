@@ -18,6 +18,13 @@ Env:
   SHOT_WHO_ROSTER   comma-separated jersey numbers for the shooting team
                     (from check-in; empty -> accept any read)
   SHOT_WHO_WIN      scan half-window seconds (default 2.5)
+  SHOT_WHO_SEED_S   seed at THIS time in the clip (the frame the typing stack
+                    actually measured the feet at). Without it the seed is
+                    rim-1.0s, which is a DIFFERENT instant from the one the feet
+                    describe -- a player runs 100+px in that gap, so the nearest
+                    box can be a neighbour, and the scan then tracks him
+                    perfectly. Measured 2026-09-17 on cb9e1294: 21.6% of shots
+                    tracked one wrong player cleanly to a confident read.
   SHOT_WHO_STEP     sampling step seconds (default 0.15)
   SHOT_WHO_NL_OFF   NL clock offset vs FL seconds (default 0)
   SHOT_WHO_MIN      vote floor to speak (default 3.0)
@@ -115,14 +122,19 @@ def track_and_read(cap, seed_box, t_seed, vote):
 vote: Counter = Counter()
 cap_fl = cv2.VideoCapture(FL_CLIP)
 seed, seed_t = None, None
-for dt in (-1.0, -1.4, -0.6):
-    img, boxes = players_at(cap_fl, RIM_S + dt)
+_seed_s = os.getenv("SHOT_WHO_SEED_S", "").strip()
+# the caller's own feet frame first, then the historical offsets as fallback so
+# a missing/!unusable seed degrades to exactly today's behaviour
+_times = ([float(_seed_s)] if _seed_s not in ("", "None") else []) \
+    + [RIM_S - 1.0, RIM_S - 1.4, RIM_S - 0.6]
+for _t in _times:
+    img, boxes = players_at(cap_fl, _t)
     if img is None or not boxes:
         continue
     d = [np.hypot((b[0]+b[2])/2 - FEET[0], b[3] - FEET[1]) for b in boxes]
     j = int(np.argmin(d))
     if d[j] < 180:
-        seed, seed_t = boxes[j], RIM_S + dt
+        seed, seed_t = boxes[j], _t
         add_read(img, seed, vote)
         break
 if seed is not None and not spoken(vote):
