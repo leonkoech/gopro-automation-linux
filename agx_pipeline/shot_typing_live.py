@@ -152,14 +152,21 @@ class LiveTyper:
         # player +/-2.5s in the same clip, jersey-vote, speak only on a
         # dominant vote. Runs on the already-cut clip — no extra I/O.
         m_feet = re.search(r"feet_px=\((\d+), (\d+)\)", cp.stdout)
+        # Seed the scan at the frame those feet were MEASURED at, not at
+        # rim-1.0s. The two instants differ by up to ~1.8s, which is enough for
+        # the nearest-box seed to land on a neighbour and track him instead.
+        m_seed = re.search(r"feet_s=([\d.]+)", cp.stdout)
         if (os.getenv("SHOT_LIVE_WHO_SCAN", "false").strip().lower()
                 in ("1", "true", "yes", "on") and m_feet):
             try:
+                scan_env = dict(env)
+                if m_seed:
+                    scan_env["SHOT_WHO_SEED_S"] = m_seed.group(1)
                 sp = subprocess.run(
                     ["python3", "who_scan_live.py", clip, "-",
                      f"{item['pre']:.2f}", m_feet.group(1), m_feet.group(2),
                      log_id],
-                    cwd=TYPING_CWD, env=env, capture_output=True, text=True,
+                    cwd=TYPING_CWD, env=scan_env, capture_output=True, text=True,
                     timeout=int(os.getenv("SHOT_WHO_SCAN_TIMEOUT_S", "150")))
                 m_scan = re.search(r"WHO_SCAN=#(\w+) conf=([\d.]+)", sp.stdout)
                 if m_scan and m_scan.group(1) != "None":
