@@ -26,6 +26,13 @@ from glob import glob
 sys.path.insert(0, "/home/dev")
 sys.path.insert(0, "/home/dev/gopro-automation-linux")
 from gt_eval import load_gt  # noqa: E402  (same-box module; reuses UballClient)
+# The typing knobs MUST come from production rather than a copy. This module used
+# to duplicate the recipe and silently fell behind: production moved to the v2
+# stack (release_pose, ankle+mix feet, STRICT) while the copy here still passed
+# possession, so an eval run would have scored a chain nobody actually runs and
+# reported it as the production number. A hard import is deliberate -- a figure
+# measured against the wrong stack is worse than no figure at all.
+from agx_pipeline.shot_typing_live import _classify_env as _production_classify_env  # noqa: E402
 
 OUT = "/home/dev/gt_eval"
 TYPING_CWD = os.getenv("SHOT_TYPING_CWD", "/home/dev/shot_typing")
@@ -43,15 +50,13 @@ def log(m):
 
 
 def classify_env():
-    """Same CUDA/knob recipe as production LiveTyper._classify_env."""
-    env = os.environ.copy()
-    nvlibs = ":".join(glob(
-        "/home/dev/.local/lib/python3.10/site-packages/nvidia/*/lib"))
-    env["LD_LIBRARY_PATH"] = (
-        f"{nvlibs}:/usr/local/cuda-12.6/targets/aarch64-linux/lib:"
-        f"/usr/local/cuda-12.6/lib64:" + env.get("LD_LIBRARY_PATH", ""))
-    env["SHOT_ATTRIB"] = "possession"
-    env["SHOT_FEET"] = "bbox"
+    """Production's own knob recipe, with this harness's rim anchor.
+
+    Everything about HOW a shot is typed comes from LiveTyper._classify_env, so
+    this eval cannot drift from what the box runs. Only the rim anchor differs,
+    and that is a property of how this harness cuts its clips, not of the chain.
+    """
+    env = _production_classify_env()
     env["SHOT_RIM_TS"] = f"{PRE_S:.2f}"
     return env
 
