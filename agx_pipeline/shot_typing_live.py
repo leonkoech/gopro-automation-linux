@@ -39,8 +39,14 @@ def typing_enabled() -> bool:
     return os.getenv("SHOT_LIVE_TYPING", "false").strip().lower() in ("1", "true", "yes", "on")
 
 
-def preflight() -> Optional[str]:
+def preflight(cwd: Optional[str] = None) -> Optional[str]:
     """Why typing cannot run, or None when it can.
+
+    `cwd` defaults to this module's TYPING_CWD. It is a parameter so a caller
+    that resolved the working dir itself -- scripts/stage_check.py does -- can
+    check the directory it means rather than the one this module happened to
+    read at import time. Two components disagreeing about which directory they
+    are talking about is how this class of fault hides.
 
     This exists because typing failed silently for fifteen days. agx_classify.py
     in TYPING_CWD was a symlink into a scratch directory that a disk cleanup had
@@ -48,9 +54,10 @@ def preflight() -> Optional[str]:
     (rc=2) and the queue logged nothing but that number. isfile() is False for a
     dangling symlink, which is exactly the case that got us.
     """
-    script = os.path.join(TYPING_CWD, "agx_classify.py")
-    if not os.path.isdir(TYPING_CWD):
-        return f"SHOT_TYPING_CWD does not exist: {TYPING_CWD}"
+    base = cwd or TYPING_CWD
+    script = os.path.join(base, "agx_classify.py")
+    if not os.path.isdir(base):
+        return f"SHOT_TYPING_CWD does not exist: {base}"
     if os.path.islink(script) and not os.path.exists(script):
         return f"classifier is a DANGLING SYMLINK: {script} -> {os.readlink(script)}"
     if not os.path.isfile(script):
