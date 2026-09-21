@@ -39,6 +39,27 @@ def typing_enabled() -> bool:
     return os.getenv("SHOT_LIVE_TYPING", "false").strip().lower() in ("1", "true", "yes", "on")
 
 
+def preflight() -> Optional[str]:
+    """Why typing cannot run, or None when it can.
+
+    This exists because typing failed silently for fifteen days. agx_classify.py
+    in TYPING_CWD was a symlink into a scratch directory that a disk cleanup had
+    removed, so every spawn died instantly on python's own "can't open file"
+    (rc=2) and the queue logged nothing but that number. isfile() is False for a
+    dangling symlink, which is exactly the case that got us.
+    """
+    script = os.path.join(TYPING_CWD, "agx_classify.py")
+    if not os.path.isdir(TYPING_CWD):
+        return f"SHOT_TYPING_CWD does not exist: {TYPING_CWD}"
+    if os.path.islink(script) and not os.path.exists(script):
+        return f"classifier is a DANGLING SYMLINK: {script} -> {os.readlink(script)}"
+    if not os.path.isfile(script):
+        return f"classifier not found: {script}"
+    if not os.access(script, os.R_OK):
+        return f"classifier not readable: {script}"
+    return None
+
+
 def _utcnow_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -77,6 +98,12 @@ class LiveTyper:
 
     def __init__(self, fb):
         self.fb = fb
+        broken = preflight()
+        if broken:
+            logger.error("TYPING IS ENABLED BUT CANNOT RUN — %s. Every shot will "
+                         "stay pending until this is fixed.", broken)
+        else:
+            logger.info("typing preflight ok — %s/agx_classify.py", TYPING_CWD)
         self._q: "queue.Queue[Dict]" = queue.Queue(maxsize=64)
         self._thread = threading.Thread(target=self._run, name="shot-typing-live",
                                         daemon=True)
@@ -140,8 +167,16 @@ class LiveTyper:
         m_proc = re.search(r"([\d.]+)s proc", cp.stdout)
         zone = m_zone.group(1) if m_zone else None
         if zone not in _POINTS:
-            logger.warning("typing no-zone for %s (zone=%s rc=%d) — stays pending",
-                           log_id, zone, cp.returncode)
+            # A non-zero rc means the classifier never reached a verdict, and its
+            # stderr says why. Logging only the number is what hid a dead symlink
+            # for fifteen days — the answer was in cp.stderr the whole time.
+            if cp.returncode != 0:
+                tail = (cp.stderr or "").strip().splitlines()[-3:]
+                logger.error("typing FAILED for %s (rc=%d): %s", log_id,
+                             cp.returncode, " | ".join(tail) or "<no stderr>")
+            else:
+                logger.warning("typing no-zone for %s (zone=%s rc=0) — stays pending",
+                               log_id, zone)
             return
         who = m_who.group(1) if m_who and m_who.group(1) != "None" else None
         rec = {"zone": zone, "points": _POINTS[zone], "who": who,
