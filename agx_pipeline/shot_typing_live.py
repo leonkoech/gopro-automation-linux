@@ -39,6 +39,27 @@ def typing_enabled() -> bool:
     return os.getenv("SHOT_LIVE_TYPING", "false").strip().lower() in ("1", "true", "yes", "on")
 
 
+def preflight() -> Optional[str]:
+    """Why typing cannot run, or None when it can.
+
+    This exists because typing failed silently for fifteen days. agx_classify.py
+    in TYPING_CWD was a symlink into a scratch directory that a disk cleanup had
+    removed, so every spawn died instantly on python's own "can't open file"
+    (rc=2) and the queue logged nothing but that number. isfile() is False for a
+    dangling symlink, which is exactly the case that got us.
+    """
+    script = os.path.join(TYPING_CWD, "agx_classify.py")
+    if not os.path.isdir(TYPING_CWD):
+        return f"SHOT_TYPING_CWD does not exist: {TYPING_CWD}"
+    if os.path.islink(script) and not os.path.exists(script):
+        return f"classifier is a DANGLING SYMLINK: {script} -> {os.readlink(script)}"
+    if not os.path.isfile(script):
+        return f"classifier not found: {script}"
+    if not os.access(script, os.R_OK):
+        return f"classifier not readable: {script}"
+    return None
+
+
 def _utcnow_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -52,8 +73,21 @@ def _classify_env() -> Dict[str, str]:
     env["LD_LIBRARY_PATH"] = (
         f"{nvlibs}:/usr/local/cuda-12.6/targets/aarch64-linux/lib:"
         f"/usr/local/cuda-12.6/lib64:" + env.get("LD_LIBRARY_PATH", ""))
-    env["SHOT_ATTRIB"] = "possession"
+    # v2 stack — every element fleet-validated on the 505-shot benchmark
+    # (2026-09-05, 86.9%): release-moment attribution, hybrid bbox+ankle feet,
+    # parked-ball filter, catch-and-shoot receiver rescue, fine-tuned ball
+    # detector, and STRICT mode so a degenerate call emits UNKNOWN instead of
+    # a coin flip (the scoreboard never shows a guess).
+    env["SHOT_ATTRIB"] = "release_pose"
     env["SHOT_FEET"] = "bbox"
+    env["SHOT_RP_FEET"] = "ankle+mix"
+    env["SHOT_BALL_PARKFILTER"] = "1"
+    env["SHOT_CS_FIX"] = "1"
+    env["SHOT_TYPE_STRICT"] = "1"
+    ball_w = os.getenv("SHOT_BALL_WEIGHTS_PATH",
+                       os.path.join(TYPING_CWD, "yolo26s_ball_hoop_ft_evalweek_v1.pt"))
+    if os.path.isfile(ball_w):
+        env["SHOT_BALL_WEIGHTS"] = ball_w
     return env
 
 
@@ -64,6 +98,12 @@ class LiveTyper:
 
     def __init__(self, fb):
         self.fb = fb
+        broken = preflight()
+        if broken:
+            logger.error("TYPING IS ENABLED BUT CANNOT RUN — %s. Every shot will "
+                         "stay pending until this is fixed.", broken)
+        else:
+            logger.info("typing preflight ok — %s/agx_classify.py", TYPING_CWD)
         self._q: "queue.Queue[Dict]" = queue.Queue(maxsize=64)
         self._thread = threading.Thread(target=self._run, name="shot-typing-live",
                                         daemon=True)
@@ -104,18 +144,83 @@ class LiveTyper:
             ["python3", "agx_classify.py", angle, clip, f"{item['pre']:.2f}", log_id],
             cwd=TYPING_CWD, env=env, capture_output=True, text=True,
             timeout=CLASSIFY_TIMEOUT_S)
+        # HEALTH-GATED RESCUE (fleet-validated pattern): when the first pass
+        # admits confusion (degenerate scores / no release), one retry with the
+        # rim-anchored ball-path solver — its answer is adopted only when that
+        # pass is itself healthy. Healthy first passes are never touched.
+        deg = re.search(r"pose_degenerate=True", cp.stdout) or             re.search(r"release_f=None", cp.stdout)
+        if deg:
+            env2 = dict(env, SHOT_BALL_SOLVER="1")
+            cp2 = subprocess.run(
+                ["python3", "agx_classify.py", angle, clip,
+                 f"{item['pre']:.2f}", log_id],
+                cwd=TYPING_CWD, env=env2, capture_output=True, text=True,
+                timeout=CLASSIFY_TIMEOUT_S)
+            healthy2 = ("pose_degenerate=False" in cp2.stdout
+                        and "release_f=None" not in cp2.stdout
+                        and "rim_end=no" not in cp2.stdout)
+            if healthy2 and re.search(r"ZONE_NEW=(\w+)", cp2.stdout):
+                cp = cp2
+                logger.info("typing rescue adopted for %s", log_id)
         m_zone = re.search(r"ZONE_NEW=(\w+)", cp.stdout)
         m_who = re.search(r"WHO=#(\w+)", cp.stdout)
         m_proc = re.search(r"([\d.]+)s proc", cp.stdout)
         zone = m_zone.group(1) if m_zone else None
         if zone not in _POINTS:
-            logger.warning("typing no-zone for %s (zone=%s rc=%d) — stays pending",
-                           log_id, zone, cp.returncode)
+            # A non-zero rc means the classifier never reached a verdict, and its
+            # stderr says why. Logging only the number is what hid a dead symlink
+            # for fifteen days — the answer was in cp.stderr the whole time.
+            if cp.returncode != 0:
+                tail = (cp.stderr or "").strip().splitlines()[-3:]
+                logger.error("typing FAILED for %s (rc=%d): %s", log_id,
+                             cp.returncode, " | ".join(tail) or "<no stderr>")
+            else:
+                logger.warning("typing no-zone for %s (zone=%s rc=0) — stays pending",
+                               log_id, zone)
             return
         who = m_who.group(1) if m_who and m_who.group(1) != "None" else None
         rec = {"zone": zone, "points": _POINTS[zone], "who": who,
                "angle": angle, "typed_at": _utcnow_iso(),
                "proc_s": float(m_proc.group(1)) if m_proc else None}
+        # WHO scan (eval-validated 2026-09-08: ~80% correct-when-spoken, every
+        # game >=75%): seed from this pass's release feet, track that one
+        # player +/-2.5s in the same clip, jersey-vote, speak only on a
+        # dominant vote. Runs on the already-cut clip — no extra I/O.
+        m_feet = re.search(r"feet_px=\((\d+), (\d+)\)", cp.stdout)
+        # Seed the scan at the frame those feet were MEASURED at, not at
+        # rim-1.0s. The two instants differ by up to ~1.8s, which is enough for
+        # the nearest-box seed to land on a neighbour and track him instead.
+        m_seed = re.search(r"feet_s=([\d.]+)", cp.stdout)
+        if (os.getenv("SHOT_LIVE_WHO_SCAN", "false").strip().lower()
+                in ("1", "true", "yes", "on") and m_feet):
+            try:
+                # OFF by default. Two-game measurement (2026-09-17):
+                #   cb9e1294  +4 / -0  coverage 49.0->56.9%, precision 82.8%
+                #   7cef734e  +2 / -3  coverage 50.0->48.0%, precision 75.0%
+                # Pooled +6/-3, but it LOWERS precision on the game it was not
+                # developed against, and this pipeline is precision-first. The
+                # residual failure is seed-box QUALITY, not identity: at the
+                # takeoff frame the detector often returns a PARTIAL box (418.5:
+                # 108px wide vs 167px a second later, both the correct player),
+                # and the IoU chain breaks on the next step. Revisit with that
+                # fixed. SHOT_WHO_SEED_ALIGN=1 to enable.
+                scan_env = dict(env)
+                if m_seed and os.getenv("SHOT_WHO_SEED_ALIGN", "").strip().lower() \
+                        in ("1", "true", "yes", "on"):
+                    scan_env["SHOT_WHO_SEED_S"] = m_seed.group(1)
+                sp = subprocess.run(
+                    ["python3", "who_scan_live.py", clip, "-",
+                     f"{item['pre']:.2f}", m_feet.group(1), m_feet.group(2),
+                     log_id],
+                    cwd=TYPING_CWD, env=scan_env, capture_output=True, text=True,
+                    timeout=int(os.getenv("SHOT_WHO_SCAN_TIMEOUT_S", "150")))
+                m_scan = re.search(r"WHO_SCAN=#(\w+) conf=([\d.]+)", sp.stdout)
+                if m_scan and m_scan.group(1) != "None":
+                    rec["who_scan"] = {"number": m_scan.group(1),
+                                       "conf": float(m_scan.group(2))}
+                    rec["who"] = m_scan.group(1)
+            except Exception as e:  # noqa: BLE001 — scan never blocks typing
+                logger.warning("who-scan failed for %s: %s", log_id, e)
         try:
             self.fb.db.collection("basketball-games").document(item["game_id"]).set(
                 {"cv_points": {log_id: rec}}, merge=True)
