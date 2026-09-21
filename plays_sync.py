@@ -196,6 +196,15 @@ def create_plays_from_firebase_logs(
 _HOOP_ANGLE = {"left": "LEFT", "right": "RIGHT"}
 
 
+# Written on every CV card. It is a PLACEHOLDER, not a measurement: the value is
+# identical for a textbook shot and a marginal one, so nothing downstream can
+# rank or threshold on it. The annotation editor shows a green/red flag off this
+# field, so while it stays constant every CV card flags the same way. Giving it
+# real signal means joining the typing verdict (cv_points.{logId}, which carries
+# trust/STRICT-UNKNOWN) onto the card at ingest.
+CV_PLACEHOLDER_CONFIDENCE = 0.5
+
+
 def create_plays_from_shot_live(
     client: Any,
     uball_game_id: str,
@@ -209,8 +218,16 @@ def create_plays_from_shot_live(
     Tagged `source="cv"` so annotators can tell these from scoreboard cards AND so
     this is idempotent on CV cards (re-runs won't duplicate). The CV knows the hoop
     (angle LEFT/RIGHT) and make/miss but NOT the point value (→ FG_MAKE/FG_MISS,
-    2pt assumed) or the team (left for the annotator). Low confidence (0.5) flags
-    them as CV-suggested + review-needed (~65% recall / ~80% precision shadow).
+    2pt assumed) or the team (left for the annotator).
+
+    Detection — a card at the right moment with the rim and make/miss — measures
+    ~99%. The earlier "~65% recall / ~80% precision" noted here was a stale
+    shadow-mode figure and is not what this stage does.
+
+    Every card is written with CV_PLACEHOLDER_CONFIDENCE: see the constant. The
+    point VALUE (2/3/4) is produced by the typing stage and lands separately on
+    the Firebase game doc at `cv_points.{logId}` — it is not joined onto these
+    cards yet, which is why the classification below is only make/miss.
 
     `dry_run` counts without writing. Returns the number created (or would create).
     """
@@ -276,12 +293,12 @@ def create_plays_from_shot_live(
             "start_timestamp": max(0.0, ts - 5.0),
             "end_timestamp": ts + 3.0,
             "source": "cv",
-            "confidence": 0.5,
+            "confidence": CV_PLACEHOLDER_CONFIDENCE,
             "events": [{
                 "label": classification,
                 "playerA": None, "playerAId": None,
                 "playerB": None, "playerBId": None,
-                "confidence": 0.5,
+                "confidence": CV_PLACEHOLDER_CONFIDENCE,
             }],
         }
         if angle:
