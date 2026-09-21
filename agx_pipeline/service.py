@@ -737,6 +737,23 @@ if __name__ == "__main__":
         # is_gpu_free() (nothing recording/ingesting). Dormant unless SHOT_QA_ENABLED.
         from agx_pipeline.shot_detect.qa import start_worker as _start_qa_worker
         _start_qa_worker(FB, CFG, is_gpu_free)
+    # Typing health at BOOT, not at the first make. LiveTyper is built lazily on
+    # the first shot, so without this the box looks healthy all day and only
+    # admits it cannot type once a game is already running.
+    try:
+        from agx_pipeline.shot_typing_live import preflight as _typing_preflight
+        from agx_pipeline.shot_typing_live import typing_enabled as _typing_on
+        if _typing_on():
+            _broken = _typing_preflight()
+            if _broken:
+                logger.error("TYPING ENABLED BUT CANNOT RUN — %s. Shots will stay "
+                             "pending until this is fixed.", _broken)
+            else:
+                logger.info("typing preflight ok")
+        else:
+            logger.info("live typing disabled (SHOT_LIVE_TYPING)")
+    except Exception as _e:  # noqa: BLE001 — a health check never blocks boot
+        logger.warning("typing preflight check failed to run: %s", _e)
     logger.info("AGX service starting on :%d (firebase=%s, cameras=%d, relay=%s, auto_record=%s)",
                 port, FB is not None, len(CFG.cameras), _RELAY is not None, AUTO_RECORD)
     app.run(host="0.0.0.0", port=port)
