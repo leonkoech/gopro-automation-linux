@@ -122,15 +122,27 @@ def decide_zone(stdout: str, returncode: int) -> Tuple[Optional[str], float, str
     zone = m_zone.group(1) if m_zone else None
     if zone in _POINTS:
         return zone, CONF_COMMITTED, "strict"
-    # STRICT declined. It does that on a degenerate pose even when the geometric
-    # zone is serviceable: on cb9e1294 all 9 declined field goals had trust=True
-    # and ZONE_OLD was RIGHT on 6 of them. Silence was the safe choice while
-    # nobody saw these verdicts; the cards now reach an annotator who reviews
-    # every one, so a flagged answer beats no answer.
-    m_old = re.search(r"ZONE_OLD=(\w+)", stdout)
-    if (m_old and m_old.group(1) in _POINTS and "trust=True" in stdout
-            and returncode == 0):
-        return m_old.group(1), CONF_FALLBACK, "geometric_fallback"
+    # STRICT declined (degenerate pose). Falling back to the geometric zone
+    # looks attractive — ZONE_OLD was right on 6 of the 9 declined field goals
+    # on cb9e1294 — and it is OFF because measuring it at the level that
+    # matters showed it buys nothing.
+    #
+    # An unanswered shot does not produce a blank card: plays_sync labels it
+    # FG_MAKE, i.e. it already assumes 2PT. Over the 12 shots the fallback fires
+    # on, it predicts 2PT for 10 of them, so it agrees with that assumption
+    # almost everywhere. Card-level accuracy measured 37/45 with it and 37/45
+    # without — identical — and both land red-flagged (0.4 vs the 0.5
+    # placeholder, both under the editor's 0.7), so the annotator sees no
+    # difference either. All it adds is complexity and seven verdicts that look
+    # wrong in the metrics.
+    #
+    # Kept behind a flag rather than deleted because the measurement is
+    # game-specific and the code is cheap to re-test: SHOT_TYPE_FALLBACK=1.
+    if os.getenv("SHOT_TYPE_FALLBACK") == "1":
+        m_old = re.search(r"ZONE_OLD=(\w+)", stdout)
+        if (m_old and m_old.group(1) in _POINTS and "trust=True" in stdout
+                and returncode == 0):
+            return m_old.group(1), CONF_FALLBACK, "geometric_fallback"
     return None, 0.0, "none"
 
 

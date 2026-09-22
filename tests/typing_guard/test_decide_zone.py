@@ -6,6 +6,7 @@ classify knobs and silently fell a whole stack behind, reporting numbers for a
 chain nobody ran; this is that trap one level down.
 """
 
+import os
 import sys
 from pathlib import Path
 
@@ -40,15 +41,29 @@ def test_free_throw_is_a_real_zone_not_a_failure():
     assert z == "FREE_THROW" and src == "strict"
 
 
+@pytest.fixture
+def fallback_on(monkeypatch):
+    monkeypatch.setenv("SHOT_TYPE_FALLBACK", "1")
+
+
 @pytest.mark.unit
-def test_unknown_falls_back_to_the_geometric_zone_at_low_confidence():
+def test_the_geometric_fallback_is_OFF_by_default():
+    """Measured on cb9e1294: it buys nothing. An unanswered shot still gets a
+    card labelled FG_MAKE (2PT assumed), the fallback predicts 2PT on 10 of the
+    12 shots it fires for, and card accuracy was 37/45 either way."""
+    assert os.getenv("SHOT_TYPE_FALLBACK") != "1"
+    assert decide_zone(out("UNKNOWN", old="3PT"), 0) == (None, 0.0, "none")
+
+
+@pytest.mark.unit
+def test_unknown_falls_back_to_the_geometric_zone_when_enabled(fallback_on):
     z, c, src = decide_zone(out("UNKNOWN", old="3PT"), 0)
     assert (z, c, src) == ("3PT", CONF_FALLBACK, "geometric_fallback")
     assert c < CONF_COMMITTED
 
 
 @pytest.mark.unit
-def test_the_fallback_is_flagged_below_the_editor_threshold():
+def test_the_fallback_is_flagged_below_the_editor_threshold(fallback_on):
     """components/editor/playSource.ts flags green at >= 0.7. A fallback must
     land red, or an annotator reads a geometric guess as a committed call."""
     _, c, _ = decide_zone(out("UNKNOWN"), 0)
@@ -56,18 +71,18 @@ def test_the_fallback_is_flagged_below_the_editor_threshold():
 
 
 @pytest.mark.unit
-def test_no_fallback_when_the_chain_did_not_trust_itself():
+def test_no_fallback_when_the_chain_did_not_trust_itself(fallback_on):
     assert decide_zone(out("UNKNOWN", trust="False"), 0) == (None, 0.0, "none")
 
 
 @pytest.mark.unit
-def test_no_fallback_when_the_process_failed():
+def test_no_fallback_when_the_process_failed(fallback_on):
     """rc != 0 means it never reached a verdict; ZONE_OLD would be meaningless."""
     assert decide_zone(out("UNKNOWN"), 2) == (None, 0.0, "none")
 
 
 @pytest.mark.unit
-def test_no_fallback_when_the_geometric_zone_is_also_unusable():
+def test_no_fallback_when_the_geometric_zone_is_also_unusable(fallback_on):
     assert decide_zone(out("UNKNOWN", old="UNKNOWN"), 0) == (None, 0.0, "none")
 
 
