@@ -286,10 +286,31 @@ class LiveShotScorer:
 
         if detector is not None and hasattr(detector, "empty_cache"):
             detector.empty_cache()   # free the pool on the way out
-        self._write_shadow(game_id, shadow, n_seg, t0, status="stopped")
-        shutil.rmtree(seg_dir, ignore_errors=True)   # segments are ephemeral; master is durable
-        logger.info("shot-live stopped game=%s segments=%d shots=%d",
-                    game_id, n_seg, len(shadow))
+
+        # WHAT NEVER GOT SCANNED. The loop exits the moment stop_evt is set, and
+        # this detector runs below real time, so at game end the queue still
+        # holds however far behind it had fallen. cb9e1294 (2026-09-14) stopped
+        # 442s behind: the last 7.4 minutes were never scanned, 16 ground-truth
+        # shots went undetected -- 37% of that game's entire coverage gap -- and
+        # the old code rmtree'd the evidence and logged only "shots=163".
+        # Two separate faults were hidden there: the loss, and its silence.
+        leftover = self._closed_segments(seg_dir, processed)
+        unscanned_s = len({idx for idx, _, _ in leftover}) * SHOT_SEGMENT_SEC
+        self._write_shadow(game_id, shadow, n_seg, t0, status="stopped",
+                           unscanned=len(leftover), unscanned_s=unscanned_s)
+        if leftover:
+            # Keep them. They are the only copy of that span at scan resolution,
+            # and at ~3.6MB/segment a whole game is single-digit GB. Deleting
+            # them is what made this unrecoverable rather than merely late.
+            kept = self._keep_unscanned(seg_dir, leftover, game_id)
+            logger.warning(
+                "shot-live stopped with %d UNSCANNED segments (~%.0fs of play) — "
+                "shots in that span were NOT detected. Kept %d for a deferred "
+                "scan at %s", len(leftover), unscanned_s, kept, seg_dir)
+        else:
+            shutil.rmtree(seg_dir, ignore_errors=True)   # nothing pending; master is durable
+        logger.info("shot-live stopped game=%s segments=%d shots=%d unscanned=%d",
+                    game_id, n_seg, len(shadow), len(leftover))
 
     # ---- per-window (recall fixes: sliding window + rim accumulation) ------- #
     def _process_window(self, scan, detector, rims, path, idx, angle, fps, imgsz,
@@ -463,6 +484,46 @@ class LiveShotScorer:
                     shot.get("side"), game_id, shot.get("wallclock"))
 
     # ---- helpers ----------------------------------------------------------- #
+    def _keep_unscanned(self, seg_dir: str, leftover: List, game_id: str) -> int:
+        """Retain only the segments that were never scanned, plus a manifest.
+
+        The scanned ones are deleted immediately -- they have already yielded
+        whatever shots they held, and keeping a whole game is ~6GB. What is left
+        is the span the detector ran out of time on, which is the only copy of
+        that footage at scan resolution once the master is uploaded and pruned.
+
+        Returns how many segments were kept. Best-effort throughout: this runs
+        on the way out of the detector thread and must never raise.
+        """
+        keep = {os.path.basename(path) for _, _, path in leftover}
+        kept = 0
+        try:
+            for fn in os.listdir(seg_dir):
+                if not _SEG_RE.match(fn):
+                    continue
+                if fn in keep:
+                    kept += 1
+                    continue
+                try:
+                    os.unlink(os.path.join(seg_dir, fn))
+                except OSError:
+                    pass
+        except OSError as e:
+            logger.warning("shot-live could not prune %s: %s", seg_dir, e)
+            return 0
+        # A deferred scanner needs to know which game these belong to; the
+        # directory is named by recording label, not game id.
+        try:
+            with open(os.path.join(seg_dir, "UNSCANNED.json"), "w") as fh:
+                json.dump({"game_id": game_id,
+                           "segments": sorted(keep),
+                           "n_segments": kept,
+                           "written_at": _utcnow_iso(),
+                           "reason": "detector stopped behind real time"}, fh, indent=1)
+        except OSError as e:  # noqa: BLE001 — the segments matter, the manifest is a convenience
+            logger.warning("shot-live could not write UNSCANNED manifest: %s", e)
+        return kept
+
     def _closed_segments(self, seg_dir: str, processed: set) -> List:
         """Finalized segments not yet processed, oldest first. A segment is closed
         once a higher-index segment for the SAME angle exists (splitmuxsink writes
@@ -521,7 +582,8 @@ class LiveShotScorer:
 
     def _write_shadow(self, game_id: str, shadow: List[Dict], n_seg: int,
                       t0: float, status: str,
-                      backlog: Optional[Dict] = None) -> None:
+                      backlog: Optional[Dict] = None,
+                      unscanned: int = 0, unscanned_s: float = 0.0) -> None:
         if not self.fb:
             return
         n_make = sum(1 for s in shadow if s["made"])
@@ -540,6 +602,12 @@ class LiveShotScorer:
                                 if s["made"] and s.get("side") == "right"),
             "backlog": (backlog or {}).get("now", 0),
             "max_backlog": (backlog or {}).get("max", 0),
+            # Segments the loop never got to before the game stopped. Non-zero
+            # means shots in that span were NOT detected -- it is the difference
+            # between "the CV found 163 shots" and "the CV looked at the whole
+            # game and found 163 shots".
+            "unscanned_segments": unscanned,
+            "unscanned_secs": round(unscanned_s, 1),
             "shots": shadow[-SHADOW_CAP:], "secs": round(time.time() - t0, 1),
             "updated_at": _utcnow_iso(),
         }
