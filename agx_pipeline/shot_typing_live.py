@@ -24,7 +24,7 @@ import re
 import subprocess
 import threading
 from datetime import datetime, timezone
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 from logging_service import get_logger
 
@@ -108,6 +108,32 @@ def _classify_env() -> Dict[str, str]:
     return env
 
 
+def decide_zone(stdout: str, returncode: int) -> Tuple[Optional[str], float, str]:
+    """The zone, its confidence, and where it came from.
+
+    Pulled out of _type() so an evaluation harness can score the SAME decision
+    production makes rather than reimplementing it. scripts/gt_eval/type_eval.py
+    kept its own copy of the classify knobs and silently fell a whole stack
+    behind; this is the same trap one level down.
+
+    Returns (None, 0.0, "none") when no zone is defensible.
+    """
+    m_zone = re.search(r"ZONE_NEW=(\w+)", stdout)
+    zone = m_zone.group(1) if m_zone else None
+    if zone in _POINTS:
+        return zone, CONF_COMMITTED, "strict"
+    # STRICT declined. It does that on a degenerate pose even when the geometric
+    # zone is serviceable: on cb9e1294 all 9 declined field goals had trust=True
+    # and ZONE_OLD was RIGHT on 6 of them. Silence was the safe choice while
+    # nobody saw these verdicts; the cards now reach an annotator who reviews
+    # every one, so a flagged answer beats no answer.
+    m_old = re.search(r"ZONE_OLD=(\w+)", stdout)
+    if (m_old and m_old.group(1) in _POINTS and "trust=True" in stdout
+            and returncode == 0):
+        return m_old.group(1), CONF_FALLBACK, "geometric_fallback"
+    return None, 0.0, "none"
+
+
 class LiveTyper:
     """Serialized clip->shot-type queue. enqueue() never blocks the highlight
     path: a full queue drops the item with a warning (that make just stays
@@ -179,27 +205,13 @@ class LiveTyper:
             if healthy2 and re.search(r"ZONE_NEW=(\w+)", cp2.stdout):
                 cp = cp2
                 logger.info("typing rescue adopted for %s", log_id)
-        m_zone = re.search(r"ZONE_NEW=(\w+)", cp.stdout)
         m_who = re.search(r"WHO=#(\w+)", cp.stdout)
         m_proc = re.search(r"([\d.]+)s proc", cp.stdout)
-        zone = m_zone.group(1) if m_zone else None
-        confidence, degenerate = CONF_COMMITTED, ("pose_degenerate=True" in cp.stdout)
-        zone_source = "strict"
-        if zone not in _POINTS:
-            # STRICT declined. It does that on a degenerate pose even when the
-            # geometric zone is perfectly serviceable: on cb9e1294 all 9 declined
-            # field goals had trust=True and ZONE_OLD was RIGHT on 6 of them.
-            # Silence used to be the safe choice, but these cards now reach an
-            # annotator with a confidence flag, and they review every one — so a
-            # flagged answer beats no answer. It is emitted at CONF_FALLBACK so
-            # the card shows red and nobody mistakes it for a committed call.
-            m_old = re.search(r"ZONE_OLD=(\w+)", cp.stdout)
-            if (m_old and m_old.group(1) in _POINTS and "trust=True" in cp.stdout
-                    and cp.returncode == 0):
-                zone = m_old.group(1)
-                confidence, zone_source = CONF_FALLBACK, "geometric_fallback"
-                logger.info("typing fallback for %s -> %s (strict declined, "
-                            "degenerate=%s)", log_id, zone, degenerate)
+        degenerate = "pose_degenerate=True" in cp.stdout
+        zone, confidence, zone_source = decide_zone(cp.stdout, cp.returncode)
+        if zone_source == "geometric_fallback":
+            logger.info("typing fallback for %s -> %s (strict declined, "
+                        "degenerate=%s)", log_id, zone, degenerate)
         if zone not in _POINTS:
             # A non-zero rc means the classifier never reached a verdict, and its
             # stderr says why. Logging only the number is what hid a dead symlink
