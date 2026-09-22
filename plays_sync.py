@@ -204,6 +204,36 @@ _HOOP_ANGLE = {"left": "LEFT", "right": "RIGHT"}
 # trust/STRICT-UNKNOWN) onto the card at ingest.
 CV_PLACEHOLDER_CONFIDENCE = 0.5
 
+# The typing stage's zone -> the annotation vocabulary, for a made and a missed
+# shot. Without this join a CV card says only FG_MAKE/FG_MISS, even though the
+# chain already worked out 2/3/4PT and free throws at 96% accuracy (measured on
+# cb9e1294, 2026-09-22) and wrote it to cv_points.{logId} on the game doc.
+_ZONE_CLASS = {
+    ("2PT", True): "FG_MAKE",              ("2PT", False): "FG_MISS",
+    ("3PT", True): "3PT_MAKE",             ("3PT", False): "3PT_MISS",
+    ("4PT", True): "4PT_MAKE",             ("4PT", False): "4PT_MISS",
+    ("FREE_THROW", True): "FREE_THROW_MAKE",
+    ("FREE_THROW", False): "FREE_THROW_MISS",
+}
+
+
+def _typing_verdict(cv_points: Dict[str, Any], shot: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """The typing verdict for this shot, or None.
+
+    Keyed the way shot_detect/live.py builds it: cv_{int(wallclock epoch)}_{side}.
+    Only MAKES have one — a highlight clip, and therefore a typing pass, is only
+    cut for a made shot — so misses keep the generic label.
+    """
+    side, wc = shot.get("side"), shot.get("wallclock")
+    if not (cv_points and side and wc):
+        return None
+    try:
+        epoch = int(datetime.fromisoformat(wc).timestamp())
+    except Exception:  # noqa: BLE001
+        return None
+    v = cv_points.get(f"cv_{epoch}_{side}")
+    return v if isinstance(v, dict) else None
+
 
 def create_plays_from_shot_live(
     client: Any,
@@ -255,8 +285,24 @@ def create_plays_from_shot_live(
 
     created = 0
     by_label: Dict[str, int] = {}
+    cv_points = firebase_game.get("cv_points") or {}
+    n_typed = 0
     for s in shots:
         classification = "FG_MAKE" if s.get("made") else "FG_MISS"
+        confidence = CV_PLACEHOLDER_CONFIDENCE
+        # Upgrade to the real shot type when typing reached a verdict, and carry
+        # ITS confidence rather than the flat placeholder — that number is what
+        # the editor's green/red flag reads.
+        _v = _typing_verdict(cv_points, s)
+        if _v:
+            _typed = _ZONE_CLASS.get((_v.get("zone"), bool(s.get("made"))))
+            if _typed:
+                classification = _typed
+                n_typed += 1
+                try:
+                    confidence = float(_v.get("confidence", CV_PLACEHOLDER_CONFIDENCE))
+                except (TypeError, ValueError):
+                    pass
         # Video-timeline seconds: prefer wallclock - game_start; fall back to the
         # segment offset. Approximate (SL/SR vs tracking-cam sync) — the annotator
         # nudges it; the card + rough position is what saves them the work.
@@ -293,12 +339,12 @@ def create_plays_from_shot_live(
             "start_timestamp": max(0.0, ts - 5.0),
             "end_timestamp": ts + 3.0,
             "source": "cv",
-            "confidence": CV_PLACEHOLDER_CONFIDENCE,
+            "confidence": confidence,
             "events": [{
                 "label": classification,
                 "playerA": None, "playerAId": None,
                 "playerB": None, "playerBId": None,
-                "confidence": CV_PLACEHOLDER_CONFIDENCE,
+                "confidence": confidence,
             }],
         }
         if angle:
@@ -318,5 +364,6 @@ def create_plays_from_shot_live(
     logger.info(f"[PlaysSync/CV] {'(dry-run) ' if dry_run else ''}created {created}/{len(shots)} "
                 f"CV cards for game {uball_game_id}")
     if summary is not None:
-        summary.update({"created": created, "by_label": by_label, "skipped_existing": False})
+        summary.update({"created": created, "by_label": by_label,
+                        "typed_from_cv_points": n_typed, "skipped_existing": False})
     return created
