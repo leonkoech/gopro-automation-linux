@@ -32,7 +32,17 @@ logger = get_logger("agx.shot_typing_live")
 
 TYPING_CWD = os.getenv("SHOT_TYPING_CWD", "/home/dev/shot_typing")
 CLASSIFY_TIMEOUT_S = int(os.getenv("SHOT_TYPING_TIMEOUT_S", "240"))
-_POINTS = {"2PT": 2, "3PT": 3, "4PT": 4}
+# The classifier emits FREE_THROW as a zone (agx_classify: zone_new = "FREE_THROW").
+# It was missing here, so every correctly-typed free throw fell through the
+# "zone not in _POINTS" branch and was discarded as if the chain had failed —
+# 4 of 8 matched free throws on cb9e1294 were typed right and thrown away.
+_POINTS = {"2PT": 2, "3PT": 3, "4PT": 4, "FREE_THROW": 1}
+
+# Confidence carried onto the annotator's card. Two levels, not a scale: the
+# chain either committed to a zone or fell back to geometry, and the card shows
+# a green/red flag off exactly this number.
+CONF_COMMITTED = 0.9     # STRICT produced a zone
+CONF_FALLBACK = 0.4      # STRICT declined (degenerate pose); geometric zone only
 
 
 def typing_enabled() -> bool:
@@ -173,6 +183,23 @@ class LiveTyper:
         m_who = re.search(r"WHO=#(\w+)", cp.stdout)
         m_proc = re.search(r"([\d.]+)s proc", cp.stdout)
         zone = m_zone.group(1) if m_zone else None
+        confidence, degenerate = CONF_COMMITTED, ("pose_degenerate=True" in cp.stdout)
+        zone_source = "strict"
+        if zone not in _POINTS:
+            # STRICT declined. It does that on a degenerate pose even when the
+            # geometric zone is perfectly serviceable: on cb9e1294 all 9 declined
+            # field goals had trust=True and ZONE_OLD was RIGHT on 6 of them.
+            # Silence used to be the safe choice, but these cards now reach an
+            # annotator with a confidence flag, and they review every one — so a
+            # flagged answer beats no answer. It is emitted at CONF_FALLBACK so
+            # the card shows red and nobody mistakes it for a committed call.
+            m_old = re.search(r"ZONE_OLD=(\w+)", cp.stdout)
+            if (m_old and m_old.group(1) in _POINTS and "trust=True" in cp.stdout
+                    and cp.returncode == 0):
+                zone = m_old.group(1)
+                confidence, zone_source = CONF_FALLBACK, "geometric_fallback"
+                logger.info("typing fallback for %s -> %s (strict declined, "
+                            "degenerate=%s)", log_id, zone, degenerate)
         if zone not in _POINTS:
             # A non-zero rc means the classifier never reached a verdict, and its
             # stderr says why. Logging only the number is what hid a dead symlink
@@ -188,7 +215,11 @@ class LiveTyper:
         who = m_who.group(1) if m_who and m_who.group(1) != "None" else None
         rec = {"zone": zone, "points": _POINTS[zone], "who": who,
                "angle": angle, "typed_at": _utcnow_iso(),
-               "proc_s": float(m_proc.group(1)) if m_proc else None}
+               "proc_s": float(m_proc.group(1)) if m_proc else None,
+               # Carried onto the annotation card by plays_sync: what the chain
+               # decided, and how much it is worth.
+               "confidence": confidence, "zone_source": zone_source,
+               "pose_degenerate": degenerate}
         # WHO scan (eval-validated 2026-09-08: ~80% correct-when-spoken, every
         # game >=75%): seed from this pass's release feet, track that one
         # player +/-2.5s in the same clip, jersey-vote, speak only on a
