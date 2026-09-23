@@ -81,6 +81,23 @@ SHADOW_CAP = int(os.getenv("SHOT_LIVE_SHADOW_CAP", "500"))   # max shots kept in
 SHOT_LIVE_WINDOW = os.getenv("SHOT_LIVE_WINDOW", "true").strip().lower() in ("1", "true", "yes", "on")
 RIM_MIN_SAMPLES = int(os.getenv("SHOT_LIVE_RIM_MIN", "8"))
 HOOP_ACC_CAP = int(os.getenv("SHOT_LIVE_HOOP_CAP", "5000"))
+# Full-rate CONFIRM. The ball model sees every SHOT_LIVE_STRIDE-th frame (4 =>
+# ~30 samples/s on ~120fps FLIRs), but logic.py's gates were ported verbatim from
+# a runner validated at FULL rate: MIN_EVIDENCE=5 at-rim samples, rim visits of
+# >=2 consecutive samples. A clean swish is in the rim zone for 0.1-0.2s -- 2-5
+# samples at stride 4 -- and is silently gated out. Swishes are mostly 3PT, 4PT
+# and free throws, which is why those classes are detected at 50-69% while 2PT
+# sits at 88%. Root-caused 2026-08-11 (commit 34c1d6c) and never acted on.
+#
+# Re-scanning here would cost ~+27% GPU per camera on a loop already at ~94% of
+# real time, so it would only make the end-of-game backlog worse. The live loop
+# therefore just KEEPS each gated segment whose track came within CONFIRM_RHO rim
+# radii (plus any segment skipped as stale), and shot_detect/confirm.py
+# re-decides them at full rate at ingest, before cards are built. Measured on
+# identical frames: makes 29 -> 37, re-reading 16% of segments.
+CONFIRM_ENABLED = os.getenv("SHOT_CONFIRM_ENABLED", "false").strip().lower() in (
+    "1", "true", "yes", "on")
+CONFIRM_RHO = float(os.getenv("SHOT_CONFIRM_RHO", "1.6"))   # = logic V41 RIM_NEAR
 # Freshness guard: skip (never scan) closed segments older than this — a verdict
 # that old can't cut a clip anyway (the highlight buffer holds ~10 min), and
 # scanning a stale backlog keeps the loop stale forever. Night 1: a 54-min
@@ -206,6 +223,8 @@ class LiveShotScorer:
         rims: Dict = {}
         hoop_acc: Dict[str, Dict] = {}   # angle -> {cx,cy,w,h} accumulated hoop samples (rim)
         prev_seg: Dict[str, tuple] = {}  # angle -> (idx, path) kept for the sliding window
+        self._confirm_keep: Dict[str, Dict[int, str]] = {}  # angle -> {idx: path} to re-read at full rate
+        self._seg_reals: Dict[str, List[float]] = {}        # angle -> measured segment durations (s)
         processed: set = set()
         scored: List[Dict] = []          # {wallclock_epoch, side} — dedup ledger
         shadow: List[Dict] = []          # detections for the shadow field
@@ -257,6 +276,8 @@ class LiveShotScorer:
                         stale = True
                     if stale:
                         n_stale += 1
+                        if CONFIRM_ENABLED:      # ran out of time -- re-read at ingest
+                            self._confirm_keep.setdefault(angle, {})[idx] = path
                         self._advance_prev(prev_seg, angle, idx, path)
                         continue
                     n_seg += 1
@@ -298,15 +319,22 @@ class LiveShotScorer:
         unscanned_s = len({idx for idx, _, _ in leftover}) * SHOT_SEGMENT_SEC
         self._write_shadow(game_id, shadow, n_seg, t0, status="stopped",
                            unscanned=len(leftover), unscanned_s=unscanned_s)
-        if leftover:
+        confirm = [(i, a, p) for a, d in getattr(self, "_confirm_keep", {}).items()
+                   for i, p in d.items() if os.path.exists(p)]
+        if leftover or confirm:
             # Keep them. They are the only copy of that span at scan resolution,
             # and at ~3.6MB/segment a whole game is single-digit GB. Deleting
             # them is what made this unrecoverable rather than merely late.
-            kept = self._keep_unscanned(seg_dir, leftover, game_id)
-            logger.warning(
-                "shot-live stopped with %d UNSCANNED segments (~%.0fs of play) — "
-                "shots in that span were NOT detected. Kept %d for a deferred "
-                "scan at %s", len(leftover), unscanned_s, kept, seg_dir)
+            kept = self._keep_unscanned(seg_dir, leftover, game_id, confirm=confirm,
+                                        hoop_acc=hoop_acc, fps=fps)
+            if leftover:
+                logger.warning(
+                    "shot-live stopped with %d UNSCANNED segments (~%.0fs of play) — "
+                    "shots in that span were NOT detected. Kept %d for a deferred "
+                    "scan at %s", len(leftover), unscanned_s, kept, seg_dir)
+            if confirm:
+                logger.info("shot-live kept %d gated-at-rim segments for a full-rate "
+                            "confirm at ingest (%s)", len(confirm), seg_dir)
         else:
             shutil.rmtree(seg_dir, ignore_errors=True)   # nothing pending; master is durable
         logger.info("shot-live stopped game=%s segments=%d shots=%d unscanned=%d",
@@ -369,7 +397,9 @@ class LiveShotScorer:
         seg_close, seg_real = _seg_real_time(path, prev)
         n_segs = (idx - base_idx) + 1
         side = _HOOP_SIDE.get(angle)
-        for v in logic.decide(G, track):
+        verdicts = logic.decide(G, track)
+        self._note_confirm(angle, idx, path, G, track, verdicts, seg_real)
+        for v in verdicts:
             if "verdict" not in v:
                 continue
             t_shot = float(v.get("t", 0.0))
@@ -435,15 +465,30 @@ class LiveShotScorer:
         finally:
             _rm(lst)
 
-    @staticmethod
-    def _advance_prev(prev_seg: Dict, angle: str, idx: int, path: str) -> None:
+    def _advance_prev(self, prev_seg: Dict, angle: str, idx: int, path: str) -> None:
         """Delete the segment that just aged out of the window (fully consumed —
         it led one window; the master is the durable copy) and keep the current
-        one as the next window's lead."""
+        one as the next window's lead. A full-rate confirm candidate is NOT
+        deleted: it is the only copy at scan resolution the confirm pass has."""
         old = prev_seg.get(angle)
-        if old and old[1] != path:
+        if old and old[1] != path and not self._is_confirm_candidate(angle, old[0]):
             _rm(old[1])
         prev_seg[angle] = (idx, path)
+
+    def _is_confirm_candidate(self, angle: str, idx: int) -> bool:
+        return idx in getattr(self, "_confirm_keep", {}).get(angle, {})
+
+    def _note_confirm(self, angle: str, idx: int, path: str, G, track: List,
+                      verdicts: List[Dict], seg_real: Optional[float]) -> None:
+        """Record this segment's measured duration, and keep it for the
+        full-rate confirm if stride-4 gated it while the ball was at the rim."""
+        if seg_real:
+            self._seg_reals.setdefault(angle, []).append(float(seg_real))
+        if not CONFIRM_ENABLED or any("verdict" in v for v in verdicts):
+            return
+        lim = CONFIRM_RHO ** 2
+        if any(G.rho(t[1], t[2]) < lim for t in track):
+            self._confirm_keep.setdefault(angle, {})[idx] = path
 
     # ---- Phase C seam (NOT yet wired to the visible scoreboard) ------------- #
     def _maybe_highlight(self, game_id: str, shot: Dict) -> None:
@@ -484,7 +529,28 @@ class LiveShotScorer:
                     shot.get("side"), game_id, shot.get("wallclock"))
 
     # ---- helpers ----------------------------------------------------------- #
-    def _keep_unscanned(self, seg_dir: str, leftover: List, game_id: str) -> int:
+    @staticmethod
+    def _manifest_rims(hoop_acc: Optional[Dict]) -> Dict:
+        """The running-median rim each angle was being decided against, so the
+        full-rate pass judges with the same geometry the live loop used."""
+        out: Dict = {}
+        if not hoop_acc:
+            return out
+        try:
+            from agx_pipeline.shot_detect.backtest import scan as _scan
+            for angle, acc in hoop_acc.items():
+                if len(acc.get("cx", [])) >= RIM_MIN_SAMPLES:
+                    rim = _scan.rim_from_hoops(acc["cx"], acc["cy"], acc["w"], acc["h"])
+                    if rim:
+                        out[angle] = rim
+        except Exception as e:  # noqa: BLE001 — the manifest must still be written
+            logger.warning("shot-live could not summarise rims: %s", e)
+        return out
+
+    def _keep_unscanned(self, seg_dir: str, leftover: List, game_id: str,
+                        confirm: Optional[List] = None,
+                        hoop_acc: Optional[Dict] = None,
+                        fps: Optional[float] = None) -> int:
         """Retain only the segments that were never scanned, plus a manifest.
 
         The scanned ones are deleted immediately -- they have already yielded
@@ -495,7 +561,9 @@ class LiveShotScorer:
         Returns how many segments were kept. Best-effort throughout: this runs
         on the way out of the detector thread and must never raise.
         """
-        keep = {os.path.basename(path) for _, _, path in leftover}
+        unscanned = {os.path.basename(path) for _, _, path in leftover}
+        confirm_names = {os.path.basename(path) for _, _, path in (confirm or [])}
+        keep = unscanned | confirm_names
         kept = 0
         try:
             for fn in os.listdir(seg_dir):
@@ -518,8 +586,25 @@ class LiveShotScorer:
                 json.dump({"game_id": game_id,
                            "segments": sorted(keep),
                            "n_segments": kept,
+                           "unscanned": sorted(unscanned),
+                           "confirm": sorted(confirm_names),
                            "written_at": _utcnow_iso(),
-                           "reason": "detector stopped behind real time"}, fh, indent=1)
+                           "reason": ("detector stopped behind real time"
+                                      if unscanned else
+                                      "gated at stride 4 with the ball at the rim"),
+                           # What the full-rate pass needs once this loop is gone:
+                           # the rim it was deciding against, each segment's true
+                           # duration (splitmuxsink cuts on media time the FLIRs
+                           # do not deliver), and every kept file's close time.
+                           "fps": fps,
+                           "rims": self._manifest_rims(hoop_acc),
+                           "seg_real": {a: sorted(v)[len(v) // 2]
+                                        for a, v in getattr(self, "_seg_reals", {}).items()
+                                        if v},
+                           "close": {fn: os.path.getmtime(os.path.join(seg_dir, fn))
+                                     for fn in keep
+                                     if os.path.exists(os.path.join(seg_dir, fn))}},
+                          fh, indent=1)
         except OSError as e:  # noqa: BLE001 — the segments matter, the manifest is a convenience
             logger.warning("shot-live could not write UNSCANNED manifest: %s", e)
         return kept

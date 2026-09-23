@@ -703,6 +703,31 @@ def run_ingestion(fb, cfg, pipeline_id: str, state: Dict, stopped: Dict, tracker
             except Exception as e:  # noqa: BLE001
                 run.log("warn", f"shot-qa enqueue skipped: {str(e)[:150]}")
 
+        # STAGE 4.55 — full-rate CONFIRM: recover the made shots the live loop
+        # could not see. It feeds the ball model every 4th frame, and a clean
+        # swish (mostly 3PT/4PT/FT) leaves too few samples to pass logic.py's
+        # full-rate gates; the loop keeps those segments, and this re-decides them
+        # at full rate now that the GPU is idle. Runs BEFORE 4.6 so the cards it
+        # seeds include what it recovers. Aborts — keeping the footage — the
+        # moment capture may be active; _capture_active() is None when unsure,
+        # and unsure counts as busy. Best-effort — never breaks ingestion.
+        if fb and firebase_game_id:
+            try:
+                from agx_pipeline.shot_detect import confirm as _confirm
+                from agx_pipeline.shot_recording import shot_seg_dir
+                if _confirm.enabled():
+                    csum = _confirm.confirm_segments(
+                        shot_seg_dir(cfg.output_dir, label), fb=fb,
+                        game_id=firebase_game_id,
+                        keep_going=lambda: _capture_active() is False)
+                    if csum:
+                        run.log("info", f"full-rate confirm: +{csum['new_makes']} makes "
+                                        f"({csum['new']} new shots) from "
+                                        f"{csum['segments_read']} segments in {csum['secs']}s"
+                                        + (" [aborted: capture active]" if csum.get("aborted") else ""))
+            except Exception as e:  # noqa: BLE001
+                run.log("warn", f"full-rate confirm skipped: {str(e)[:120]}")
+
         # STAGE 4.6 — the live CV's OWN shot detections (shadow): (a) surface the
         # count on the card, and (b) SHOT_CARDS_ENABLED: seed one annotation card
         # per detected shot (source="cv", review-flagged) so a game is carded even
