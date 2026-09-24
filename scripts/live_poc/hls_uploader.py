@@ -49,9 +49,21 @@ def main() -> int:
             time.sleep(POLL)
             continue
 
-        # The newest .ts is still being written by ffmpeg; uploading a partial
-        # segment yields a file the player can fetch but not decode.
-        for fn in names[:-1]:
+        # The newest .ts is normally still being written by ffmpeg, and uploading
+        # a partial segment yields a file the player can fetch but not decode.
+        # BUT once the publisher has stopped, ffmpeg has written EXT-X-ENDLIST
+        # and nothing is open any more -- then the newest file is complete and
+        # MUST go up, or the last segment of every game is missing from S3 and
+        # the player 404s on the final seconds. (Measured: 29 of 30 segments
+        # reached S3 before this was fixed.)
+        finished = False
+        try:
+            with open(playlist) as fh:
+                finished = "#EXT-X-ENDLIST" in fh.read()
+        except OSError:
+            pass
+
+        for fn in (names if finished else names[:-1]):
             if fn in sent:
                 continue
             path = os.path.join(src, fn)
@@ -77,7 +89,8 @@ def main() -> int:
         if n_seg and n_seg % 5 == 0:
             print(f"[uploader] {n_seg} segments up", flush=True)
         if once:
-            print(f"[uploader] one pass done, {n_seg} segments")
+            print(f"[uploader] one pass done, {n_seg} segments"
+                  + (" (stream finished, last segment included)" if finished else ""))
             return 0
         time.sleep(POLL)
 

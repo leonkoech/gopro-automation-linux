@@ -123,16 +123,24 @@ def main() -> int:
     if not ok:
         fails.append("playlist durations disagree with the media")
 
-    # 5 -- PDT tracks real wall-clock. THE critical one.
+    # 5 -- PDT tracks real wall-clock. Only meaningful while the stream is LIVE:
+    # once ffmpeg has written EXT-X-ENDLIST the stream stops advancing but the
+    # clock does not, so this comparison would report the time since the game
+    # ended as if it were drift. Skip it on a finished stream -- the rate-error
+    # check below is the one that still holds, and it does not depend on `now`.
     first_pdt = timed[0][0]
     span_pdt = (timed[-1][0] - first_pdt).total_seconds() + (timed[-1][1] or want_seg)
     age = (now - first_pdt).total_seconds()
     drift = age - span_pdt
-    ok = abs(drift) < 5.0
-    print(f"{'PASS' if ok else 'FAIL'}  PDT tracks wall-clock "
-          f"(stream spans {span_pdt:.1f}s, wall-clock {age:.1f}s, drift {drift:+.1f}s)")
-    if not ok:
-        fails.append(f"PDT drifts {drift:+.1f}s from wall-clock - rebase would be wrong by this much")
+    if has_endlist:
+        print(f"SKIP  PDT vs wall-clock: stream ENDED "
+              f"({span_pdt:.1f}s of footage, finished {drift:.0f}s ago)")
+    else:
+        ok = abs(drift) < 5.0
+        print(f"{'PASS' if ok else 'FAIL'}  PDT tracks wall-clock "
+              f"(stream spans {span_pdt:.1f}s, wall-clock {age:.1f}s, drift {drift:+.1f}s)")
+        if not ok:
+            fails.append(f"PDT drifts {drift:+.1f}s from wall-clock - rebase would be wrong by this much")
 
     # 5b -- ONGOING RATE ERROR, measured against segment write times.
     #
@@ -169,10 +177,14 @@ def main() -> int:
               f"(camera -> encode -> segment close; subtract it at the anchor, do not "
               f"bake it in as a correction)")
 
-    # 6 -- live-edge lag
-    lag = (now - (timed[-1][0])).total_seconds() - (timed[-1][1] or want_seg)
-    print(f"INFO  live-edge lag at the origin: {lag:.1f}s "
-          f"(+ player prebuffer ~{3 * want_seg:.0f}s = ~{lag + 3 * want_seg:.0f}s glass-to-glass)")
+    # 6 -- live-edge lag (live streams only, same reason as check 5)
+    if not has_endlist:
+        lag = (now - (timed[-1][0])).total_seconds() - (timed[-1][1] or want_seg)
+        print(f"INFO  live-edge lag at the origin: {lag:.1f}s "
+              f"(+ player prebuffer ~{3 * want_seg:.0f}s = ~{lag + 3 * want_seg:.0f}s glass-to-glass)")
+    else:
+        print(f"INFO  finished stream: {len(segs)} segments, "
+              f"{span_pdt:.0f}s of footage, playable as VOD over the same playlist")
 
     print()
     if fails:
