@@ -101,6 +101,19 @@ def _classify_env() -> Dict[str, str]:
     env["SHOT_BALL_PARKFILTER"] = "1"
     env["SHOT_CS_FIX"] = "1"
     env["SHOT_TYPE_STRICT"] = "1"
+    # Two-game loop, 2026-09-24 (cb9e1294 + 7cef734e, every shot scored against
+    # manual GT). Both broke 0 shots on either game.
+    # FLIGHT GATE: a release-pose "release" at or after the rim moment is
+    # impossible for a shot from >=1.5m; hand it to the possession release
+    # instead (cb9 +3/-0, 7cef 0/0). Free-throw feet are never gated.
+    env["SHOT_RP_FLIGHT_GATE"] = "1"
+    env["SHOT_RP_FLIGHT_A"] = "0.05"
+    env["SHOT_RP_FLIGHT_B"] = "0"
+    env["SHOT_RP_FLIGHT_MIN_D_CM"] = "150"
+    env["SHOT_RP_FLIGHT_SKIP_FT"] = "1"
+    # KEEP FT: STRICT discarded FREE_THROW calls whenever the release pose was
+    # unclear, but an FT does not depend on the release (7cef +4/-0, cb9 0/0).
+    env["SHOT_STRICT_KEEP_FT"] = "1"
     ball_w = os.getenv("SHOT_BALL_WEIGHTS_PATH",
                        os.path.join(TYPING_CWD, "yolo26s_ball_hoop_ft_evalweek_v1.pt"))
     if os.path.isfile(ball_w):
