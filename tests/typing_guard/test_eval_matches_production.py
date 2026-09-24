@@ -82,3 +82,20 @@ def test_eval_keeps_its_own_rim_anchor():
     PRE_S, so it must override SHOT_RIM_TS rather than inherit production's."""
     type_eval = _load_type_eval()
     assert type_eval.classify_env()["SHOT_RIM_TS"] == f"{type_eval.PRE_S:.2f}"
+
+
+@pytest.mark.unit
+def test_production_enables_the_two_game_loop_fixes():
+    """Flight gate + keep-FT were adopted on 2026-09-24 after breaking 0 shots on
+    either test game. If someone drops them, the eval and production diverge
+    from the measured stack -- this names the settings that were measured."""
+    type_eval = _load_type_eval()
+    from agx_pipeline.shot_typing_live import _classify_env
+
+    env = _classify_env()
+    assert env["SHOT_RP_FLIGHT_GATE"] == "1"
+    assert (env["SHOT_RP_FLIGHT_A"], env["SHOT_RP_FLIGHT_B"]) == ("0.05", "0")
+    assert env["SHOT_RP_FLIGHT_MIN_D_CM"] == "150"
+    assert env["SHOT_RP_FLIGHT_SKIP_FT"] == "1"
+    assert env["SHOT_STRICT_KEEP_FT"] == "1"
+    assert type_eval.classify_env()["SHOT_STRICT_KEEP_FT"] == "1"
