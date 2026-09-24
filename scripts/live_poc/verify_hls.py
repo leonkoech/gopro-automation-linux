@@ -134,6 +134,41 @@ def main() -> int:
     if not ok:
         fails.append(f"PDT drifts {drift:+.1f}s from wall-clock - rebase would be wrong by this much")
 
+    # 5b -- ONGOING RATE ERROR, measured against segment write times.
+    #
+    # Re-anchoring the check above on a later segment does NOT work: the anchor
+    # PDT cancels algebraically and you get the live-edge lag back, not a rate.
+    # A real rate measurement needs an independent wall-clock witness per
+    # segment, and the file's mtime is one -- it is when ffmpeg closed it.
+    #
+    # For each closed segment: lag_k = mtime_k - (PDT_k + EXTINF_k). A constant
+    # lag means the timeline is sound and merely offset by pipeline latency. A
+    # lag that TRENDS is the dangerous case, because it grows without bound and
+    # a 2h game ends far from where it started.
+    lags = []
+    for pdt, inf, fn in timed[:-1]:                # last one is still being written
+        try:
+            mt = datetime.fromtimestamp(os.path.getmtime(os.path.join(d, fn)), timezone.utc)
+        except OSError:
+            continue
+        lags.append((mt - pdt).total_seconds() - (inf or want_seg))
+    if len(lags) >= 6:
+        head = sum(lags[:3]) / 3
+        tail = sum(lags[-3:]) / 3
+        span = (timed[-2][0] - timed[0][0]).total_seconds() or 1.0
+        trend = tail - head
+        rate_err = trend / span * 100
+        per_2h = trend / span * 7200
+        ok = abs(rate_err) < 0.5
+        print(f"{'PASS' if ok else 'FAIL'}  ongoing rate error {rate_err:+.3f}% "
+              f"(segment lag {head:+.2f}s -> {tail:+.2f}s over {span:.0f}s "
+              f"= {per_2h:+.0f}s of error across a 2h game)")
+        if not ok:
+            fails.append(f"PDT rate error {rate_err:+.3f}% -> {per_2h:+.0f}s over a 2h game")
+        print(f"INFO  constant pipeline offset: {head:+.2f}s "
+              f"(camera -> encode -> segment close; subtract it at the anchor, do not "
+              f"bake it in as a correction)")
+
     # 6 -- live-edge lag
     lag = (now - (timed[-1][0])).total_seconds() - (timed[-1][1] or want_seg)
     print(f"INFO  live-edge lag at the origin: {lag:.1f}s "
