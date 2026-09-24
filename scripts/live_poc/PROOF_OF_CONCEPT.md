@@ -166,6 +166,36 @@ The verifier prints this number every run precisely so it stays measured.
 
 ---
 
+## 4b. Unplanned contention test — it held
+
+Partway through the run the box picked up an unrelated job from the two-game
+autopilot loop: an ffmpeg seeking into `7cef734e_NL.mp4` at **553% CPU**, taking
+the load average from 1.5 to **11.6**.
+
+The stream did not care. After **10.6 minutes** of continuous publishing through
+that load:
+
+```
+PASS  PDT advances with segment duration (worst deviation 0.001s)
+PASS  EXTINF matches decoded duration (worst 0.029s)
+PASS  PDT tracks wall-clock (stream spans 635.9s, wall-clock 634.2s, drift -1.8s)
+PASS  ongoing rate error +0.000%  ->  +0s across a 2h game
+INFO  constant pipeline offset: -5.06s   (unchanged)
+```
+
+The constant offset stayed at −5.06s to the same two decimals, and the live-edge
+lag actually *improved* to 1.8s. This was not a designed experiment, but it is
+the contention evidence Phase 0 wanted: the publisher survives a heavily loaded
+box because its work is on the NVDEC/NVENC blocks, not the CPU or the SMs.
+
+Own CPU cost during this, for both angles together: 19.9% + 19.5% (gst) +
+1.9% + 1.9% (uploaders) ≈ **43% of one core out of twelve**.
+
+Production was unaffected throughout: `agx-ingestion` stayed `active`,
+`/health` (port **5000**, not 8080) reported `recording: false, status: ok`.
+
+---
+
 ## 5. Latency
 
 | Stage | Measured |
