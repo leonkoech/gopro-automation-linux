@@ -79,6 +79,15 @@ SHADOW_CAP = int(os.getenv("SHOT_LIVE_SHADOW_CAP", "500"))   # max shots kept in
 #    (whole-game-quality rim) instead of trusting one 4s segment's estimate;
 #    canonical rims.json is the fallback until MIN samples are seen.
 SHOT_LIVE_WINDOW = os.getenv("SHOT_LIVE_WINDOW", "true").strip().lower() in ("1", "true", "yes", "on")
+# The window re-scans the PREVIOUS segment with every new one, so each segment is
+# decoded AND inferred twice. scan_ball_and_hoops does both in a single pass, so
+# caching the previous segment's TRACK and joining tracks instead of files halves
+# the loop. Measured 2026-09-25: 51% of per-window cost, and it is what takes the
+# loop below 1.0x realtime -- TensorRT alone leaves it at 1.22x, this alone at
+# 0.99x, both together 0.60x. Off by default until the equivalence test has run
+# on a real game.
+SHOT_LIVE_WINDOW_CACHE = os.getenv(
+    "SHOT_LIVE_WINDOW_CACHE", "false").strip().lower() in ("1", "true", "yes", "on")
 RIM_MIN_SAMPLES = int(os.getenv("SHOT_LIVE_RIM_MIN", "8"))
 HOOP_ACC_CAP = int(os.getenv("SHOT_LIVE_HOOP_CAP", "5000"))
 # Full-rate CONFIRM. The ball model sees every SHOT_LIVE_STRIDE-th frame (4 =>
@@ -152,6 +161,22 @@ def _rm(path: str) -> None:
         pass
 
 
+def _join_window_track(prev_track, own_track, offset):
+    """[prev segment's track] + [this segment's track shifted by `offset`].
+
+    Track entries are (true_frame_index, ...), so joining two segments means
+    adding the first segment's frame count to the second's indices. Exactly what
+    scanning a concatenation of the two files produces -- without decoding or
+    inferring the first segment a second time.
+    """
+    return list(prev_track) + [(t[0] + offset,) + tuple(t[1:]) for t in own_track]
+
+
+def _split_window_track(track, offset):
+    """Inverse: recover the SECOND segment's own track from a window track."""
+    return [(t[0] - offset,) + tuple(t[1:]) for t in track if t[0] >= offset]
+
+
 class LiveShotScorer:
     """Per-game live reader over the SL/SR segments. start()/stop() mirror the
     HighlightBuffer so service.py drives it exactly alongside the recorders."""
@@ -223,6 +248,8 @@ class LiveShotScorer:
         rims: Dict = {}
         hoop_acc: Dict[str, Dict] = {}   # angle -> {cx,cy,w,h} accumulated hoop samples (rim)
         prev_seg: Dict[str, tuple] = {}  # angle -> (idx, path) kept for the sliding window
+        # angle -> (seg_idx, that segment's OWN track, frame offset used)
+        self._win_cache: Dict[str, tuple] = {}
         self._confirm_keep: Dict[str, Dict[int, str]] = {}  # angle -> {idx: path} to re-read at full rate
         self._seg_reals: Dict[str, List[float]] = {}        # angle -> measured segment durations (s)
         processed: set = set()
@@ -350,20 +377,49 @@ class LiveShotScorer:
         #    else scan just this segment. `base_idx` = footage-offset of the
         #    window's first segment.
         prev = prev_seg.get(angle)
+        cached = self._win_cache.get(angle) if SHOT_LIVE_WINDOW_CACHE else None
+        # Only usable when the cache holds exactly the segment the window wants.
+        # After a stale skip _advance_prev moves prev on WITHOUT a scan, so the
+        # mismatch here falls back to the concat path for one window.
+        use_cache = (SHOT_LIVE_WINDOW and cached is not None
+                     and prev is not None and cached[0] == prev[0])
+        seg_frames = int(round(SHOT_SEGMENT_SEC * float(fps)))
         window, base_idx, tmp = path, idx, None
-        if SHOT_LIVE_WINDOW and prev and os.path.exists(prev[1]):
-            tmp = self._concat(prev[1], path)
-            if tmp:
-                window, base_idx = tmp, prev[0]
-        # 2. One pass: coarse ball track + hoop samples.
+        own_track = None
         t_sc = time.time()
-        try:
-            track, hoops = scan.scan_ball_and_hoops(
-                detector.model, window, detector.device, stride=stride, imgsz=imgsz)
-        finally:
-            if tmp:
-                _rm(tmp)
+        if use_cache:
+            # Scan ONLY the new segment; join its track onto the cached one.
+            own_track, hoops = scan.scan_ball_and_hoops(
+                detector.model, path, detector.device, stride=stride, imgsz=imgsz)
+            off = cached[2]
+            track = _join_window_track(cached[1], own_track, off)
+            base_idx = prev[0]
+            # hoops: ONLY this segment's. The concat path accumulates the previous
+            # segment's samples a second time -- caching drops that double count,
+            # which is a fix, not a regression, but it does shift the running rim.
+        else:
+            if SHOT_LIVE_WINDOW and prev and os.path.exists(prev[1]):
+                tmp = self._concat(prev[1], path)
+                if tmp:
+                    window, base_idx = tmp, prev[0]
+            try:
+                track, hoops = scan.scan_ball_and_hoops(
+                    detector.model, window, detector.device, stride=stride, imgsz=imgsz)
+            finally:
+                if tmp:
+                    _rm(tmp)
+            # Recover this segment's own track from the window so the cache can
+            # engage on the NEXT segment instead of concatenating twice in a row.
+            own_track = (track if window == path
+                         else _split_window_track(track, seg_frames))
         scan_s = round(time.time() - t_sc, 2)
+        if SHOT_LIVE_WINDOW_CACHE and own_track is not None:
+            # seg_frames is NOMINAL: -vf select drops frames before the pipe, so
+            # the reader never sees the ones it skipped and the true count is not
+            # available. splitmuxsink cuts on media time against a forced fps cap,
+            # so segments land within a frame or two of nominal -- at 120fps that
+            # is ~17ms against a calibration delta measured in seconds.
+            self._win_cache[angle] = (idx, own_track, seg_frames)
         # 3. Accumulate hoop samples -> running-median rim (whole-game quality),
         #    canonical rims.json until we have enough.
         acc = hoop_acc.setdefault(angle, {"cx": [], "cy": [], "w": [], "h": []})
