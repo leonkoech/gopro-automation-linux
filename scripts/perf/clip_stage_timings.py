@@ -33,9 +33,9 @@ Needs the same Grafana settings the AGX service posts with:
     export GRAFANA_URL=http://monitoring-box:3000
     export GRAFANA_TOKEN=<service-account token with Annotations:Read>
 
-    python3 scripts/clip_stage_timings.py --since 1
-    python3 scripts/clip_stage_timings.py --from '2026-09-03 19:00' --to '2026-09-04 00:00'
-    python3 scripts/clip_stage_timings.py --since 3 --csv clips.csv
+    python3 scripts/perf/clip_stage_timings.py --since 1
+    python3 scripts/perf/clip_stage_timings.py --from '2026-09-03 19:00' --to '2026-09-04 00:00'
+    python3 scripts/perf/clip_stage_timings.py --since 3 --csv clips.csv
 """
 
 from __future__ import annotations

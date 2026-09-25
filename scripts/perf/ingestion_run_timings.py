@@ -31,9 +31,9 @@ across a change, and read the durations for what a night actually costs.
 
 Run it where Firebase creds live -- normally the AGX itself:
 
-    python3 scripts/ingestion_run_timings.py --limit 20
-    python3 scripts/ingestion_run_timings.py --since 2026-08-25 --angles
-    python3 scripts/ingestion_run_timings.py --limit 50 --csv timings.csv
+    python3 scripts/perf/ingestion_run_timings.py --limit 20
+    python3 scripts/perf/ingestion_run_timings.py --since 2026-08-25 --angles
+    python3 scripts/perf/ingestion_run_timings.py --limit 50 --csv timings.csv
 """
 
 from __future__ import annotations
@@ -47,7 +47,7 @@ import sys
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 import firebase_admin
 from firebase_admin import credentials, firestore
@@ -63,7 +63,7 @@ STAGES = ("transcode", "upload", "register")
 
 FIREBASE_CREDENTIALS_PATH = os.getenv(
     "FIREBASE_CREDENTIALS_PATH",
-    os.path.join(os.path.dirname(os.path.dirname(__file__)),
+    os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
                  "uball-gopro-fleet-firebase-adminsdk.json"),
 )
 

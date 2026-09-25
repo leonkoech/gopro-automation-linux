@@ -38,9 +38,9 @@ outliers -- --max-min drops them.
 
 Run where Firebase creds live, normally the AGX:
 
-    python3 scripts/clip_latency_firestore.py --games 10
-    python3 scripts/clip_latency_firestore.py --game <firebase_game_id> --each
-    python3 scripts/clip_latency_firestore.py --games 20 --csv clips.csv
+    python3 scripts/perf/clip_latency_firestore.py --games 10
+    python3 scripts/perf/clip_latency_firestore.py --game <firebase_game_id> --each
+    python3 scripts/perf/clip_latency_firestore.py --games 20 --csv clips.csv
 """
 
 from __future__ import annotations
@@ -53,7 +53,7 @@ import sys
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 import firebase_admin
 from firebase_admin import credentials, firestore
@@ -67,7 +67,7 @@ except ImportError:
 GAMES = "basketball-games"
 FIREBASE_CREDENTIALS_PATH = os.getenv(
     "FIREBASE_CREDENTIALS_PATH",
-    os.path.join(os.path.dirname(os.path.dirname(__file__)),
+    os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
                  "uball-gopro-fleet-firebase-adminsdk.json"))
 
 # cv_<epoch>_<side> -- the same shape _retry_failed_highlights parses.
