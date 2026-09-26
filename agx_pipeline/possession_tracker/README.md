@@ -79,6 +79,17 @@ box/score_now.sh   holder on every cached clip + eval for both games
 Lessons: two workers in parallel are slower than one (GPU saturated). Never `pkill -f` a
 pattern that appears in your own ssh command line — put the logic in a script file.
 
+## Deployed as SHADOW (2026-09-26)
+
+Cron on the box, `45 5 * * *`: `nightly_shadow.py` -> `track_shadow.py` for every game ingested
+in the last 20 h, after production typing (04:15) has finished. Writes only
+`/home/dev/possession/shadow/<label>.jsonl` — no card is changed. Fast tracker on every card;
+SAM3 re-checks the cards where fast disagrees with the card's type. End-to-end test on 20
+cb9e1294 cards: tracker 17/18 vs production 15/18 against the manual cards, 5 SAM3 re-checks
+(~4 min each), other cards ~23 s. Crontab backup: `crontab.bak-pre-shadow-20260926`.
+Score a night with `shadow_report.py shadow/<label>.jsonl <uball_game_id>` once it is annotated.
+Switching over (writing types onto cards) is a separate, explicitly approved step.
+
 ## Getting it into the regular pipeline
 
 The blocker is speed, not accuracy: ~4.3 min per shot on the Orin (SAM3 on 91 frames) =
