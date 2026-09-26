@@ -40,7 +40,17 @@ def label_for(fb_game_id):
     return None
 
 
+def production_typing_running() -> bool:
+    """True while the 04:15 production typing sweep is still going: two GPU jobs at once has
+    wedged this box before, so the shadow waits its turn."""
+    out = subprocess.run(["pgrep", "-f", "nightly_typing.py|shot_typing.py"], capture_output=True, text=True).stdout
+    return bool(out.strip())
+
+
 def main():
+    while production_typing_running():
+        print("[shadow-nightly] production typing still running — waiting", flush=True)
+        time.sleep(300)
     cutoff = datetime.now(timezone.utc) - timedelta(hours=LOOKBACK_H)
     runs = [d.to_dict() | {"_id": d.id} for d in
             db.collection("ingestion-runs").order_by("started_at",
