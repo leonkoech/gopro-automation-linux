@@ -5,7 +5,17 @@ released each shot by following the ball and the players, and types the shot fro
 player's feet. Identity (which jersey) is deliberately out of scope; this only has to pick
 the right *person*.
 
-## Result so far (2026-09-25, whole-game run in progress)
+## Final result (2026-09-26): every GT shot of both 14-Sep games
+
+| | shots | production | SAM3 tracker | FAST tracker (YOLO-seg + ByteTrack) |
+|---|---|---|---|---|
+| all GT shots | 271 | 220 (81%) | **252 (93%)** | **245 (90%)** |
+| held-out (not used to pick the rule) | 150 | 123 (82%) | **141 (94%)** | **137 (91%)** |
+
+Fast = ~27 s per shot on the Orin (SAM3 ~250 s). Fast loses 10 shots to SAM3 and wins 4; six of
+its losses are 2PT called 4PT (feet far too deep: an id switch or a poor outline).
+
+## First result (2026-09-25, whole-game run in progress)
 
 TYPE (2PT / 3PT / 4PT / FT) against manual GT, same shots, both 14-Sep games:
 
