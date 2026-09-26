@@ -3,7 +3,8 @@
 For every CV card of one game (same selection as the nightly shot_typing.py), cut the
 FL/FR master around the card time, run the FAST tracker (YOLO-seg + ByteTrack perception,
 then holder.py's possession logic) and type the shot from the tracked shooter's median
-takeoff feet on the SAME calibration arcs production uses. The answer lands next to
+takeoff feet on the SAME calibration arcs production uses. Where the fast answer disagrees
+with the card's current type (or is missing), SAM3 re-checks that card and its answer wins. The answer lands next to
 production's in <out>/<label>.jsonl so the two can be compared against annotator GT before
 anything is switched over.
 
@@ -89,19 +90,41 @@ def takeoff_feet(track, release_t):
     return [float(v) for v in np.median(pts, axis=0)], still
 
 
-def track_card(clip: str, cam: str, work: str):
-    """Fast perception into `work`, then the possession logic. Returns the chosen shot."""
+PERCEIVERS = {"fast": ("perceive_fast.py", 300), "sam3": ("perceive.py", 1200)}
+
+
+def track_card(clip: str, cam: str, work: str, how: str = "fast"):
+    """Perception (fast YOLO-seg + ByteTrack, or SAM3) into its own cache dir under `work`,
+    then the possession logic. Returns (chosen shot, holder result) or None."""
     import holder
-    subprocess.run(["python3", os.path.join(HERE, "perceive_fast.py"), clip, work, "%.2f" % PRE],
-                   capture_output=True, text=True, timeout=300, check=True)
+    script, timeout = PERCEIVERS[how]
+    cache_root = os.path.join(work, how)
+    subprocess.run(["python3", os.path.join(HERE, script), clip, cache_root, "%.2f" % PRE],
+                   capture_output=True, text=True, timeout=timeout, check=True)
     name = os.path.splitext(os.path.basename(clip))[0]
-    S = holder.load(work, name)
+    S = holder.load(cache_root, name)
     res = holder.analyse(S, holder.Camera(cam))
     shots = [s for s in res.get("shots", []) if s.get("shooter") is not None]
     if not shots:
         return None
     # the attempt whose rim moment is nearest the card time (the card IS a rim event)
     return min(shots, key=lambda s: abs(s["rim_t"] - PRE)), res
+
+
+TYPE_OF = {"FG": "2PT", "2PT": "2PT", "3PT": "3PT", "4PT": "4PT", "FREE_THROW": "FREE_THROW"}
+
+
+def type_with(clip: str, cam: str, work: str, how: str) -> dict:
+    """One perception route -> shooter -> median takeoff feet -> zone on production's arcs."""
+    got = track_card(clip, cam, work, how)
+    if got is None:
+        return {"track_zone": None}
+    shot, res = got
+    track = (res.get("tracks") or {}).get(str(shot["shooter"])) or []
+    feet, still = takeoff_feet(track, shot["release_t"])
+    return {"track_zone": zone_of(load_arcs(cam, 1920), feet, still) if feet else None,  # cut is 1920x1080
+            "release_t": shot["release_t"], "rim_t": shot["rim_t"], "votes": shot.get("votes"),
+            "feet_px": feet, "still": still, "n_attempts": len(res.get("shots", []))}
 
 
 def main():
@@ -112,6 +135,8 @@ def main():
     ap.add_argument("--ts-offset", type=float, default=0.0)
     # where the FL/FR masters are; {label} and {cam} are filled in
     ap.add_argument("--master-pattern", default=REC + "/{label}/{label}_{cam}.mp4")
+    ap.add_argument("--no-sam3-escalation", dest="sam3_escalation", action="store_false",
+                    help="fast tracker only (default: SAM3 re-checks cards where fast disagrees)")
     a = ap.parse_args()
 
     from uball_client import UballClient
@@ -147,34 +172,34 @@ def main():
             try:
                 if not cut_clip(master, ts, clip):
                     raise RuntimeError("clip cut failed (%s)" % master)
-                got = track_card(clip, cam, work)
-                if got is None:
-                    rec["track_zone"] = None
-                    n_none += 1
-                else:
-                    shot, res = got
-                    track = (res.get("tracks") or {}).get(str(shot["shooter"])) or []
-                    feet, still = takeoff_feet(track, shot["release_t"])
-                    width = 1920                     # the cut is always scaled to 1920x1080
-                    rec.update({"release_t": shot["release_t"], "rim_t": shot["rim_t"],
-                                "votes": shot.get("votes"), "feet_px": feet, "still": still,
-                                "n_attempts": len(res.get("shots", []))})
-                    rec["track_zone"] = zone_of(load_arcs(cam, width), feet, still) if feet else None
-                    n_ok += rec["track_zone"] is not None
-                    n_none += rec["track_zone"] is None
+                rec.update(type_with(clip, cam, work, "fast"))
+                rec["fast_zone"] = rec["track_zone"]
+                # SAM3 only where it can matter: the fast tracker disagrees with the card's
+                # current type, or has no answer. Measured on 271 GT shots: escalates 19% and
+                # scores 251 vs 252 for SAM3 on every shot (fast alone 245, production 220).
+                prod_type = TYPE_OF.get(str(rec["prod_classification"]).rsplit("_", 1)[0])
+                if a.sam3_escalation and rec["track_zone"] != prod_type:
+                    sam = type_with(clip, cam, work, "sam3")
+                    rec["sam3"] = sam
+                    rec["escalated"] = True
+                    if sam.get("track_zone"):
+                        rec["track_zone"] = sam["track_zone"]
+                n_ok += rec["track_zone"] is not None
+                n_none += rec["track_zone"] is None
             except Exception as e:  # noqa: BLE001 - one card never stops the game
                 rec["error"] = "%s: %s" % (type(e).__name__, e)
                 n_none += 1
             finally:
+                import shutil
                 for f in os.listdir(work):
                     p = os.path.join(work, f)
-                    if os.path.isfile(p):
-                        os.remove(p)
+                    shutil.rmtree(p) if os.path.isdir(p) else os.remove(p)
             rec["secs"] = round(time.time() - t0, 1)
             fo.write(json.dumps(rec) + "\n")
             fo.flush()
-            log("[%d/%d] %s %.1f prod=%s track=%s (%.0fs)%s" % (
-                i + 1, len(cards), cam, ts, rec["prod_classification"], rec.get("track_zone"),
+            log("[%d/%d] %s %.1f prod=%s fast=%s%s final=%s (%.0fs)%s" % (
+                i + 1, len(cards), cam, ts, rec["prod_classification"], rec.get("fast_zone"),
+                " sam3=%s" % rec["sam3"].get("track_zone") if rec.get("sam3") else "", rec.get("track_zone"),
                 rec["secs"], " ERR " + rec["error"] if "error" in rec else ""))
     log("SUMMARY typed=%d untyped=%d -> %s" % (n_ok, n_none, out_path))
     print("SHADOW_DONE", flush=True)
