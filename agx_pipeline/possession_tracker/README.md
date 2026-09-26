@@ -72,7 +72,24 @@ pattern that appears in your own ssh command line — put the logic in a script 
 ## Getting it into the regular pipeline
 
 The blocker is speed, not accuracy: ~4.3 min per shot on the Orin (SAM3 on 91 frames) =
-~12 h per game. In order:
+~12 h per game.
+
+**Measured 2026-09-26 on 147 GT shots** (production 117/147; tracker rule frozen):
+
+| perception | tracker right |
+|---|---|
+| SAM3 masks, 15 fps (current) | **134 (91%)** |
+| boxes instead of masks | 126 (86%) |
+| 7.5 fps | 126 (86%) |
+| boxes and 7.5 fps | 119 (81%) |
+
+Both the masks and the frame rate carry the gain, so "plain detector boxes" alone is not
+enough. Options, cheapest first: a YOLO *segmentation* model + ByteTrack (masks at detector
+speed, TensorRT-able — test next), SAM3 via TensorRT on the Orin, or SAM3 on a cloud GPU
+(estimated ~45-80 s/shot on an A10G, ~2-4 h/game on one GPU, parallel across GPUs).
+Held-out check: 23/26 tracker vs 20/26 production on GT shots the rule was never tuned on.
+
+In order:
 
 1. **How much survives cheaper perception** (no GPU needed — simulated on the SAM3 caches):
    `CONTACT_MODE=box` (boxes instead of masks — what YOLO + a tracker gives) and `FPS_DIV=2`
