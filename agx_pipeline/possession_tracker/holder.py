@@ -382,6 +382,9 @@ def read_frames(clip, times):
     return [out.get(int(round(t * fps))) for t in times]
 
 
+CAPTIONS = json.load(open(os.environ["CAPTIONS"])) if os.environ.get("CAPTIONS") else {}
+
+
 def render(S, res, clip, base):
     imgs = read_frames(clip, S["times"])
     H, W = S["HW"]
@@ -423,6 +426,10 @@ def render(S, res, clip, base):
                 tag += "   RELEASE -> shooter %s" % shot["shooter"]
         cv2.putText(im, tag, (20, 45), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 0), 6)
         cv2.putText(im, tag, (20, 45), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (255, 255, 255), 2)
+        cap = CAPTIONS.get(os.path.basename(base))
+        if cap:
+            cv2.putText(im, cap, (20, 95), cv2.FONT_HERSHEY_SIMPLEX, 1.1, (0, 0, 0), 6)
+            cv2.putText(im, cap, (20, 95), cv2.FONT_HERSHEY_SIMPLEX, 1.1, (0, 255, 255), 2)
         small = cv2.resize(im, (W // 2, H // 2))
         vw.write(small)
         shown.append((k, small))
