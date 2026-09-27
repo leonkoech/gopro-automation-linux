@@ -115,7 +115,7 @@ def zone_of(cam, px, still):
     return "3PT" if cv2.pointPolygonTest(arc["four_pt_red"], pt, False) >= 0 else "4PT"
 
 
-def render(out, clip_dir, name, dst_dir, vertical):
+def render(out, clip_dir, name, dst_dir, vertical, make=None):
     angle = name.split("_")[1] if name.startswith("L_") else name.split("_")[0]
     cam = H.Camera(angle)
     S = H.load(out, name)
@@ -167,7 +167,9 @@ def render(out, clip_dir, name, dst_dir, vertical):
 
     # score badge for makes: the tracker's own type from the shooter's median takeoff feet
     badge, hoop = None, res.get("hoop_px")
-    if shot and "_MAKE_" in name and hoop:
+    if make is None:
+        make = "_MAKE_" in name
+    if shot and make and hoop:
         track = (res.get("tracks") or {}).get(str(shot["shooter"])) or []
         win = [b for tq, b in track if shot["release_t"] - 0.8 <= tq <= shot["release_t"]]
         if win:

@@ -39,6 +39,13 @@ def _include_misses() -> bool:
     return os.getenv("CORE_REEL_INCLUDE_MISSES", "false").lower() in ("1", "true", "yes", "on")
 
 
+def _use_2k() -> bool:
+    """Publish the 2K-style render (ring on the ball-holder, ball-centred crop) when one
+    exists for a clip. Default OFF: the plain clip is used exactly as before. Renders are made
+    post-game by possession_tracker/highlights_2k_job.py and recorded as `url_2k`."""
+    return os.getenv("CORE_REEL_USE_2K", "false").lower() in ("1", "true", "yes", "on")
+
+
 def _play_type(log: Dict) -> Optional[str]:
     """Canonical play-type label for a score log, or None for non-scores."""
     if log.get("actionType") in ("score_added", "player_score_added"):
@@ -97,7 +104,7 @@ def build_reel(firebase_game_id: str, game: Dict, game_date: Optional[str] = Non
         log = by_id.get(str(log_id), {})
         score = running.get(str(log_id))
         clips.append({
-            "url": h["url"],
+            "url": h["url_2k"] if (_use_2k() and h.get("url_2k")) else h["url"],
             "play_type": _play_type(log),
             "team": log.get("team"),          # "left"/"right" (team identity)
             "ts": log.get("timestamp"),        # ISO — reel ordering key
