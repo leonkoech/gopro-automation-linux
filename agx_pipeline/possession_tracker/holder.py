@@ -41,6 +41,17 @@ DEPTH_VETO_CM = 200                    # overlap in the image but this far apart
 HOLD_MAX_H_CM = 300                    # a ball above this is in flight, whoever it overlaps
 RELEASE_WIN = 0.6
 MIN_RELEASE_VOTES = max(1, 2 // FPS_DIV)
+# Wrong-player fixes found on unseen games (2026-09-28), env-gated until measured:
+#   HOLDER_FRONT=1  two overlapping players both touch a raised ball -> the one nearer the camera
+#                   holds it (a free-throw shooter's ball overlaps the lane player behind him)
+#   HOLDER_TIP=1    a touch while the ball is already up at the rim is a tip/rebound, not the
+#                   release of the shot that got it there
+FRONT = os.environ.get("HOLDER_FRONT") == "1"
+TIP = os.environ.get("HOLDER_TIP") == "1"
+FRONT_OVERLAP = 0.3                    # x-overlap / narrower width for "overlapping in the image"
+TIP_R_MULT = 2.5                       # x hoop near-radius: the rim zone
+TIP_H_CM = 250
+TIP_LOOKBACK = 15                      # frames (1 s): the ball flew into the rim zone untouched
 JUMP_MIN_CONF = 0.3
 ON_COURT_MIN_FRAC = 0.3               # share of a track's frames that must be on court
 OFF_COURT_CM = 150                     # a player's feet may be this far out of bounds
@@ -237,12 +248,29 @@ def track_from(S, start, b0):
     return track
 
 
-def pick_near(contact):
+def front_of(contact, boxes):
+    """Among touchers that overlap in the image, the one nearest the camera (lowest feet)."""
+    ids = [o for o in contact if contact[o] <= SINGLE_VETO_CM and o in boxes]
+    if len(ids) < 2:
+        return None
+    ids.sort(key=lambda o: -boxes[o][3])
+    a, b = boxes[ids[0]], boxes[ids[1]]
+    ov = min(a[2], b[2]) - max(a[0], b[0])
+    if ov > FRONT_OVERLAP * min(a[2] - a[0], b[2] - b[0]):
+        return ids[0]
+    return None
+
+
+def pick_near(contact, boxes=None):
     """Nearest touching player on the floor. Depth is noisy and a jumping player's feet
     project too far back, so one toucher is trusted up to SINGLE_VETO_CM; the strict
     DEPTH_VETO_CM only applies when several players touch the ball."""
     if not contact:
         return None
+    if FRONT and boxes and len(contact) > 1:
+        f = front_of(contact, boxes)
+        if f is not None:
+            return f
     oid = min(contact, key=contact.get)
     lim = SINGLE_VETO_CM if len(contact) == 1 else DEPTH_VETO_CM
     return oid if contact[oid] <= lim else None
@@ -290,7 +318,8 @@ def frame_states(S, cam, track):
                 feet = cam.to_court([[(p["box"][0] + p["box"][2]) / 2, p["box"][3]]])[0]
                 st["contact"][oid] = round(float(np.linalg.norm(feet - X[:2])))
         low = "ball_xyh" in st and st["ball_xyh"][2] <= HOLD_MAX_H_CM
-        st["near"] = pick_near(st["contact"]) if low else None
+        boxes = {o: S["players"][k][o]["box"] for o in st["contact"]}
+        st["near"] = pick_near(st["contact"], boxes) if low else None
         frames.append(st)
     holder, run_id, run_n = None, None, 0
     for st in frames:
@@ -304,9 +333,28 @@ def frame_states(S, cam, track):
     return frames
 
 
-def attribute(S, frames, lo, ri):
+def in_tip_zone(st, hoop, near_r):
+    if hoop is None or "ball_px" not in st or "ball_xyh" not in st:
+        return False
+    d = np.hypot(st["ball_px"][0] - hoop[0], st["ball_px"][1] - hoop[1])
+    return d <= TIP_R_MULT * near_r and st["ball_xyh"][2] >= TIP_H_CM
+
+
+def attribute(S, frames, lo, ri, hoop=None, near_r=None):
     """Release = last contact frame in (lo, ri]; shooter = most contact in RELEASE_WIN before it."""
-    rel = max((k for k in range(lo + 1, ri + 1) if frames[k]["near"] is not None), default=None)
+    cand = [k for k in range(lo + 1, ri + 1) if frames[k]["near"] is not None]
+    if TIP and hoop is not None:
+        # a tip/rebound: touched in the rim zone AFTER the ball had already flown into that zone
+        # untouched (a layup carries the ball up in the hand, so it never qualifies)
+        def is_tip(k):
+            if not in_tip_zone(frames[k], hoop, near_r):
+                return False
+            return any(in_tip_zone(frames[j], hoop, near_r) and frames[j]["near"] is None
+                       for j in range(max(lo + 1, k - TIP_LOOKBACK), k))
+        away = [k for k in cand if not is_tip(k)]
+        if away:
+            cand = away
+    rel = max(cand, default=None)
     if rel is None:
         return {"rim_i": ri, "rim_t": frames[ri]["t"]}
     t_rel = frames[rel]["t"]
@@ -336,7 +384,7 @@ def analyse(S, cam):
     for k, _, b in events:
         track = track_from(S, k, b)
         frames = frame_states(S, cam, track)
-        shot = attribute(S, frames, lo, k)
+        shot = attribute(S, frames, lo, k, hoop, near_r)
         if "shooter" not in shot:
             continue            # nobody touched it since the last arrival: a rim bounce, or a shot from before the clip
         h_rel = (frames[shot["release_i"]].get("ball_xyh") or [0, 0, RIM_CM])[2]
