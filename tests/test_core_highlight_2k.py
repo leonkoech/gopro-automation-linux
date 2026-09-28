@@ -45,3 +45,13 @@ def test_cv_clip_takes_its_type_from_cv_points(monkeypatch):
     clips = {c["url"]: c for c in build_reel("g", g)["clips"]}
     assert clips["https://cdn/cv_FL.mp4"]["play_type"] == "3PT_MAKE"
     assert clips["https://cdn/a_FL.mp4"]["play_type"] == "3PT_MAKE"      # score log still wins
+
+
+@pytest.mark.unit
+def test_cv_clips_are_ordered_by_their_own_time():
+    g = {"logs": [], "highlights": {
+        "cv_1789785674_left": {"status": "ready", "url": "u2", "angle": "FL"},
+        "cv_1789784482_right": {"status": "ready", "url": "u1", "angle": "FR"}}}
+    clips = build_reel("g", g)["clips"]
+    assert [c["url"] for c in clips] == ["u1", "u2"]
+    assert clips[0]["ts"].startswith("2026-")

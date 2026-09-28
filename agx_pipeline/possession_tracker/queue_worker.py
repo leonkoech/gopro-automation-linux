@@ -9,8 +9,9 @@ Per clip (job files written by agx_pipeline/tracker_queue.py):
      what ingest turns into the annotation card's type)
   5. makes: render the 2K highlight (floor ring on the ball-holder, ball-centred crop, score
      badge), upload it next to the plain clip, record highlights.{logId}.url_2k
-When a game has ended and all its jobs (and its SAM3 re-checks) are done, publish its reel to
-Core; publish again if more clips finish later (Core upserts on the game, so it just updates).
+When a game has ended and its fast jobs are done, publish its reel to Core; publish again as
+later SAM3 corrections land (Core upserts on the game, so it just updates). SAM3 never delays
+the first publish: in the full-game replay it cost ~6 min per shot and changed no answer.
 
 Load: runs at nice 19 / idle IO, one clip at a time, and pauses while the live shot detector is
 behind (shot_live.backlog). Recording is a separate process and is never touched.
@@ -25,7 +26,6 @@ Env (all optional):
                                    (the plain clip stays at url_plain)
   TRACKER_PUBLISH_CORE      true   publish the reel to Core when a game's queue is done
   TRACKER_BACKLOG_MAX       6      pause while the live detector is this many segments behind
-  TRACKER_PUBLISH_MAX_WAIT_MIN 45  after a game ends, publish even if SAM3 is still queued
 
 Run:  python3 queue_worker.py            (forever)      --once   (drain, then exit)
 """
@@ -60,7 +60,6 @@ DO_2K = _flag("TRACKER_2K", "true")
 TV_2K = _flag("TRACKER_TV_2K", "false")
 PUBLISH = _flag("TRACKER_PUBLISH_CORE", "true")
 BACKLOG_MAX = int(os.environ.get("TRACKER_BACKLOG_MAX", "6"))
-PUBLISH_MAX_WAIT_S = 60 * float(os.environ.get("TRACKER_PUBLISH_MAX_WAIT_MIN", "45"))
 BUCKET = os.environ.get("UPLOAD_BUCKET", "uball-videos-production")
 CDN = os.environ.get("HIGHLIGHT_CDN_DOMAIN", "d22gul8sdref0l.cloudfront.net")
 POINTS = {"2PT": 2, "3PT": 3, "4PT": 4, "FREE_THROW": 1}
@@ -256,7 +255,7 @@ def process_sam3(name, job):
 
 # ---------------------------------------------------------------- publish
 def maybe_publish():
-    """Publish each ended game whose queue is done (or whose SAM3 wait ran out)."""
+    """Publish each ended game whose fast work is done; republish when more jobs finish."""
     if not PUBLISH:
         return
     games = {f.split("__")[0] for st in ("done", "failed") for f in os.listdir(qpath(st)) if f.endswith(".json")}
@@ -273,14 +272,6 @@ def maybe_publish():
         d = game_doc(g).get().to_dict() or {}
         if d.get("status") != "completed" and not d.get("endedAt"):
             continue
-        if jobs("sam3", g):
-            ended = d.get("endedAt")
-            try:
-                waited = time.time() - datetime.fromisoformat(str(ended).replace("Z", "+00:00")).timestamp()
-            except Exception:  # noqa: BLE001
-                waited = 0
-            if waited < PUBLISH_MAX_WAIT_S:
-                continue
         from agx_pipeline.core_highlight import publish_core_highlight
         date = None
         for h in (d.get("highlights") or {}).values():

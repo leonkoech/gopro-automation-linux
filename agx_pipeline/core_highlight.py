@@ -19,6 +19,8 @@ from __future__ import annotations
 
 import logging
 import os
+import re
+from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
 import requests
@@ -46,6 +48,14 @@ def _use_2k() -> bool:
     exists for a clip. Default OFF: the plain clip is used exactly as before. Renders are made
     post-game by possession_tracker/highlights_2k_job.py and recorded as `url_2k`."""
     return os.getenv("CORE_REEL_USE_2K", "false").lower() in ("1", "true", "yes", "on")
+
+
+def _cv_ts(log_id) -> Optional[str]:
+    """CV clips have no score log; their id carries the shot's epoch: cv_<epoch>_<side>."""
+    m = re.match(r"cv_(\d{9,11})_", str(log_id))
+    if not m:
+        return None
+    return datetime.fromtimestamp(int(m.group(1)), tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
 
 
 def _play_type(log: Dict) -> Optional[str]:
@@ -115,7 +125,7 @@ def build_reel(firebase_game_id: str, game: Dict, game_date: Optional[str] = Non
             "url": h["url_2k"] if (_use_2k() and h.get("url_2k")) else h["url"],
             "play_type": play_type,
             "team": log.get("team"),          # "left"/"right" (team identity)
-            "ts": log.get("timestamp"),        # ISO — reel ordering key
+            "ts": log.get("timestamp") or _cv_ts(log_id),  # ISO — reel ordering key
             "angle": h.get("angle"),           # camera the clip was cut from
             "team1_score": score[0] if score else None,  # running, after this shot
             "team2_score": score[1] if score else None,
