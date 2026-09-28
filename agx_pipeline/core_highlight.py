@@ -19,6 +19,8 @@ from __future__ import annotations
 
 import logging
 import os
+import re
+from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
 import requests
@@ -27,6 +29,8 @@ logger = logging.getLogger("agx.core_highlight")
 
 # Points -> canonical annotation label (must match plays_sync._MAKE_BY_POINTS).
 _MAKE_BY_POINTS: Dict[int, str] = {1: "FREE_THROW_MAKE", 2: "FG_MAKE", 3: "3PT_MAKE", 4: "4PT_MAKE"}
+
+_ZONE_POINTS: Dict[str, int] = {"2PT": 2, "3PT": 3, "4PT": 4, "FREE_THROW": 1}
 
 _TIMEOUT = 20
 
@@ -37,6 +41,21 @@ def _include_misses() -> bool:
     Default OFF. Exists so the -3s/+3s miss window can be eyeballed on a real
     clip in the app; it is not a shipping configuration."""
     return os.getenv("CORE_REEL_INCLUDE_MISSES", "false").lower() in ("1", "true", "yes", "on")
+
+
+def _use_2k() -> bool:
+    """Publish the 2K-style render (ring on the ball-holder, ball-centred crop) when one
+    exists for a clip. Default OFF: the plain clip is used exactly as before. Renders are made
+    post-game by possession_tracker/highlights_2k_job.py and recorded as `url_2k`."""
+    return os.getenv("CORE_REEL_USE_2K", "false").lower() in ("1", "true", "yes", "on")
+
+
+def _cv_ts(log_id) -> Optional[str]:
+    """CV clips have no score log; their id carries the shot's epoch: cv_<epoch>_<side>."""
+    m = re.match(r"cv_(\d{9,11})_", str(log_id))
+    if not m:
+        return None
+    return datetime.fromtimestamp(int(m.group(1)), tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
 
 
 def _play_type(log: Dict) -> Optional[str]:
@@ -96,11 +115,17 @@ def build_reel(firebase_game_id: str, game: Dict, game_date: Optional[str] = Non
             continue
         log = by_id.get(str(log_id), {})
         score = running.get(str(log_id))
+        play_type = _play_type(log)
+        if play_type is None:
+            # CV clips have no operator score log: take the shot type the tracker/typing stage
+            # wrote to cv_points (only makes carry a highlight here, so it is a *_MAKE label).
+            v = (game.get("cv_points") or {}).get(str(log_id)) or {}
+            play_type = _MAKE_BY_POINTS.get(_ZONE_POINTS.get(v.get("zone"), 0))
         clips.append({
-            "url": h["url"],
-            "play_type": _play_type(log),
+            "url": h["url_2k"] if (_use_2k() and h.get("url_2k")) else h["url"],
+            "play_type": play_type,
             "team": log.get("team"),          # "left"/"right" (team identity)
-            "ts": log.get("timestamp"),        # ISO — reel ordering key
+            "ts": log.get("timestamp") or _cv_ts(log_id),  # ISO — reel ordering key
             "angle": h.get("angle"),           # camera the clip was cut from
             "team1_score": score[0] if score else None,  # running, after this shot
             "team2_score": score[1] if score else None,
