@@ -115,11 +115,13 @@ def zone_of(cam, px, still):
     return "3PT" if cv2.pointPolygonTest(arc["four_pt_red"], pt, False) >= 0 else "4PT"
 
 
-def render(out, clip_dir, name, dst_dir, vertical, make=None):
+def render(out, clip_dir, name, dst_dir, vertical, make=None, badge_zone=None, S=None, res=None):
     angle = name.split("_")[1] if name.startswith("L_") else name.split("_")[0]
     cam = H.Camera(angle)
-    S = H.load(out, name)
-    res = H.analyse(S, cam)
+    if S is None:
+        S = H.load(out, name)
+    if res is None:
+        res = H.analyse(S, cam)
     frames = res["frames"]
     shots = [s for s in res.get("shots", []) if s.get("shooter") is not None]
     shot = min(shots, key=lambda s: abs(s["rim_t"] - S["rim_t"])) if shots else None
@@ -175,7 +177,7 @@ def render(out, clip_dir, name, dst_dir, vertical, make=None):
         if win:
             pts = np.array([((b[0] + b[2]) / 2, b[3]) for b in win], float)
             still = bool(np.ptp(pts[:, 0]) < 60 and np.ptp(pts[:, 1]) < 60)
-            zone = zone_of(angle, np.median(pts, axis=0), still)
+            zone = badge_zone or zone_of(angle, np.median(pts, axis=0), still)
             badge = {"2PT": "+2", "3PT": "+3", "4PT": "+4", "FREE_THROW": "+1"}.get(zone)
     os.makedirs(dst_dir, exist_ok=True)
     targets = [("", 1920, 1080)] + ([("_vertical", 1080, 1920)] if vertical else [])

@@ -28,6 +28,8 @@ logger = logging.getLogger("agx.core_highlight")
 # Points -> canonical annotation label (must match plays_sync._MAKE_BY_POINTS).
 _MAKE_BY_POINTS: Dict[int, str] = {1: "FREE_THROW_MAKE", 2: "FG_MAKE", 3: "3PT_MAKE", 4: "4PT_MAKE"}
 
+_ZONE_POINTS: Dict[str, int] = {"2PT": 2, "3PT": 3, "4PT": 4, "FREE_THROW": 1}
+
 _TIMEOUT = 20
 
 
@@ -103,9 +105,15 @@ def build_reel(firebase_game_id: str, game: Dict, game_date: Optional[str] = Non
             continue
         log = by_id.get(str(log_id), {})
         score = running.get(str(log_id))
+        play_type = _play_type(log)
+        if play_type is None:
+            # CV clips have no operator score log: take the shot type the tracker/typing stage
+            # wrote to cv_points (only makes carry a highlight here, so it is a *_MAKE label).
+            v = (game.get("cv_points") or {}).get(str(log_id)) or {}
+            play_type = _MAKE_BY_POINTS.get(_ZONE_POINTS.get(v.get("zone"), 0))
         clips.append({
             "url": h["url_2k"] if (_use_2k() and h.get("url_2k")) else h["url"],
-            "play_type": _play_type(log),
+            "play_type": play_type,
             "team": log.get("team"),          # "left"/"right" (team identity)
             "ts": log.get("timestamp"),        # ISO — reel ordering key
             "angle": h.get("angle"),           # camera the clip was cut from

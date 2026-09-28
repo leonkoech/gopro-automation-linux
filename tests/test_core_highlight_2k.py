@@ -34,3 +34,14 @@ def test_2k_where_rendered_when_flag_on(monkeypatch):
     monkeypatch.setenv("CORE_REEL_USE_2K", "true")
     urls = [c["url"] for c in build_reel("g", _game())["clips"]]
     assert urls == ["https://cdn/a_FL_2k.mp4", "https://cdn/b_FR.mp4"]
+
+
+@pytest.mark.unit
+def test_cv_clip_takes_its_type_from_cv_points(monkeypatch):
+    monkeypatch.delenv("CORE_REEL_USE_2K", raising=False)
+    g = _game()
+    g["highlights"]["cv_1_left"] = {"status": "ready", "url": "https://cdn/cv_FL.mp4", "angle": "FL"}
+    g["cv_points"] = {"cv_1_left": {"zone": "3PT"}}
+    clips = {c["url"]: c for c in build_reel("g", g)["clips"]}
+    assert clips["https://cdn/cv_FL.mp4"]["play_type"] == "3PT_MAKE"
+    assert clips["https://cdn/a_FL.mp4"]["play_type"] == "3PT_MAKE"      # score log still wins
