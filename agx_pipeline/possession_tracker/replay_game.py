@@ -21,6 +21,7 @@ def main():
     ap.add_argument("--queue", default=os.environ.get("TRACKER_QUEUE_DIR", "/home/dev/possession/queue"))
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--pace", type=float, default=0)
+    ap.add_argument("--only", help="json file with {'keep': {log_id: ...}}: enqueue just those clips")
     a = ap.parse_args()
     import firebase_admin
     from firebase_admin import credentials, firestore
@@ -31,6 +32,10 @@ def main():
     hs = sorted(((k, h) for k, h in (d.get("highlights") or {}).items()
                  if h.get("status") == "ready" and h.get("angle") in ("FL", "FR")),
                 key=lambda kv: kv[1].get("updatedAt") or kv[0])
+    if a.only:
+        import json
+        keep = json.load(open(a.only))["keep"]
+        hs = [(k, h) for k, h in hs if k in keep]
     if a.limit:
         hs = hs[:a.limit]
     n = 0

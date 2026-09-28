@@ -68,11 +68,39 @@ def load_arcs(cam: str, width: int):
     return {k: np.array(a[k], np.float32) * sc for k in ("three_pt_white", "four_pt_red", "ft_stripe") if a.get(k)}
 
 
+BASELINE_FIX = os.environ.get("TRACKER_BASELINE_FIX", "1") == "1"
+
+
+BASELINE_TOL_PX = 60
+BASELINE_MID = 0.6          # only the middle 60% of the arc's width (never the corners)
+
+
+def behind_baseline(poly, pt):
+    """True when pt sits just past the baseline edge of the 3PT zone, near the basket.
+    The traced 3PT zone is a closed loop whose top edge runs along the baseline; a shooter
+    right under the rim can land a few pixels past that edge (behind the baseline in the
+    image), outside every zone -> typed 4PT. Nobody shoots a 3 or a 4 from behind the
+    baseline near the basket: that is a 2. Corners are excluded (corner 3s live there)."""
+    xs = poly[:, 0]
+    lo, hi = float(xs.min()), float(xs.max())
+    mid_lo = lo + (1 - BASELINE_MID) / 2 * (hi - lo)
+    mid_hi = hi - (1 - BASELINE_MID) / 2 * (hi - lo)
+    if not mid_lo <= pt[0] <= mid_hi:
+        return False
+    col = poly[np.abs(xs - pt[0]) <= 12]
+    if not len(col):
+        return False
+    top = float(col[:, 1].min())
+    return 0 < top - pt[1] <= BASELINE_TOL_PX
+
+
 def zone_of(arcs, px, still):
     pt = (float(px[0]), float(px[1]))
     if still and "ft_stripe" in arcs and cv2.pointPolygonTest(arcs["ft_stripe"], pt, False) >= 0:
         return "FREE_THROW"
     if cv2.pointPolygonTest(arcs["three_pt_white"], pt, False) >= 0:
+        return "2PT"
+    if BASELINE_FIX and behind_baseline(arcs["three_pt_white"], pt):
         return "2PT"
     if cv2.pointPolygonTest(arcs["four_pt_red"], pt, False) >= 0:
         return "3PT"

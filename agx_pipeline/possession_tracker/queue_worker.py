@@ -197,7 +197,9 @@ def render_2k(job, work, name, S, res, zone):
     if not os.path.isfile(made) or os.path.getsize(made) == 0:
         return None
     key = (job.get("s3_key") or "highlights/tracker/%s/%s_%s.mp4" % (job["game_id"], job["log_id"], job["angle"]))
-    key = key[:-4] + "_2k.mp4" if key.endswith(".mp4") else key + "_2k.mp4"
+    # a new name per render: a re-render must never be hidden behind the CDN's cached copy
+    tag = "_2k_%d.mp4" % int(time.time())
+    key = key[:-4] + tag if key.endswith(".mp4") else key + tag
     url = upload(made, key)
     local = os.path.join(os.path.dirname(job["clip"]), "2k", os.path.basename(key))
     os.makedirs(os.path.dirname(local), exist_ok=True)
