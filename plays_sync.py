@@ -330,6 +330,11 @@ def create_plays_from_shot_live(
         angle = _HOOP_ANGLE.get(s.get("side"))
         label = SHOT_LABELS.get(classification, classification)
         note = f"CV: {label}" + (f" ({s.get('cam')} · {s.get('side')} rim)" if s.get("cam") else "")
+        # Jersey SUGGESTION from the possession tracker (cv_points.{id}.who): shown in the note
+        # only — the player field stays the annotator's call. Validated at 83% right when it
+        # speaks on 395 annotated shots, so it is a hint, never a fill.
+        if _v and _v.get("who"):
+            note += f" · Tracker suggests #{_v['who']}"
 
         play_data: Dict[str, Any] = {
             "game_id": uball_game_id,
