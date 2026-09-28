@@ -18,7 +18,7 @@ behind (shot_live.backlog). Recording is a separate process and is never touched
 
 Env (all optional):
   TRACKER_QUEUE_DIR         /home/dev/possession/queue
-  TRACKER_SAM3              true   | false: never run SAM3
+  TRACKER_SAM3              false  | true: re-check near-line shots with SAM3 (slow, optional)
   TRACKER_SAM3_MAX_PER_GAME 6      SAM3 re-checks per game (4 min each)
   TRACKER_SAM3_NEAR_PX      40     feet this close to a court line -> SAM3 re-check
   TRACKER_2K                true   render + upload 2K highlights for makes
@@ -53,7 +53,7 @@ def _flag(name, default):
 
 
 QUEUE = os.environ.get("TRACKER_QUEUE_DIR", "/home/dev/possession/queue")
-USE_SAM3 = _flag("TRACKER_SAM3", "true")
+USE_SAM3 = _flag("TRACKER_SAM3", "false")
 SAM3_MAX = int(os.environ.get("TRACKER_SAM3_MAX_PER_GAME", "6"))
 SAM3_NEAR_PX = float(os.environ.get("TRACKER_SAM3_NEAR_PX", "40"))
 DO_2K = _flag("TRACKER_2K", "true")
