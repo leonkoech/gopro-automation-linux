@@ -21,6 +21,11 @@ Run it on REAL splitmuxsink segments, not ffmpeg-cut ones: the nominal 480-frame
 offset the cache assumes is a property of how splitmuxsink cuts, and cut files
 will not exercise it.
 
+STANDALONE ON PURPOSE. It inlines the join rather than importing it from
+live.py, so it runs on the AGX from a paste with nothing checked out -- that box
+runs games nightly and switching branches there would swap the live detector
+under the running service.
+
     python3 scripts/perf/window_cache_verify.py --segments /home/dev/app/recordings/<game>/shot_seg
     python3 scripts/perf/window_cache_verify.py --a seg_1_SL.mp4 --b seg_2_SL.mp4
 """
@@ -41,6 +46,14 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 SEG_RE = re.compile(r"^seg_(\d{5,})_([A-Z]{2})\.mp4$")
+
+
+def _join_window_track(prev_track, own_track, offset):
+    """MUST stay identical to _join_window_track in
+    agx_pipeline/shot_detect/live.py. Inlined, not imported, so this runs on the
+    AGX without a checkout. Two lines, and the unit tests on that function are
+    the guard against the two copies drifting apart."""
+    return list(prev_track) + [(t[0] + offset,) + tuple(t[1:]) for t in own_track]
 
 
 def concat(a: str, b: str, out: str) -> None:
@@ -68,8 +81,6 @@ def verdicts(track, rim, fps):
 
 
 def compare(a: str, b: str, det, scan, rim, fps, stride, imgsz) -> bool:
-    from agx_pipeline.shot_detect.live import _join_window_track
-
     na, nb = nframes(a), nframes(b)
     tmp = tempfile.mkdtemp(prefix="wcv_")
     ab = f"{tmp}/ab.mp4"
