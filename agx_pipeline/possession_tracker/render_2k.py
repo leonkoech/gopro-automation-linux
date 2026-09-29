@@ -4,7 +4,9 @@ the rim. Built on the possession tracker's output (perceive cache + holder.analy
 ring sits on the player the tracker says has the ball, and on the shooter through the shot.
 
 The ring is a real circle on the floor (RING_CM radius around the holder's feet) projected into
-the image through the court homography, so it lies in perspective like the in-game marker.
+the image through the court homography, so it lies in perspective like the in-game marker. It is
+drawn UNDER the players, cut out by their tracker masks: the back half of the ring passes behind
+the holder's legs (so he stands in it), and anyone nearer the camera covers it entirely.
 
 Usage: render_2k.py <out_dir> <clip_dir> <name> [<name> ...]
 Env:   R2K_OUT (default <out_dir>/r2k), R2K_ZOOM (1.6), R2K_VERTICAL=1 to add a 9:16 cut
@@ -45,13 +47,29 @@ def smooth(x, win):
     return np.stack([np.convolve(pad[:, j], k, mode="valid") for j in range(x.shape[1])], 1)
 
 
+def redistort(cal, pts):
+    """Inverse of holder.undistort (division model), by fixed-point iteration."""
+    lam = cal.get("division_lambda")
+    pts = np.asarray(pts, float).reshape(-1, 2)
+    if not lam:
+        return pts
+    cx, cy = cal.get("principal_point") or [cal["image_size"][0] / 2, cal["image_size"][1] / 2]
+    diag = float(np.hypot(cx, cy))
+    qu = pts - [cx, cy]
+    qd = qu.copy()
+    for _ in range(30):
+        qd = qu * (1 + lam * (qd ** 2).sum(1) / diag ** 2)[:, None]
+    return qd + [cx, cy]
+
+
 def ring_poly(cam, feet_px):
-    """Circle of RING_CM around the feet on the court plane, projected back into the image."""
+    """Circle of RING_CM around the feet on the court plane, projected back into the image
+    (homography inverse, then the lens distortion put back so the ring is centred on the feet)."""
     c = cam.to_court([feet_px])[0]
     a = np.linspace(0, 2 * np.pi, 48, endpoint=False)
     court = np.stack([c[0] + RING_CM * np.cos(a), c[1] + RING_CM * np.sin(a)], 1).astype(np.float32)
     img = cv2.perspectiveTransform(court.reshape(-1, 1, 2), np.linalg.inv(cam.H)).reshape(-1, 2)
-    return img.astype(np.int32)
+    return np.round(redistort(cam.cal, img)).astype(np.int32)
 
 
 def draw_ring(im, poly, col, alpha):
@@ -62,6 +80,47 @@ def draw_ring(im, poly, col, alpha):
     cv2.polylines(glow, [poly], True, col, 14, cv2.LINE_AA)
     cv2.addWeighted(glow, 0.35 * alpha, im, 1 - 0.35 * alpha, 0, im)
     cv2.polylines(im, [poly], True, col, 4, cv2.LINE_AA)
+
+
+OCC_FEATHER = 5                   # px blur on the occlusion edge (masks are 512x288, upscaled)
+
+
+def occluders(players, oid, feet_y, shape, roi):
+    """Float mask (roi-sized) of where the ring is hidden behind someone: the ring owner's body
+    ABOVE his feet line (the back half of the ring runs behind his legs; the front half stays in
+    front of his feet) and the whole body of anyone standing nearer the camera (feet lower)."""
+    x0, y0, x1, y1 = roi
+    H, W = shape[:2]
+    occ = np.zeros((y1 - y0, x1 - x0), np.float32)
+    for pid, p in players.items():
+        b = p["box"]
+        if b[2] < x0 or b[0] > x1 or b[3] < y0 or b[1] > y1:
+            continue
+        own = pid == oid
+        if not own and b[3] <= feet_y:
+            continue
+        m = cv2.resize(p["mask"].astype(np.float32), (W, H), interpolation=cv2.INTER_LINEAR)[y0:y1, x0:x1]
+        if own:
+            m[max(0, int(feet_y) - y0):, :] = 0
+        occ = np.maximum(occ, m)
+    if OCC_FEATHER and occ.any():
+        k = 2 * OCC_FEATHER + 1
+        occ = cv2.GaussianBlur(occ, (k, k), 0)
+    return np.clip(occ, 0, 1)
+
+
+def draw_ring_under(im, poly, col, alpha, players, oid, feet_y):
+    """draw_ring, then put back the original pixels wherever a player covers the ring."""
+    layer = im.copy()
+    draw_ring(layer, poly, col, alpha)
+    x, y, w, h = cv2.boundingRect(poly)
+    pad = 12
+    x0, y0 = max(0, x - pad), max(0, y - pad)
+    x1, y1 = min(im.shape[1], x + w + pad), min(im.shape[0], y + h + pad)
+    if x1 <= x0 or y1 <= y0:
+        return
+    occ = occluders(players or {}, oid, feet_y, im.shape, (x0, y0, x1, y1))[..., None]
+    im[y0:y1, x0:x1] = (layer[y0:y1, x0:x1] * (1 - occ) + im[y0:y1, x0:x1] * occ).astype(np.uint8)
 
 
 def draw_marker(im, box, col):
@@ -208,7 +267,8 @@ def render(out, clip_dir, name, dst_dir, vertical, make=None, badge_zone=None, S
             b = box_at(oid, k)
             if b is not None:
                 feet = [(b[0] + b[2]) / 2, b[3]]
-                draw_ring(im, ring_poly(cam, feet), col, alpha)
+                near = int(np.argmin(np.abs(t - tt)))
+                draw_ring_under(im, ring_poly(cam, feet), col, alpha, S["players"][near], oid, feet[1])
                 if alpha >= 1:
                     draw_marker(im, b, col)
         bx, by = ball_o[k]
