@@ -53,3 +53,55 @@ def test_redistort_inverts_holder_undistort():
     pts = np.array([[464.0, 885.0], [1800.0, 100.0], [960.0, 540.0]])
     back = R.redistort(cal, holder.undistort(cal, pts))
     assert np.abs(back - pts).max() < 0.5
+
+
+class _Cam:
+    """Identity floor: court cm == image px, no lens distortion."""
+    H = np.eye(3)
+    cal = {"division_lambda": 0}
+
+    def to_court(self, px):
+        return np.asarray(px, float)
+
+
+def test_sprite_quad_is_centred_on_the_feet_and_sized_by_outer_radius():
+    q = R.sprite_quad(_Cam(), [500.0, 400.0], outer_cm=R.SPRITE_R_PX)
+    assert np.allclose(q.mean(0), [500, 400])
+    assert np.allclose(q[1, 0] - q[0, 0], R.SPRITE_PX)          # asset px == cm when outer_cm == R px
+
+
+def test_sprite_is_blended_by_alpha_and_hidden_behind_the_holder():
+    R.OCC_FEATHER = 0
+    rgba = np.zeros((R.SPRITE_PX, R.SPRITE_PX, 4), np.uint8)
+    rgba[..., 0] = 255                                          # blue, fully opaque
+    rgba[..., 3] = 255
+    im = np.full((H, W, 3), 100, np.uint8)
+    quad = np.array([[60, 50], [120, 50], [120, 90], [60, 90]], np.float32)
+    R.draw_sprite_under(im, rgba, quad, 1.0, {1: person(84, 10, 96, 70)}, 1, 70)
+    assert (im[60, 90] == 100).all()                            # behind his leg, above the feet line
+    assert im[60, 70, 0] == 255 and im[60, 70, 1] == 0          # floor next to him: the sprite
+    assert im[80, 90, 0] == 255                                 # in front of his feet: the sprite
+    assert (im[20, 20] == 100).all()                            # outside the quad: untouched
+
+
+def test_sprite_stream_reads_forward_and_loops(tmp_path):
+    import subprocess
+    p = tmp_path / "ring.mov"
+    subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i",
+                    "color=c=red:s=%dx%d:d=0.125:r=24,format=rgba" % (R.SPRITE_PX, R.SPRITE_PX),
+                    "-c:v", "png", str(p)], check=True)
+    sp = R.SpriteStream(str(p))
+    try:
+        f0 = sp.frame(0)
+        f2 = sp.frame(2)
+        assert f0.shape == (R.SPRITE_PX, R.SPRITE_PX, 4) and f2[0, 0, 2] == 255   # BGRA: red
+        assert sp.frame(7) is not None                          # past the 3-frame end: loops
+        assert sp.frame(1) is not None                          # going back reopens
+    finally:
+        sp.close()
+
+
+def test_missing_assets_fall_back_to_the_classic_ring(tmp_path, monkeypatch):
+    monkeypatch.setattr(R, "ASSETS", str(tmp_path))
+    monkeypatch.setattr(R, "RING_STYLE", "sprite")
+    assert R.load_sprites() is None

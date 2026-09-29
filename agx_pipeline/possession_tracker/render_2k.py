@@ -8,8 +8,15 @@ the image through the court homography, so it lies in perspective like the in-ga
 drawn UNDER the players, cut out by their tracker masks: the back half of the ring passes behind
 the holder's legs (so he stands in it), and anyone nearer the camera covers it entirely.
 
+The ring is the client's animated blue "2K player circle" (a looping top-down RGBA animation,
+laid flat on the floor in perspective): the plain loop under the ball-holder, the {SHOOTING}
+version started at the release so its pulse fires as he shoots. Assets live in R2K_ASSETS
+(ring_blue_512.mov / ring_blue_shoot_512.mov: the 1080px originals scaled to 512, PNG codec);
+without them, or with R2K_RING_STYLE=classic, the drawn cyan/gold ring is used.
+
 Usage: render_2k.py <out_dir> <clip_dir> <name> [<name> ...]
-Env:   R2K_OUT (default <out_dir>/r2k), R2K_ZOOM (1.6), R2K_VERTICAL=1 to add a 9:16 cut
+Env:   R2K_OUT (default <out_dir>/r2k), R2K_ZOOM (1.6), R2K_VERTICAL=1 to add a 9:16 cut,
+       R2K_RING_STYLE (sprite|classic), R2K_ASSETS (default <this dir>/assets)
 Writes <R2K_OUT>/<name>_2k.mp4 (1920x1080, 30 fps) and, if asked, <name>_2k_vertical.mp4.
 """
 import os
@@ -25,6 +32,15 @@ ZOOM = float(os.environ.get("R2K_ZOOM", "1.6"))
 RING_CM = 70.0
 RING_COL = (255, 229, 0)          # BGR electric cyan
 SHOT_COL = (40, 200, 255)         # BGR gold: the shooter after release
+RING_STYLE = os.environ.get("R2K_RING_STYLE", "sprite")
+ASSETS = os.environ.get("R2K_ASSETS", os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets"))
+SPRITE_FILES = {"hold": "ring_blue_512.mov", "shot": "ring_blue_shoot_512.mov"}
+SPRITE_PX = 512                   # asset side
+SPRITE_FPS = 24
+SPRITE_N = 240                    # frames in one loop (10 s)
+SPRITE_R_PX = 166.7               # the ring's outer edge in the asset (measured on the alpha)
+SPRITE_OUTER_CM = 80.0            # ... laid on the floor at this radius (hole ~44 cm for the feet)
+SPRITE_COL = (249, 161, 93)       # BGR of the asset's blue, for the head marker
 TRAIL_LEN = 10                    # output frames of ball trail
 SMOOTH_S = 0.45                   # crop-centre smoothing window
 FPS = 30
@@ -121,6 +137,96 @@ def draw_ring_under(im, poly, col, alpha, players, oid, feet_y):
         return
     occ = occluders(players or {}, oid, feet_y, im.shape, (x0, y0, x1, y1))[..., None]
     im[y0:y1, x0:x1] = (layer[y0:y1, x0:x1] * (1 - occ) + im[y0:y1, x0:x1] * occ).astype(np.uint8)
+
+
+class SpriteStream:
+    """One animated RGBA ring, decoded on demand at SPRITE_PX. Frames are asked for in time
+    order within a clip, so a single ffmpeg pipe is read forward (reopened if asked to go back)."""
+
+    def __init__(self, path):
+        self.path, self.proc, self.i, self.cur = path, None, -1, None
+
+    def _open(self):
+        self.close()
+        self.proc = subprocess.Popen(["ffmpeg", "-nostdin", "-v", "error", "-i", self.path, "-f", "rawvideo",
+                                      "-pix_fmt", "bgra", "-"], stdout=subprocess.PIPE, stdin=subprocess.DEVNULL)
+        self.i = -1
+
+    def frame(self, n):
+        n = int(n) % SPRITE_N
+        if self.proc is None or n < self.i:
+            self._open()
+        size = SPRITE_PX * SPRITE_PX * 4
+        while self.i < n:
+            raw = self.proc.stdout.read(size)
+            if len(raw) < size:                       # shorter than expected: loop from the top
+                if self.i < 0:
+                    raise RuntimeError("ring asset unreadable: %s" % self.path)
+                n %= self.i + 1
+                self._open()
+                continue
+            self.cur = np.frombuffer(raw, np.uint8).reshape(SPRITE_PX, SPRITE_PX, 4)
+            self.i += 1
+        return self.cur
+
+    def close(self):
+        if self.proc is not None:
+            self.proc.stdout.close()
+            self.proc.kill()
+            self.proc.wait()
+            self.proc = None
+
+
+def load_sprites():
+    """{"hold", "shot"} SpriteStreams, or None (classic ring) when switched off or missing."""
+    if RING_STYLE != "sprite":
+        return None
+    paths = {k: os.path.join(ASSETS, f) for k, f in SPRITE_FILES.items()}
+    missing = [p for p in paths.values() if not os.path.isfile(p)]
+    if missing:
+        print("ring assets missing (%s) - classic ring" % ", ".join(missing), flush=True)
+        return None
+    return {k: SpriteStream(p) for k, p in paths.items()}
+
+
+def sprite_quad(cam, feet_px, outer_cm=SPRITE_OUTER_CM):
+    """Image positions of the asset's four corners when its ring (outer edge SPRITE_R_PX) is
+    laid on the floor around the feet with an outer radius of outer_cm."""
+    c = cam.to_court([feet_px])[0]
+    h = outer_cm * (SPRITE_PX / 2) / SPRITE_R_PX
+    court = np.array([[c[0] - h, c[1] - h], [c[0] + h, c[1] - h], [c[0] + h, c[1] + h], [c[0] - h, c[1] + h]],
+                     np.float32)
+    img = cv2.perspectiveTransform(court.reshape(-1, 1, 2), np.linalg.inv(cam.H)).reshape(-1, 2)
+    return redistort(cam.cal, img).astype(np.float32)
+
+
+def draw_sprite_under(im, rgba, quad, alpha, players, oid, feet_y):
+    """Warp the RGBA sprite onto the floor quad and blend it in, cut out where players cover it."""
+    x, y, w, h = cv2.boundingRect(np.round(quad).astype(np.int32))
+    x0, y0 = max(0, x), max(0, y)
+    x1, y1 = min(im.shape[1], x + w), min(im.shape[0], y + h)
+    if x1 <= x0 or y1 <= y0:
+        return
+    src = np.array([[0, 0], [SPRITE_PX, 0], [SPRITE_PX, SPRITE_PX], [0, SPRITE_PX]], np.float32)
+    M = cv2.getPerspectiveTransform(src, quad - np.array([x0, y0], np.float32))
+    warped = cv2.warpPerspective(rgba, M, (x1 - x0, y1 - y0), flags=cv2.INTER_LINEAR,
+                                 borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+    occ = occluders(players or {}, oid, feet_y, im.shape, (x0, y0, x1, y1))
+    a = (warped[..., 3].astype(np.float32) / 255.0 * alpha * (1 - occ))[..., None]
+    roi = im[y0:y1, x0:x1].astype(np.float32)
+    im[y0:y1, x0:x1] = (roi * (1 - a) + warped[..., :3].astype(np.float32) * a).astype(np.uint8)
+
+
+def draw_owner_ring(im, cam, feet, is_shot, alpha, players, oid, t_hold, t_shot, sprites):
+    """The ring under its owner: the animated sprite when loaded (hold loop, or the shooting
+    version counted from the release), else the classic drawn ring. Returns the marker colour."""
+    if sprites:
+        sp, n = (sprites["shot"], t_shot * SPRITE_FPS) if is_shot else (sprites["hold"], t_hold * SPRITE_FPS)
+        draw_sprite_under(im, sp.frame(max(0, n)), sprite_quad(cam, feet), alpha, players, oid, feet[1])
+        return SPRITE_COL
+    col = SHOT_COL if is_shot else RING_COL
+    draw_ring_under(im, ring_poly(cam, feet), col, alpha, players, oid, feet[1])
+    return col
 
 
 def draw_marker(im, box, col):
@@ -251,6 +357,7 @@ def render(out, clip_dir, name, dst_dir, vertical, make=None, badge_zone=None, S
 
     src_i, frame = -1, None
     trail = []
+    sprites = load_sprites()
     for k, tt in enumerate(out_t):
         want = int(round(tt * src_fps))
         while src_i < want:
@@ -268,7 +375,9 @@ def render(out, clip_dir, name, dst_dir, vertical, make=None, badge_zone=None, S
             if b is not None:
                 feet = [(b[0] + b[2]) / 2, b[3]]
                 near = int(np.argmin(np.abs(t - tt)))
-                draw_ring_under(im, ring_poly(cam, feet), col, alpha, S["players"][near], oid, feet[1])
+                is_shot = shot is not None and rel_t <= tt
+                col = draw_owner_ring(im, cam, feet, is_shot, alpha, S["players"][near], oid,
+                                      tt - out_t[0], tt - rel_t if is_shot else 0.0, sprites)
                 if alpha >= 1:
                     draw_marker(im, b, col)
         bx, by = ball_o[k]
@@ -292,6 +401,8 @@ def render(out, clip_dir, name, dst_dir, vertical, make=None, badge_zone=None, S
                 crop = im[y0:y0 + vh, x0:x0 + vw]
             proc.stdin.write(cv2.resize(crop, (ow, oh), interpolation=cv2.INTER_CUBIC).tobytes())
     cap.release()
+    for sp in (sprites or {}).values():
+        sp.close()
     for proc, _, _ in pipes.values():
         proc.stdin.close()
         proc.wait()

@@ -105,7 +105,7 @@ def near_owner_seq(S_n, cam_n, near, far_rows, offset):
     return seq
 
 
-def render_near(S, cam, clip, seq, rim_t, badge, dst_dir, name, vertical):
+def render_near(S, cam, clip, seq, rim_t, release_t, badge, dst_dir, name, vertical):
     t = np.asarray(S["times"], float)
     cap = cv2.VideoCapture(clip)
     src_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
@@ -138,6 +138,7 @@ def render_near(S, cam, clip, seq, rim_t, badge, dst_dir, name, vertical):
              "-s", "%dx%d" % (ow, oh), "-r", str(FPS), "-i", "-", "-c:v", "libx264", "-preset", "slow",
              "-crf", "18", "-pix_fmt", "yuv420p", "-movflags", "+faststart", path], stdin=subprocess.PIPE), ow, oh)
     src_i, frame = -1, None
+    sprites = R.load_sprites()
     for k, tt in enumerate(out_t):
         want = int(round(tt * src_fps))
         while src_i < want:
@@ -153,9 +154,9 @@ def render_near(S, cam, clip, seq, rim_t, badge, dst_dir, name, vertical):
         is_shot = seq[near[k]][1]
         alpha = 1.0 if tt <= rim_t else max(0.0, 1 - (tt - rim_t) / 0.5)
         if b is not None and alpha > 0:
-            col = R.SHOT_COL if is_shot else R.RING_COL
             feet = [(b[0] + b[2]) / 2, b[3]]
-            R.draw_ring_under(im, R.ring_poly(cam, feet), col, alpha, S["players"][near[k]], oid, feet[1])
+            col = R.draw_owner_ring(im, cam, feet, is_shot, alpha, S["players"][near[k]], oid,
+                                    tt - out_t[0], max(0.0, tt - release_t), sprites)
             if alpha >= 1:
                 R.draw_marker(im, b, col)
         if badge and hoop is not None and tt >= rim_t:
@@ -168,6 +169,8 @@ def render_near(S, cam, clip, seq, rim_t, badge, dst_dir, name, vertical):
             y0 = int(np.clip(cy - vh / 2, 0, Hh - vh))
             proc.stdin.write(cv2.resize(im[y0:y0 + vh, x0:x0 + vw], (ow, oh), interpolation=cv2.INTER_CUBIC).tobytes())
     cap.release()
+    for sp in (sprites or {}).values():
+        sp.close()
     for proc, _, _ in pipes.values():
         proc.stdin.close()
         proc.wait()
@@ -202,7 +205,8 @@ def one(game, r, work, sync):
     S_n = H.load(work, name)
     seq = near_owner_seq(S_n, cam_n, near, far_rows, offset)
     held = sum(1 for o, _ in seq if o is not None)
-    done = render_near(S_n, cam_n, clip, seq, float(shot["rim_t"]) + offset, BADGE.get(r["gt"]),
+    done = render_near(S_n, cam_n, clip, seq, float(shot["rim_t"]) + offset, float(shot["release_t"]) + offset,
+                       BADGE.get(r["gt"]),
                        os.path.join(work, "r2k"), name, True)
     print(name, "rendered" if done else "skipped", "| ring on %d/%d frames | offset %.2fs" % (held, len(seq), offset), flush=True)
 
