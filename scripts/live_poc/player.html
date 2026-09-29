@@ -1,0 +1,147 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Court A — Live Feed (PoC)</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wght@500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+  :root{
+    --ground:#0e1216; --panel:#161c23; --line:#242e38;
+    --ink:#e6ecf2; --dim:#8b9aa9; --accent:#4cc2d6; --live:#e5484d; --ok:#3dd68c;
+    --mono:"IBM Plex Mono",ui-monospace,SFMono-Regular,Menlo,monospace;
+    --sans:"Archivo",system-ui,-apple-system,Segoe UI,sans-serif;
+    color-scheme:dark;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--ground);color:var(--ink);font-family:var(--sans);
+       padding:28px 16px 48px;line-height:1.5}
+  .wrap{max-width:1180px;margin:0 auto}
+  header{display:flex;flex-wrap:wrap;gap:12px;align-items:baseline;
+         border-bottom:1px solid var(--line);padding-bottom:16px;margin-bottom:24px}
+  h1{font-size:clamp(20px,3vw,27px);margin:0;font-weight:700;letter-spacing:-.02em;text-wrap:balance}
+  .sub{color:var(--dim);font-size:13px;font-family:var(--mono)}
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:20px}
+  .panel{background:var(--panel);border:1px solid var(--line);border-radius:10px;overflow:hidden}
+  .bar{display:flex;align-items:center;gap:10px;padding:10px 14px;border-bottom:1px solid var(--line)}
+  .angle{font-family:var(--mono);font-weight:500;font-size:13px;letter-spacing:.06em}
+  .dot{width:8px;height:8px;border-radius:50%;background:var(--live);flex:none}
+  .dot.off{background:var(--dim)}
+  .state{margin-left:auto;font-family:var(--mono);font-size:11px;color:var(--dim);
+         text-align:right;font-variant-numeric:tabular-nums}
+  video{width:100%;display:block;aspect-ratio:16/9;background:#000;max-width:100%}
+  .meta{padding:10px 14px;font-family:var(--mono);font-size:11px;color:var(--dim);
+        border-top:1px solid var(--line);font-variant-numeric:tabular-nums;
+        overflow-x:auto;white-space:nowrap}
+  .note{margin-top:26px;padding:16px 18px;background:var(--panel);
+        border:1px solid var(--line);border-left:3px solid var(--accent);border-radius:8px}
+  .note h2{font-size:14px;margin:0 0 10px;letter-spacing:.02em}
+  .note ul{margin:0;padding-left:18px;font-size:13.5px;color:var(--dim)}
+  .note li{margin:5px 0}
+  .note b{color:var(--ink);font-weight:600}
+  code{font-family:var(--mono);font-size:12px;color:var(--accent);
+       background:rgba(76,194,214,.09);padding:1px 5px;border-radius:4px}
+  @media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>Court A — live feed</h1>
+    <span class="sub" id="sess"></span>
+  </header>
+
+  <div class="grid">
+    <div class="panel">
+      <div class="bar"><span class="dot" id="d-FL"></span><span class="angle">FL / LEFT</span>
+        <span class="state" id="s-FL">connecting…</span></div>
+      <video id="v-FL" controls muted playsinline></video>
+      <div class="meta" id="m-FL">—</div>
+    </div>
+    <div class="panel">
+      <div class="bar"><span class="dot" id="d-FR"></span><span class="angle">FR / RIGHT</span>
+        <span class="state" id="s-FR">connecting…</span></div>
+      <video id="v-FR" controls muted playsinline></video>
+      <div class="meta" id="m-FR">—</div>
+    </div>
+  </div>
+
+  <div class="note">
+    <h2>What this is</h2>
+    <ul>
+      <li>Live from the AGX at the venue: Zowietek <b>HEVC 3840&times;2160</b> &rarr; hardware decode, scale
+          and H.264 encode on the Jetson &rarr; HLS &rarr; S3 &rarr; CloudFront &rarr; this page.</li>
+      <li>Each segment carries <code>EXT-X-PROGRAM-DATE-TIME</code>. The wall-clock under each player is read
+          from the playing fragment's PDT &mdash; that value is the anchor the whole timestamp rebase depends on.</li>
+      <li>It is an <b>EVENT</b> playlist, so the scrub bar reaches back to the moment the publisher started.
+          That is the DVR the annotator gets, with no buffer window to manage.</li>
+      <li>The court is empty &mdash; no games for two weeks. The point is the pipeline, not the basketball.</li>
+    </ul>
+  </div>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/hls.js/1.5.13/hls.min.js"></script>
+<script>
+(function () {
+  var ANGLES = ["FL", "FR"];
+  var base = location.pathname.replace(/\/[^\/]*$/, "");
+  document.getElementById("sess").textContent = base.split("/").filter(Boolean).pop() || "";
+
+  function two(n) { return (n < 10 ? "0" : "") + n; }
+  function clock(d) {
+    return two(d.getHours()) + ":" + two(d.getMinutes()) + ":" + two(d.getSeconds());
+  }
+
+  ANGLES.forEach(function (a) {
+    var video = document.getElementById("v-" + a);
+    var state = document.getElementById("s-" + a);
+    var meta = document.getElementById("m-" + a);
+    var dot = document.getElementById("d-" + a);
+    var url = base + "/" + a + "/live.m3u8";
+    var lastPDT = null;
+
+    function paint() {
+      if (!lastPDT) return;
+      // Where the playhead sits in real time, and how far behind the live edge.
+      var behind = video.duration && isFinite(video.duration)
+        ? Math.max(0, video.duration - video.currentTime) : 0;
+      meta.textContent = "frame wall-clock " + clock(lastPDT)
+        + "   ·   behind live " + behind.toFixed(1) + "s"
+        + "   ·   buffered " + (video.duration && isFinite(video.duration)
+            ? video.duration.toFixed(0) + "s" : "—");
+      dot.className = "dot" + (behind > 30 ? " off" : "");
+      state.textContent = behind > 30 ? "BEHIND" : "LIVE";
+    }
+
+    if (window.Hls && Hls.isSupported()) {
+      var hls = new Hls({ lowLatencyMode: false, backBufferLength: Infinity });
+      hls.loadSource(url);
+      hls.attachMedia(video);
+      hls.on(Hls.Events.MANIFEST_PARSED, function () {
+        state.textContent = "LIVE";
+        video.play().catch(function () { state.textContent = "press play"; });
+      });
+      hls.on(Hls.Events.FRAG_CHANGED, function (_e, data) {
+        if (data && data.frag && data.frag.programDateTime) {
+          lastPDT = new Date(data.frag.programDateTime);
+          paint();
+        }
+      });
+      hls.on(Hls.Events.ERROR, function (_e, data) {
+        if (data && data.fatal) { state.textContent = "error: " + data.type; dot.className = "dot off"; }
+      });
+    } else if (video.canPlayType("application/vnd.apple.mpegurl")) {
+      video.src = url;                       // Safari plays HLS natively
+      video.addEventListener("loadedmetadata", function () {
+        state.textContent = "LIVE"; video.play().catch(function () {});
+      });
+    } else {
+      state.textContent = "no HLS support";
+    }
+
+    video.addEventListener("timeupdate", paint);
+  });
+})();
+</script>
+</body>
+</html>
