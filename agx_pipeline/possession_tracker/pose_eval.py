@@ -9,6 +9,11 @@ height. Rules compared (shooter = ...):
   min_dist      the player with the smallest hold distance overall
 Both fall back to the current rule when no one qualifies.
 
+Measured 2026-09-30 on 329 auto-labelled shots (current rule 237): as a replacement every
+variant is worse (best: min_dist, 22 fixed / 28 broken); as a tiebreaker only when the current
+pick's hands never come near the ball, +2 at best. NOT adopted: on these far cameras the wrists
+are small and noisy, and the gather that hides the ball hides the hands too.
+
 Usage: pose_eval.py   (box, /home/dev/possession; RTMPose on CPU via rtmlib)
 """
 import json
