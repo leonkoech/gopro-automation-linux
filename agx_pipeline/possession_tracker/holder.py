@@ -47,6 +47,17 @@ MIN_RELEASE_VOTES = max(1, 2 // FPS_DIV)
 #   HOLDER_TIP=1    a touch while the ball is already up at the rim is a tip/rebound, not the
 #                   release of the shot that got it there
 FRONT = os.environ.get("HOLDER_FRONT") == "1"
+# HOLDER_FLIGHT=1: touches while the ball is already in free flight (a smooth arc traced back from
+# the rim) are image overlaps with a contesting defender, not possession; the release is the
+# last touch before that arc begins. Measured cause of 50/51 wrong-shooter cases.
+FLIGHT = os.environ.get("HOLDER_FLIGHT") == "1"
+FLIGHT_TOL_PX = float(os.environ.get("HOLDER_FLIGHT_TOL", "12"))
+FLIGHT_MIN = 4
+# HOLDER_LAUNCH=1: the shooter is the player whose upper body holds the point where the ball's
+# free flight begins (traced back from the rim), used when touch-based possession disagrees
+# or finds nobody. Half the wrong-shooter cases never see the ball in the shooter's hands.
+LAUNCH = os.environ.get("HOLDER_LAUNCH") == "1"
+LAUNCH_PAD = 0.25
 TIP = os.environ.get("HOLDER_TIP") == "1"
 FRONT_OVERLAP = 0.3                    # x-overlap / narrower width for "overlapping in the image"
 TIP_R_MULT = 2.5                       # x hoop near-radius: the rim zone
@@ -340,9 +351,61 @@ def in_tip_zone(st, hoop, near_r):
     return d <= TIP_R_MULT * near_r and st["ball_xyh"][2] >= TIP_H_CM
 
 
+def flight_start(frames, lo, ri):
+    """First frame of the ball's free flight into the rim at frame ri: walk back while the
+    ball's pixel track still fits x linear / y quadratic in time within FLIGHT_TOL_PX."""
+    ks = [k for k in range(lo + 1, ri + 1) if "ball_px" in frames[k]]
+    if len(ks) < FLIGHT_MIN:
+        return None
+    start = None
+    seg = []
+    for k in reversed(ks):
+        seg.append(k)
+        if len(seg) < FLIGHT_MIN:
+            continue
+        t = np.array([frames[j]["t"] for j in seg])
+        x = np.array([frames[j]["ball_px"][0] for j in seg], float)
+        y = np.array([frames[j]["ball_px"][1] for j in seg], float)
+        rx = x - np.polyval(np.polyfit(t, x, 1), t)
+        ry = y - np.polyval(np.polyfit(t, y, 2), t)
+        if max(np.abs(rx).max(), np.abs(ry).max()) > FLIGHT_TOL_PX:
+            break
+        start = k
+    return start
+
+
+def launcher(S, frames, lo, ri):
+    """(player, frame) whose upper body holds the ball where its free flight begins."""
+    fs = flight_start(frames, lo, ri)
+    if fs is None:
+        return None, None
+    for k in range(fs, max(lo, fs - 3), -1):          # the launch frame, or up to 2 before it
+        if "ball_px" not in frames[k]:
+            continue
+        u, v = frames[k]["ball_px"]
+        best, bd = None, 1e9
+        for oid, p in S["players"][k].items():
+            b = p["box"]
+            w, h = b[2] - b[0], b[3] - b[1]
+            if not (b[0] - LAUNCH_PAD * w <= u <= b[2] + LAUNCH_PAD * w and b[1] - 0.35 * h <= v <= b[1] + 0.6 * h):
+                continue
+            dist = abs(u - (b[0] + b[2]) / 2) / w + abs(v - b[1]) / h
+            if dist < bd:
+                best, bd = oid, dist
+        if best is not None:
+            return best, k
+    return None, None
+
+
 def attribute(S, frames, lo, ri, hoop=None, near_r=None):
     """Release = last contact frame in (lo, ri]; shooter = most contact in RELEASE_WIN before it."""
     cand = [k for k in range(lo + 1, ri + 1) if frames[k]["near"] is not None]
+    if FLIGHT:
+        fs = flight_start(frames, lo, ri)
+        if fs is not None:
+            before = [k for k in cand if k <= fs]
+            if before:
+                cand = before
     if TIP and hoop is not None:
         # a tip/rebound: touched in the rim zone AFTER the ball had already flown into that zone
         # untouched (a layup carries the ball up in the hand, so it never qualifies)
@@ -356,6 +419,13 @@ def attribute(S, frames, lo, ri, hoop=None, near_r=None):
             cand = away
     rel = max(cand, default=None)
     if rel is None:
+        if LAUNCH:
+            lid, lk = launcher(S, frames, lo, ri)
+            if lid is not None:
+                return {"rim_i": ri, "rim_t": frames[ri]["t"], "release_i": lk, "release_t": frames[lk]["t"],
+                        "shooter": lid, "votes": {lid: 0},
+                        "shooter_track": [[round(float(S["times"][k]), 3), [round(float(v)) for v in S["players"][k][lid]["box"]]]
+                                          for k in range(len(frames)) if lid in S["players"][k]]}
         return {"rim_i": ri, "rim_t": frames[ri]["t"]}
     t_rel = frames[rel]["t"]
     votes = {}
@@ -367,6 +437,10 @@ def attribute(S, frames, lo, ri, hoop=None, near_r=None):
     # window can hand the shot to the defender
     at_rel = frames[rel]["near"]
     sid = at_rel if votes.get(at_rel, 0) >= MIN_RELEASE_VOTES else max(votes, key=votes.get)
+    if LAUNCH:
+        lid, lk = launcher(S, frames, lo, ri)
+        if lid is not None and lid != sid:
+            sid, rel, t_rel = lid, lk, frames[lk]["t"]
     return {"rim_i": ri, "rim_t": frames[ri]["t"], "release_i": rel, "release_t": t_rel,
             "shooter": sid, "votes": votes,
             "shooter_track": [[round(float(S["times"][k]), 3), [round(float(v)) for v in S["players"][k][sid]["box"]]]
