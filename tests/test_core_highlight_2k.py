@@ -55,3 +55,10 @@ def test_cv_clips_are_ordered_by_their_own_time():
     clips = build_reel("g", g)["clips"]
     assert [c["url"] for c in clips] == ["u1", "u2"]
     assert clips[0]["ts"].startswith("2026-")
+
+
+@pytest.mark.unit
+def test_cv_clip_takes_the_tracker_team():
+    g = {"logs": [], "highlights": {"cv_1789785674_left": {"status": "ready", "url": "u", "angle": "FL"}},
+         "tracker_teams": {"switch_epoch": 1789785000.0, "left_basket_first": "left"}}
+    assert build_reel("g", g)["clips"][0]["team"] == "right"     # after half-time the right team attacks left

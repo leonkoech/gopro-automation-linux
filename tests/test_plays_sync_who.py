@@ -46,3 +46,12 @@ def test_no_who_no_suggestion(monkeypatch):
     epoch = int(datetime(2026, 9, 16, 2, 20, 0, tzinfo=timezone.utc).timestamp())
     created = _run(_game({"cv_%d_left" % epoch: {"zone": "2PT", "confidence": 0.8}}), monkeypatch)
     assert "Tracker suggests" not in created[0]["note"]
+
+
+@pytest.mark.unit
+def test_cv_card_gets_the_team_from_the_half_time_rule(monkeypatch):
+    epoch = int(datetime(2026, 9, 16, 2, 20, 0, tzinfo=timezone.utc).timestamp())
+    g = _game({})
+    g["tracker_teams"] = {"switch_epoch": epoch + 600, "left_basket_first": "right"}
+    created = _run(g, monkeypatch)
+    assert created[0]["team"] == "team2"            # right team attacks the left basket first

@@ -58,6 +58,18 @@ def _cv_ts(log_id) -> Optional[str]:
     return datetime.fromtimestamp(int(m.group(1)), tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
 
 
+def _cv_team(game: Dict, log_id) -> Optional[str]:
+    """CV clips have no score log: the tracker's team (cv_points, or the game's half-time rule)."""
+    v = (game.get("cv_points") or {}).get(str(log_id)) or {}
+    if v.get("team") in ("left", "right"):
+        return v["team"]
+    m = re.match(r"cv_(\d{9,11})_(left|right)$", str(log_id))
+    if not m or not game.get("tracker_teams"):
+        return None
+    from agx_pipeline.team_assign import team_for_shot
+    return team_for_shot(game["tracker_teams"], m.group(2), float(m.group(1)))
+
+
 def _play_type(log: Dict) -> Optional[str]:
     """Canonical play-type label for a score log, or None for non-scores."""
     if log.get("actionType") in ("score_added", "player_score_added"):
@@ -124,7 +136,7 @@ def build_reel(firebase_game_id: str, game: Dict, game_date: Optional[str] = Non
         clips.append({
             "url": h["url_2k"] if (_use_2k() and h.get("url_2k")) else h["url"],
             "play_type": play_type,
-            "team": log.get("team"),          # "left"/"right" (team identity)
+            "team": log.get("team") or _cv_team(game, log_id),  # "left"/"right" (team identity)
             "ts": log.get("timestamp") or _cv_ts(log_id),  # ISO — reel ordering key
             "angle": h.get("angle"),           # camera the clip was cut from
             "team1_score": score[0] if score else None,  # running, after this shot

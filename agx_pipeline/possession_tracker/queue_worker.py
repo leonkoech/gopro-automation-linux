@@ -26,6 +26,8 @@ Env (all optional):
                                    (the plain clip stays at url_plain)
   TRACKER_PUBLISH_CORE      true   publish the reel to Core when a game's queue is done
   TRACKER_WHO               false  read the jersey number on the tracked shooter -> cv_points.who
+  TRACKER_WHO_EXTEND        false  if the clip gives no number, follow the shooter up to 15 s back /
+                                   5 s forward in the live buffer (67% named at 78% vs 60% at 83%)
                                    (validated on 395 annotated shots: speaks on 72%, right 83%)
   TRACKER_BACKLOG_MAX       6      pause while the live detector is this many segments behind
 
@@ -62,6 +64,7 @@ DO_2K = _flag("TRACKER_2K", "true")
 TV_2K = _flag("TRACKER_TV_2K", "false")
 PUBLISH = _flag("TRACKER_PUBLISH_CORE", "true")
 WHO = _flag("TRACKER_WHO", "false")
+WHO_EXTEND = _flag("TRACKER_WHO_EXTEND", "false")
 WHO_PYSRC = os.environ.get("TRACKER_WHO_PYSRC", "/home/dev/who_deps_staging/pysrc")
 BACKLOG_MAX = int(os.environ.get("TRACKER_BACKLOG_MAX", "6"))
 BUCKET = os.environ.get("UPLOAD_BUCKET", "uball-videos-production")
@@ -231,11 +234,20 @@ def jersey_stack():
     return _JS
 
 
-def read_who(clip, res, shot):
-    """Jersey number of the tracked shooter: read on every frame he is tracked, vote."""
+def read_who(clip, res, shot, job=None):
+    """Jersey number of the tracked shooter: read on every frame he is tracked, vote; if the
+    clip gives none and TRACKER_WHO_EXTEND is on, follow him beyond the clip."""
     import who_eval as W
     boxes = (res.get("tracks") or {}).get(str(shot["shooter"]), [])
     reads = W.read_track(jersey_stack(), clip, boxes)
+    if WHO_EXTEND and job is not None and W.speak(reads, None) is None:
+        try:
+            import who_extend_live as XL
+            n0 = len(reads)
+            reads = XL.extend_reads(jersey_stack(), job, boxes, reads)
+            job["who_extended_reads"] = len(reads) - n0
+        except Exception as e:  # noqa: BLE001 - the clip-only answer stands
+            job["who_extend_error"] = "%s: %s" % (type(e).__name__, e)
     num = W.speak(reads, None)
     votes = {}
     for n, c in reads:
@@ -255,11 +267,20 @@ def process_fast(name, job):
         job["fast_zone"] = zone
         job["feet_px"] = feet
         extra = {}
+        if shot is not None:
+            try:
+                import team_eval as TE
+                rel = shot.get("release_i") or 0
+                lab = TE.torso_colour(S, clip, shot["shooter"], list(range(max(0, rel - 12), rel + 1, 3)))
+                if lab is not None:
+                    extra["kit_lab"] = [round(float(v), 1) for v in lab]
+            except Exception as e:  # noqa: BLE001 - team falls back to basket side alone
+                job["kit_error"] = "%s: %s" % (type(e).__name__, e)
         if WHO and shot is not None:
             try:
-                num, top = read_who(clip, res, shot)
+                num, top = read_who(clip, res, shot, job)
                 job["who"] = num
-                extra = {"who": num, "who_votes": dict(top), "who_source": "tracker"}
+                extra.update({"who": num, "who_votes": dict(top), "who_source": "tracker"})
             except Exception as e:  # noqa: BLE001 - WHO never blocks the type
                 job["who_error"] = "%s: %s" % (type(e).__name__, e)
         if zone:
@@ -313,6 +334,23 @@ def maybe_publish():
         d = game_doc(g).get().to_dict() or {}
         if d.get("status") != "completed" and not d.get("endedAt"):
             continue
+        # team for every shot: one half-time switch found from the shooters' kit colours
+        try:
+            from agx_pipeline.team_assign import assign_game, team_for_shot
+            tt = assign_game(d)
+            if tt:
+                patch = {"tracker_teams": tt}
+                for lid in (d.get("cv_points") or {}):
+                    m = lid.split("_")
+                    if len(m) == 3 and m[0] == "cv":
+                        team = team_for_shot(tt, m[2], float(m[1]))
+                        if team:
+                            patch["cv_points.%s.team" % lid] = team
+                game_doc(g).update(patch)
+                d = game_doc(g).get().to_dict() or {}
+                log("game %s teams: half-time %s, left basket first: %s" % (g, tt.get("switch_epoch"), tt.get("left_basket_first")))
+        except Exception as e:  # noqa: BLE001
+            log("team pass failed for %s: %s" % (g, e))
         from agx_pipeline.core_highlight import publish_core_highlight
         date = None
         for h in (d.get("highlights") or {}).values():
@@ -362,8 +400,8 @@ def main():
         os.nice(19)
     except OSError:
         pass
-    log("worker up: queue=%s sam3=%s (max %d/game, near %gpx) 2k=%s tv_2k=%s publish=%s who=%s"
-        % (QUEUE, USE_SAM3, SAM3_MAX, SAM3_NEAR_PX, DO_2K, TV_2K, PUBLISH, WHO))
+    log("worker up: queue=%s sam3=%s (max %d/game, near %gpx) 2k=%s tv_2k=%s publish=%s who=%s who_extend=%s"
+        % (QUEUE, USE_SAM3, SAM3_MAX, SAM3_NEAR_PX, DO_2K, TV_2K, PUBLISH, WHO, WHO_EXTEND))
     idle = 0
     while True:
         worked = step()

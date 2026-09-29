@@ -335,6 +335,15 @@ def create_plays_from_shot_live(
         # speaks on 395 annotated shots, so it is a hint, never a fill.
         if _v and _v.get("who"):
             note += f" · Tracker suggests #{_v['who']}"
+        # Team from the tracker's half-time switch (basket side + time), makes AND misses — the
+        # score goes to the team even when no player is named.
+        _team = None
+        try:
+            from agx_pipeline.team_assign import team_for_shot
+            _ep = datetime.fromisoformat(s["wallclock"]).timestamp() if s.get("wallclock") else None
+            _team = team_for_shot(firebase_game.get("tracker_teams"), s.get("side"), _ep)
+        except Exception:  # noqa: BLE001
+            _team = None
 
         play_data: Dict[str, Any] = {
             "game_id": uball_game_id,
@@ -354,6 +363,8 @@ def create_plays_from_shot_live(
         }
         if angle:
             play_data["angle"] = angle
+        if _team in ("left", "right"):
+            play_data["team"] = "team1" if _team == "left" else "team2"
 
         if dry_run:
             created += 1
