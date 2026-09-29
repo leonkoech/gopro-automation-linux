@@ -83,6 +83,62 @@ def check_who() -> Tuple[str, str]:
     return OK, "scan script, models and roster all present"
 
 
+def _detector_weight() -> str:
+    """The exact file the detector will open, resolved the way node.py resolves
+    it -- imported rather than re-derived, so this can never name a different
+    weight than production loads."""
+    from agx_pipeline.shot_detect import node  # noqa: PLC0415
+    return os.getenv("SHOT_DET_WEIGHT", node._DEFAULT_WEIGHT)
+
+
+def check_detector(load: bool = False) -> Tuple[str, str]:
+    """Will the shot detector's weight actually load and run here?
+
+    A1 adopts TensorRT by pointing SHOT_DET_WEIGHT at a .engine file. No code
+    changes, which is the appeal -- and the reason it needs a check. An engine is
+    built for one GPU and one TensorRT build, and a wrong one is indistinguishable
+    from a right one on disk: the path resolves, the service starts clean, and it
+    dies on the first shot of the game. We have also already been bitten by an
+    engine that loaded fine and then refused a single-frame predict because it
+    was exported at a fixed batch.
+
+    So the file checks always run, and `load` does the only thing that settles
+    it: build the model and push one frame through it at the production image
+    size. That costs GPU and seconds, so it stays opt-in (`--load`) and the
+    deploy gate is where it belongs.
+    """
+    try:
+        weight = Path(_detector_weight())
+    except Exception as exc:  # noqa: BLE001
+        return BLOCKED, f"cannot resolve the detector weight: {exc}"
+    if weight.is_symlink() and not weight.exists():
+        return BLOCKED, (f"weight is a DANGLING SYMLINK: {weight} -> "
+                         f"{os.readlink(weight)}")
+    if not weight.is_file():
+        return BLOCKED, f"weight not found: {weight}"
+
+    engine = weight.suffix == ".engine"
+    backend = "TensorRT engine" if engine else f"PyTorch weight ({weight.suffix})"
+    if not load:
+        note = "" if engine else " — still PyTorch; A1 points this at a .engine"
+        return OK, f"{backend}: {weight}{note} (run with --load to prove it runs)"
+
+    imgsz = int(os.getenv("SHOT_DET_IMGSZ", "1280"))
+    try:
+        import numpy as np  # noqa: PLC0415
+        from ultralytics import YOLO  # noqa: PLC0415
+        model = YOLO(str(weight))
+        # One frame, not a batch: a fixed-batch export loads happily and only
+        # fails here, which is the failure we actually hit.
+        model.predict(np.zeros((imgsz, imgsz, 3), dtype=np.uint8),
+                      imgsz=imgsz, verbose=False)
+    except Exception as exc:  # noqa: BLE001
+        return BLOCKED, (f"{backend} at {weight} did not run here (imgsz={imgsz}): "
+                         f"{exc}. An engine is tied to the GPU and the TensorRT "
+                         f"build it was exported on — re-export it on this box.")
+    return OK, f"{backend} loaded and ran one frame at imgsz={imgsz}: {weight}"
+
+
 def check_eval() -> Tuple[str, str]:
     """The eval is only useful if it scores what production runs."""
     sys.path.insert(0, str(REPO / "scripts" / "gt_eval"))
@@ -99,9 +155,21 @@ def check_eval() -> Tuple[str, str]:
     return OK, f"matches production ({prod.get('SHOT_ATTRIB')})"
 
 
-def main() -> int:
+def main(argv: Optional[List[str]] = ()) -> int:
+    # Defaults to no flags rather than sys.argv so that callers (and the tests)
+    # can invoke main() bare without inheriting whatever ran the process; the
+    # CLI passes sys.argv[1:] explicitly below.
+    import argparse  # noqa: PLC0415
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--load", action="store_true",
+                    help="actually load the detector weight and run one frame "
+                         "through it (needs the GPU; the only way to catch a "
+                         "TensorRT engine built for another box)")
+    args = ap.parse_args(argv)
+
     checks = (("TYPE (live typing)", check_typing),
               ("WHO (jersey scan)", check_who),
+              ("DETECTOR weight", lambda: check_detector(load=args.load)),
               ("TYPE eval harness", check_eval))
     print(f"stage check — SHOT_TYPING_CWD={TYPING_CWD}\n")
     failed = False
@@ -120,4 +188,4 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(main(sys.argv[1:]))
