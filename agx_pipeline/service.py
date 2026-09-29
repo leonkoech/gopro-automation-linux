@@ -48,6 +48,9 @@ logger = logging.getLogger("agx.service")
 
 app = Flask(__name__)
 CFG = load_config()
+# Coverage records live beside the recordings; the config knows where that is.
+from agx_pipeline import coverage as _coverage  # noqa: E402
+_coverage.configure(CFG.output_dir)
 # Recording backend: "camrec" drives geoffbauer's per-camera FastAPI recorder
 # (robust, watchdog-supervised); "gstreamer" (default) is our own single
 # gst-launch. Both expose the same start()/stop() interface.
@@ -251,6 +254,26 @@ def system_info():
     return jsonify({"success": True, "hostname": socket.gethostname(),
                     "jetson_id": CFG.jetson_id,
                     "disk": {"total": total, "used": used, "free": free}})
+
+
+@app.route("/api/coverage")
+def coverage_status():
+    """Recent games and anything wrong with them.
+
+    Exposed here because this is the surface the fleet monitor already polls, so
+    a coverage shortfall reaches the same alert path as an offline box or a full
+    disk. Games still being played are not reported as problems.
+    """
+    from agx_pipeline import coverage
+    try:
+        hours = float(request.args.get("hours", 24))
+    except (TypeError, ValueError):
+        hours = 24.0
+    games = [{"game_id": d.get("game_id"), "status": d.get("status"),
+              "updated_at": d.get("updated_at"),
+              "summary": coverage.summarize(d)} for d in coverage.recent(hours)]
+    return jsonify({"success": True, "jetson_id": CFG.jetson_id,
+                    "problems": coverage.problems(hours), "games": games})
 
 
 # --------------------------------------------------------------------------- #
