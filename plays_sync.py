@@ -235,12 +235,50 @@ def _typing_verdict(cv_points: Dict[str, Any], shot: Dict[str, Any]) -> Optional
     return v if isinstance(v, dict) else None
 
 
+# Same vote thresholds as the tracker's own (possession_tracker/who_eval.speak).
+_WHO_V_MIN = 1.5
+_WHO_V_RATIO = 1.5
+
+
+def _who_suggestion(v: Optional[Dict[str, Any]], team: Optional[str],
+                    rosters: Dict[str, Dict[str, str]]) -> Optional[tuple]:
+    """(number, player name or None) to suggest on a CV card, or None.
+
+    With the shooting team known and its roster available, the tracker's stored jersey votes are
+    re-voted over that roster's numbers only (a read of an opponent's number is dropped) and the
+    player's name comes with it. Without them, the tracker's own number is kept as is."""
+    if not v:
+        return None
+    roster = rosters.get(team) if team in ("left", "right") else None
+    votes = v.get("who_votes")
+    if roster and isinstance(votes, dict) and votes:
+        ok = sorted(((str(n), float(w)) for n, w in votes.items() if str(n) in roster), key=lambda x: -x[1])
+        if not ok or ok[0][1] < _WHO_V_MIN or (len(ok) > 1 and ok[0][1] < _WHO_V_RATIO * ok[1][1]):
+            return None
+        return ok[0][0], roster[ok[0][0]]
+    return (str(v["who"]), None) if v.get("who") else None
+
+
+def rosters_from_annotation_game(game: Optional[Dict[str, Any]]) -> Dict[str, Dict[str, str]]:
+    """{"left": {jersey: name}, "right": {...}} from an annotation game (team1 = left)."""
+    out: Dict[str, Dict[str, str]] = {}
+    for side, key in (("left", "roster_team1"), ("right", "roster_team2")):
+        r = {}
+        for p in (game or {}).get(key) or []:
+            if p.get("jersey_number") is not None and p.get("name"):
+                r[str(p["jersey_number"])] = str(p["name"])
+        if r:
+            out[side] = r
+    return out
+
+
 def create_plays_from_shot_live(
     client: Any,
     uball_game_id: str,
     firebase_game: Dict[str, Any],
     dry_run: bool = False,
     summary: Optional[Dict[str, Any]] = None,
+    rosters: Optional[Dict[str, Dict[str, str]]] = None,
 ) -> int:
     """Create annotation cards from the CV's `shot_live` shadow — every make/miss
     the high-fps SL/SR detector saw, independent of the scorekeeper.
@@ -333,8 +371,6 @@ def create_plays_from_shot_live(
         # Jersey SUGGESTION from the possession tracker (cv_points.{id}.who): shown in the note
         # only — the player field stays the annotator's call. Validated at 83% right when it
         # speaks on 395 annotated shots, so it is a hint, never a fill.
-        if _v and _v.get("who"):
-            note += f" · Tracker suggests #{_v['who']}"
         # Team from the tracker's half-time switch (basket side + time), makes AND misses — the
         # score goes to the team even when no player is named.
         _team = None
@@ -344,6 +380,11 @@ def create_plays_from_shot_live(
             _team = team_for_shot(firebase_game.get("tracker_teams"), s.get("side"), _ep)
         except Exception:  # noqa: BLE001
             _team = None
+        # Only numbers on the SHOOTING team's roster are suggested, with the player's name
+        # (unseen games: right 81% when it speaks vs 78% on any number).
+        _who = _who_suggestion(_v, _team, rosters or {})
+        if _who:
+            note += f" · Tracker suggests #{_who[0]}" + (f" {_who[1]}" if _who[1] else "")
 
         play_data: Dict[str, Any] = {
             "game_id": uball_game_id,

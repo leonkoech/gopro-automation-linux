@@ -55,3 +55,48 @@ def test_cv_card_gets_the_team_from_the_half_time_rule(monkeypatch):
     g["tracker_teams"] = {"switch_epoch": epoch + 600, "left_basket_first": "right"}
     created = _run(g, monkeypatch)
     assert created[0]["team"] == "team2"            # right team attacks the left basket first
+
+
+ROSTERS = {"left": {"7": "Giovanni Garcia", "2": "Kevin Garcia"}, "right": {"0": "Nick Rosso", "12": "Ryan Jackson"}}
+
+
+@pytest.mark.unit
+def test_roster_suggestion_names_the_player_from_the_shooting_team():
+    v = {"who": "7", "who_votes": {"7": 9.0, "12": 2.0}}
+    assert plays_sync._who_suggestion(v, "left", ROSTERS) == ("7", "Giovanni Garcia")
+
+
+@pytest.mark.unit
+def test_roster_drops_a_number_the_shooting_team_does_not_have():
+    # the raw vote says #12, but #12 plays for the OTHER team: the left roster's #2 wins if strong
+    v = {"who": "12", "who_votes": {"12": 9.0, "2": 4.0}}
+    assert plays_sync._who_suggestion(v, "left", ROSTERS) == ("2", "Kevin Garcia")
+    weak = {"who": "12", "who_votes": {"12": 9.0, "2": 1.0}}
+    assert plays_sync._who_suggestion(weak, "left", ROSTERS) is None
+
+
+@pytest.mark.unit
+def test_no_roster_or_no_team_keeps_the_plain_number():
+    v = {"who": "7", "who_votes": {"7": 9.0}}
+    assert plays_sync._who_suggestion(v, None, ROSTERS) == ("7", None)
+    assert plays_sync._who_suggestion(v, "left", {}) == ("7", None)
+    assert plays_sync._who_suggestion({}, "left", ROSTERS) is None
+
+
+@pytest.mark.unit
+def test_card_note_carries_the_roster_name(monkeypatch):
+    epoch = int(datetime(2026, 9, 16, 2, 20, 0, tzinfo=timezone.utc).timestamp())
+    game = _game({"cv_%d_left" % epoch: {"zone": "2PT", "who": "7", "who_votes": {"7": 9.0}, "confidence": 0.8}})
+    game["tracker_teams"] = {"switch_epoch": None, "left_basket_first": "left"}
+    c = FakeClient()
+    plays_sync.create_plays_from_shot_live(c, "G", game, rosters=ROSTERS)
+    assert "Tracker suggests #7 Giovanni Garcia" in c.created[0]["note"]
+    assert c.created[0]["events"][0]["playerA"] is None
+
+
+@pytest.mark.unit
+def test_rosters_from_annotation_game_maps_team1_to_left():
+    g = {"roster_team1": [{"name": "Giovanni Garcia", "jersey_number": 7}, {"name": "No Number", "jersey_number": None}],
+         "roster_team2": [{"name": "Nick Rosso", "jersey_number": 0}]}
+    assert plays_sync.rosters_from_annotation_game(g) == {"left": {"7": "Giovanni Garcia"}, "right": {"0": "Nick Rosso"}}
+    assert plays_sync.rosters_from_annotation_game(None) == {}
