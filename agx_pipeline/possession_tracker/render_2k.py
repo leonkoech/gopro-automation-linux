@@ -43,6 +43,9 @@ GROW_S = 0.3                      # seconds to grow after the release
 SHOW_MARKER = os.environ.get("R2K_MARKER") == "1"
 SHOW_TRAIL = os.environ.get("R2K_TRAIL") == "1"
 SHOW_BADGE = os.environ.get("R2K_BADGE") == "1"
+# R2K_SHOT_FRAMING=1: around the release, frame the ball AND the shooter's feet (the shooting
+# circle stays in view) instead of following the ball alone; off by default (production framing)
+SHOT_FRAMING = os.environ.get("R2K_SHOT_FRAMING") == "1"
 SPRITE_PX = 512                   # asset side
 SPRITE_FPS = 24
 SPRITE_N = 240                    # frames in one loop (10 s)
@@ -443,6 +446,15 @@ def render(out, clip_dir, name, dst_dir, vertical, make=None, badge_zone=None, S
             return (bi or bj)["box"]
         w = (out_t[k] - t[i]) / max(t[j] - t[i], 1e-6)
         return (1 - w) * bi["box"] + w * bj["box"]
+
+    if SHOT_FRAMING and shot:
+        aim = ball_o.copy()
+        for k, tt in enumerate(out_t):
+            if rel_t - 0.3 <= tt <= rel_t + 0.9:
+                b = box_at(shot["shooter"], k)
+                if b is not None:            # midway between the ball and his feet: both in frame
+                    aim[k] = [(ball_o[k][0] + (b[0] + b[2]) / 2) / 2, (ball_o[k][1] + b[3]) / 2]
+        centre = smooth(aim, max(1, int(SMOOTH_S * FPS)))
 
     # score badge for makes: the tracker's own type from the shooter's median takeoff feet
     badge, hoop = None, res.get("hoop_px")
