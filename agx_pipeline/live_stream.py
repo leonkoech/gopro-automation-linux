@@ -69,6 +69,8 @@ MAX_MIN = int(os.getenv("LIVE_MAX_MIN", "180"))
 # Refuse to start if the disk is already tight. HLS is small (~4.5 GB/angle for
 # a 2h game) but recording's needs come first.
 MIN_FREE_GB = float(os.getenv("LIVE_MIN_FREE_GB", "40"))
+# Bounded so a camera that is genuinely gone does not spin forever.
+MAX_RESTARTS = int(os.getenv("LIVE_MAX_RESTARTS", "10"))
 
 
 def _now_iso() -> str:
@@ -97,6 +99,8 @@ class _AnglePublisher:
         self._sent: set[str] = set()
         self._stop = threading.Event()
         self._uploader: Optional[threading.Thread] = None
+        self._log = None
+        self.restarts = 0
 
     # ---- pipeline ---------------------------------------------------------
     def _gst_cmd(self) -> str:
@@ -139,21 +143,26 @@ class _AnglePublisher:
         os.makedirs(self.dir, exist_ok=True)
         cmd = f"{self._gst_cmd()} | {self._ffmpeg_cmd()}"
         try:
+            # Keep stderr. A publisher that dies silently cannot be diagnosed
+            # after the fact, and we have lost two weeks before to a subprocess
+            # whose error output was thrown away.
+            self._log = open(os.path.join(self.dir, "publish.log"), "ab", buffering=0)
             self.proc = subprocess.Popen(
                 ["bash", "-c", cmd],
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                stderr=self._log,
                 preexec_fn=os.setsid,
             )
         except OSError as e:
             logger.error("[LIVE] %s publisher failed to spawn: %s", self.angle, e)
             self.proc = None
             return False
-        self._uploader = threading.Thread(
-            target=self._upload_loop, name=f"live-upload-{self.angle}", daemon=True
-        )
-        self._uploader.start()
+        if self._uploader is None or not self._uploader.is_alive():
+            self._uploader = threading.Thread(
+                target=self._upload_loop, name=f"live-upload-{self.angle}", daemon=True
+            )
+            self._uploader.start()
         logger.info("[LIVE] %s <- %s publishing to %s", self.angle, self.source_angle, self.playlist_url)
         return True
 
@@ -374,7 +383,14 @@ class LivePublisher:
 
     # ---- watchdog ---------------------------------------------------------
     def _watch(self) -> None:
-        """Report each angle's PDT anchor once it exists, and enforce the cap."""
+        """Restart a dead angle, report its PDT anchor, and enforce the cap.
+
+        The restart is the important half. An angle whose pipeline dies — at
+        startup under contention, or mid-game when a camera hiccups — would
+        otherwise stay dead for the whole game, and the annotator would simply
+        never get that side. Measured in testing: FR died at launch while FL ran
+        fine, and nothing retried it.
+        """
         reported: set[str] = set()
         while not self._stop_evt.wait(5):
             try:
@@ -383,6 +399,12 @@ class LivePublisher:
                     threading.Thread(target=self.stop, daemon=True).start()
                     return
                 for a in self._angles:
+                    if not a.alive() and a.restarts < MAX_RESTARTS:
+                        a.restarts += 1
+                        logger.warning("[LIVE] %s died — restart %d/%d",
+                                       a.angle, a.restarts, MAX_RESTARTS)
+                        a.start()
+                        continue
                     if a.angle in reported:
                         continue
                     pdt = a.first_pdt()
