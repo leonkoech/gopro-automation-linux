@@ -3,7 +3,7 @@ against the annotators. Every stage is resumable; run them in order.
 
   gt     the annotators' shots (type, make/miss, basket, jersey + team from the game's check-in
          rosters, which is what production sees) + the registered kit colours (Firebase)
-  map    clock line SL/SR master -> game video, one RANSAC line per side fitted on (replayed
+  map    clock line SL/SR master -> game video, one line per side (slope + offset) fitted on (replayed
          shot, annotated shot) pairs. Production cuts clips by wall clock and needs no map; this
          only aligns two recordings, globally, so no single shot's answer leaks in.
   clips  a clip [t-5 s, t+3 s] from the annotation tool's FL/FR video at every replayed CV shot
@@ -39,6 +39,9 @@ ROOT = "/home/dev/gametest"
 VAL = "/home/dev/validate"
 MATCH_S = 2.0            # a CV shot and an annotated shot pair within this (after the clock line)
 MAP_TOL_S = 1.0
+LOCAL_MAX_S = 12.0       # annotated shot <-> nearest CV shot offsets beyond this are other shots
+LOCAL_WIN_S = 240.0
+LOCAL_MIN = 6
 DEDUP_S = 1.0
 TYPE_OF = {"FG": "2PT", "2PT": "2PT", "3PT": "3PT", "4PT": "4PT", "FREE_THROW": "FREE_THROW"}
 
@@ -107,18 +110,66 @@ def replay_shots(replay):
     return out
 
 
+def fit_line(pairs):
+    """video_t = a + b * sl_t from candidate (sl_t, gt_t) pairs. The SL/SR shot cameras' clock runs
+    up to a few percent off the game video (1.3-1.8 % on 2026-09-15), so the slope is searched too:
+    for each slope, the 1-s bin of (gt_t - b * sl_t) holding the most pairs; the best (slope,
+    offset) seeds a least-squares line on the pairs near it, tightened twice. Wrong pairs (other
+    shots at the same basket) scatter; the true ones stack up."""
+    x = np.array([p[0] for p in pairs], float)
+    y = np.array([p[1] for p in pairs], float)
+    best = (0, 1.0, 0)
+    for b in np.arange(0.90, 1.10, 0.0005):
+        c = Counter(np.round(y - b * x).astype(int))
+        k = max(c, key=lambda z: c[z - 1] + c[z] + c[z + 1])
+        n = c[k - 1] + c[k] + c[k + 1]
+        if n > best[0]:
+            best = (n, b, k)
+    _, b, a = best
+    inl = np.abs(y - (a + b * x)) <= 3.0
+    for tol in (2.0, MAP_TOL_S):
+        b, a = np.polyfit(x[inl], y[inl], 1)
+        inl = np.abs(y - (a + b * x)) <= tol
+    res = np.abs(y[inl] - (a + b * x[inl]))
+    return {"a": float(a), "b": float(b), "inliers": int(inl.sum()), "of": len(pairs),
+            "resid_median_s": float(np.median(res)) if inl.any() else None}
+
+
 def stage_map(g, replay):
-    import sync_masters as SM
     gt = json.load(open(os.path.join(gdir(g), "gt.json")))
     shots = replay_shots(replay)
-    SM.TOL_S = MAP_TOL_S
     maps = {}
     for side in ("left", "right"):
         pairs = [(s["sl_t"], a["t"]) for s in shots if s["side"] == side
                  for a in gt["shots"] if a["side"] == side and a["made"] == s["made"]]
-        maps[side] = SM.ransac(pairs, iters=20000) if len(pairs) > 4 else None
-        print("map %-5s %s" % (side, maps[side]))
+        maps[side] = fit_line(pairs) if len(pairs) > 4 else None
+        if maps[side]:
+            # the recordings also stall/jump (an ~8 s step mid-game on 2026-09-15): keep each
+            # annotated shot's offset to its nearest CV shot along the line, for a local correction
+            a, b = maps[side]["a"], maps[side]["b"]
+            cv = np.array([a + b * s["sl_t"] for s in shots if s["side"] == side])
+            pts = []
+            for x in gt["shots"]:
+                if x["side"] == side and len(cv):
+                    r = float(x["t"] - cv[np.argmin(np.abs(cv - x["t"]))])
+                    if abs(r) <= LOCAL_MAX_S:
+                        pts.append([x["t"], r])
+            maps[side]["local"] = pts
+        print("map %-5s %s" % (side, {k: v for k, v in (maps[side] or {}).items() if k != "local"}))
     json.dump(maps, open(os.path.join(gdir(g), "map.json"), "w"), indent=1)
+
+
+def local_offset(m, vt):
+    """Median offset of the annotated shots within LOCAL_WIN_S of video time vt (window widened
+    until it holds LOCAL_MIN shots): one window of many shots, so no shot aligns itself."""
+    pts = np.array(m.get("local") or [], float).reshape(-1, 2)
+    if not len(pts):
+        return 0.0
+    for w in (LOCAL_WIN_S, 2 * LOCAL_WIN_S, 4 * LOCAL_WIN_S):
+        sel = pts[np.abs(pts[:, 0] - vt) <= w, 1]
+        if len(sel) >= LOCAL_MIN:
+            return float(np.median(sel))
+    return float(np.median(pts[:, 1]))
 
 
 # ---------------------------------------------------------------------------------------- clips
@@ -134,6 +185,7 @@ def stage_clips(g, replay):
             continue
         cam = "FL" if s["side"] == "left" else "FR"
         vt = m["a"] + m["b"] * s["sl_t"]
+        vt += local_offset(m, vt)
         name = "%s_t%07.1f" % (cam, vt)
         clip = os.path.join(d, "clips", name + ".mp4")
         if not os.path.exists(clip) and not T.cut_clip(os.path.join(VAL, g, cam + ".mp4"), vt, clip):
@@ -183,6 +235,13 @@ def stage_fast(g):
     arcs = {c: T.load_arcs(c, 1920) for c in ("FL", "FR")}
     out_path = os.path.join(d, "results.jsonl")
     done = {r["name"] for r in jl(out_path)}
+    # EXTEND_SCORED_ONLY=1: the extended timeline (~95 s per silent clip on the AGX, measured on
+    # game 1) runs only on clips that pair with an annotated shot -- the only ones its accuracy is
+    # scored on; its production cost is taken from game 1, where it ran on every clip.
+    scored = None
+    if os.environ.get("EXTEND_SCORED_ONLY") == "1":
+        shots_all = jl(os.path.join(d, "shots.jsonl"))
+        scored = {shots_all[i]["name"] for i in pair(shots_all, json.load(open(os.path.join(d, "gt.json")))["shots"])}
     with open(out_path, "a") as fo:
         for s in jl(os.path.join(d, "shots.jsonl")):
             if s["name"] in done:
@@ -208,7 +267,7 @@ def stage_fast(g):
                     t1 = time.time()
                     reads = W.read_track(js, clip, boxes) if boxes else []
                     rec["reads"], rec["read_s"] = reads, round(time.time() - t1, 1)
-                    if boxes and W.speak(reads, None) is None:
+                    if boxes and W.speak(reads, None) is None and (scored is None or s["name"] in scored):
                         t1 = time.time()
                         rec["reads_ext"] = extend(js, seg, os.path.join(VAL, g, s["cam"] + ".mp4"),
                                                   s["video_t"] - T.PRE, boxes, reads)
