@@ -9,10 +9,12 @@ drawn UNDER the players, cut out by their tracker masks: the back half of the ri
 the holder's legs (so he stands in it), and anyone nearer the camera covers it entirely.
 
 The ring is the client's animated blue "2K player circle" (a looping top-down RGBA animation,
-laid flat on the floor in perspective): the plain loop under the ball-holder, the {SHOOTING}
-version started at the release so its pulse fires as he shoots. Assets live in R2K_ASSETS
-(ring_blue_512.mov / ring_blue_shoot_512.mov: the 1080px originals scaled to 512, PNG codec);
-without them, or with R2K_RING_STYLE=classic, the drawn cyan/gold ring is used.
+laid flat on the floor in perspective) under the ball-holder; from the release it grows a little
+(SHOT_GROW) on the shooter. That circle is the ONLY overlay by default (client, 2026-10-01): the
+head marker, the ball trail and the score badge are off (R2K_MARKER / R2K_TRAIL / R2K_BADGE=1 to
+show them). R2K_SHOT_SPRITE=<file in R2K_ASSETS> swaps the circle's colour while shooting (for
+approval reels; production keeps the blue). Assets: ring_blue_512.mov (the 1080px original scaled
+to 512, PNG codec); without it, or with R2K_RING_STYLE=classic, the drawn cyan/gold ring is used.
 
 Usage: render_2k.py <out_dir> <clip_dir> <name> [<name> ...]
 Env:   R2K_OUT (default <out_dir>/r2k), R2K_ZOOM (1.6), R2K_VERTICAL=1 to add a 9:16 cut,
@@ -34,7 +36,13 @@ RING_COL = (255, 229, 0)          # BGR electric cyan
 SHOT_COL = (40, 200, 255)         # BGR gold: the shooter after release
 RING_STYLE = os.environ.get("R2K_RING_STYLE", "sprite")
 ASSETS = os.environ.get("R2K_ASSETS", os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets"))
-SPRITE_FILES = {"hold": "ring_blue_512.mov", "shot": "ring_blue_shoot_512.mov"}
+SPRITE_FILES = {"hold": "ring_blue_512.mov"}
+SHOT_SPRITE = os.environ.get("R2K_SHOT_SPRITE", "")     # e.g. ring_yellow_512.mov; "" = same blue
+SHOT_GROW = float(os.environ.get("R2K_SHOT_GROW", "1.2"))  # circle size on the shooter, x the holder's
+GROW_S = 0.3                      # seconds to grow after the release
+SHOW_MARKER = os.environ.get("R2K_MARKER") == "1"
+SHOW_TRAIL = os.environ.get("R2K_TRAIL") == "1"
+SHOW_BADGE = os.environ.get("R2K_BADGE") == "1"
 SPRITE_PX = 512                   # asset side
 SPRITE_FPS = 24
 SPRITE_N = 240                    # frames in one loop (10 s)
@@ -182,6 +190,8 @@ def load_sprites():
     if RING_STYLE != "sprite":
         return None
     paths = {k: os.path.join(ASSETS, f) for k, f in SPRITE_FILES.items()}
+    if SHOT_SPRITE:
+        paths["shot"] = os.path.join(ASSETS, SHOT_SPRITE)
     missing = [p for p in paths.values() if not os.path.isfile(p)]
     if missing:
         print("ring assets missing (%s) - classic ring" % ", ".join(missing), flush=True)
@@ -217,12 +227,20 @@ def draw_sprite_under(im, rgba, quad, alpha, players, oid, feet_y):
     im[y0:y1, x0:x1] = (roi * (1 - a) + warped[..., :3].astype(np.float32) * a).astype(np.uint8)
 
 
+def shot_scale(t_shot):
+    """Circle size on the shooter: grows from 1 to SHOT_GROW over GROW_S after the release."""
+    return 1.0 + (SHOT_GROW - 1.0) * min(1.0, max(0.0, t_shot) / GROW_S)
+
+
 def draw_owner_ring(im, cam, feet, is_shot, alpha, players, oid, t_hold, t_shot, sprites):
-    """The ring under its owner: the animated sprite when loaded (hold loop, or the shooting
-    version counted from the release), else the classic drawn ring. Returns the marker colour."""
+    """The ring under its owner: the animated sprite when loaded (one continuous loop, grown on
+    the shooter, in the shooting colour only when a shot sprite is configured), else the classic
+    drawn ring. Returns the marker colour."""
     if sprites:
-        sp, n = (sprites["shot"], t_shot * SPRITE_FPS) if is_shot else (sprites["hold"], t_hold * SPRITE_FPS)
-        draw_sprite_under(im, sp.frame(max(0, n)), sprite_quad(cam, feet), alpha, players, oid, feet[1])
+        sp = sprites["shot"] if is_shot and "shot" in sprites else sprites["hold"]
+        scale = shot_scale(t_shot) if is_shot else 1.0
+        draw_sprite_under(im, sp.frame(max(0, t_hold * SPRITE_FPS)), sprite_quad(cam, feet, SPRITE_OUTER_CM * scale),
+                          alpha, players, oid, feet[1])
         return SPRITE_COL
     col = SHOT_COL if is_shot else RING_COL
     draw_ring_under(im, ring_poly(cam, feet), col, alpha, players, oid, feet[1])
@@ -378,14 +396,14 @@ def render(out, clip_dir, name, dst_dir, vertical, make=None, badge_zone=None, S
                 is_shot = shot is not None and rel_t <= tt
                 col = draw_owner_ring(im, cam, feet, is_shot, alpha, S["players"][near], oid,
                                       tt - out_t[0], tt - rel_t if is_shot else 0.0, sprites)
-                if alpha >= 1:
+                if alpha >= 1 and SHOW_MARKER:
                     draw_marker(im, b, col)
         bx, by = ball_o[k]
         airborne = shot is not None and rel_t <= tt <= rim_t + 0.3
         trail = (trail + [(int(bx), int(by))])[-TRAIL_LEN:] if airborne else []
-        if trail:
+        if trail and SHOW_TRAIL:
             draw_trail(im, trail, SHOT_COL)
-        if badge and shot and tt >= rim_t:
+        if badge and shot and tt >= rim_t and SHOW_BADGE:
             draw_badge(im, badge, hoop, min(1.0, (tt - rim_t) / 0.25) * max(0.0, 1 - max(0.0, tt - rim_t - 1.2) / 0.4))
         cx, cy = centre[k]
         for suf, (proc, ow, oh) in pipes.items():

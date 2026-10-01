@@ -157,9 +157,9 @@ def render_near(S, cam, clip, seq, rim_t, release_t, badge, dst_dir, name, verti
             feet = [(b[0] + b[2]) / 2, b[3]]
             col = R.draw_owner_ring(im, cam, feet, is_shot, alpha, S["players"][near[k]], oid,
                                     tt - out_t[0], max(0.0, tt - release_t), sprites)
-            if alpha >= 1:
+            if alpha >= 1 and R.SHOW_MARKER:
                 R.draw_marker(im, b, col)
-        if badge and hoop is not None and tt >= rim_t:
+        if badge and hoop is not None and tt >= rim_t and R.SHOW_BADGE:
             R.draw_badge(im, badge, hoop, min(1.0, (tt - rim_t) / 0.25) * max(0.0, 1 - max(0.0, tt - rim_t - 1.2) / 0.4))
         cx, cy = cent[k]
         for suf, (proc, ow, oh) in pipes.items():

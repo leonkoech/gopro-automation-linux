@@ -105,3 +105,21 @@ def test_missing_assets_fall_back_to_the_classic_ring(tmp_path, monkeypatch):
     monkeypatch.setattr(R, "ASSETS", str(tmp_path))
     monkeypatch.setattr(R, "RING_STYLE", "sprite")
     assert R.load_sprites() is None
+
+
+def test_circle_grows_a_little_on_the_shot_and_holds():
+    assert R.shot_scale(0) == 1.0
+    assert 1.0 < R.shot_scale(R.GROW_S / 2) < R.SHOT_GROW
+    assert R.shot_scale(5.0) == R.SHOT_GROW
+
+
+def test_only_the_blue_circle_by_default(tmp_path, monkeypatch):
+    for f in ("ring_blue_512.mov", "ring_yellow_512.mov"):
+        (tmp_path / f).write_bytes(b"x")
+    monkeypatch.setattr(R, "ASSETS", str(tmp_path))
+    monkeypatch.setattr(R, "RING_STYLE", "sprite")
+    monkeypatch.setattr(R, "SHOT_SPRITE", "")
+    assert set(R.load_sprites()) == {"hold"}
+    assert not (R.SHOW_MARKER or R.SHOW_TRAIL or R.SHOW_BADGE)
+    monkeypatch.setattr(R, "SHOT_SPRITE", "ring_yellow_512.mov")
+    assert set(R.load_sprites()) == {"hold", "shot"}
