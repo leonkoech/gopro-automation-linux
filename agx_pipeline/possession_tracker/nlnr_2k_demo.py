@@ -70,10 +70,11 @@ def far_owners(key, cam_f):
     res = H.analyse(S, cam_f)
     shots = [s for s in res.get("shots", []) if s.get("shooter") is not None]
     shot = min(shots, key=lambda s: abs(s["rim_t"] - S["rim_t"])) if shots else None
+    own = R.owner_timeline(S, res, cam_f, shot)        # any ball seen in hands, shooter backfilled
     rows = []
     for i, tt in enumerate(S["times"]):
         is_shot = bool(shot and tt >= shot["release_t"])
-        oid = shot["shooter"] if is_shot else res["frames"][i].get("holder")
+        oid = shot["shooter"] if is_shot else own[i]
         p = S["players"][i].get(oid) if oid is not None else None
         xy = cam_f.to_court([[(p["box"][0] + p["box"][2]) / 2, p["box"][3]]])[0] if p else None
         rows.append((float(tt), oid, is_shot, xy))

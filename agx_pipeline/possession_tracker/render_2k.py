@@ -247,6 +247,99 @@ def draw_owner_ring(im, cam, feet, is_shot, alpha, players, oid, t_hold, t_shot,
     return col
 
 
+BALL_CONF = 0.3                   # a raw ball detection must be at least this confident
+AWAY_W = 1.5                      # ... a ball further than this many box widths is not his
+GAP_S = 0.5                       # the shooter walk-back bridges tracking gaps up to this long
+HOLD_EXPIRE_S = 2.0               # the ring leaves a player not seen with the ball for this long
+
+
+def raw_contacts(S, cam):
+    """Per cache frame: the player holding ANY detected ball (not only the shot's ball traced back
+    from the rim, which the shot logic uses and which starts shortly before the shot): the ball
+    centre on his (dilated) mask, the ball low enough to be in hands, the nearest player if several."""
+    off = H.off_court_tracks(S, cam)
+    out = []
+    for k, balls in enumerate(S["balls"]):
+        best = None
+        for d in balls:
+            conf, x1, y1, x2, y2 = (float(v) for v in d[:5])
+            if conf < BALL_CONF:
+                continue
+            u, v, dia = (x1 + x2) / 2, (y1 + y2) / 2, ((x2 - x1) + (y2 - y1)) / 2
+            X = cam.ball_3d(u, v, dia)
+            if X[2] > H.HOLD_MAX_H_CM:
+                continue
+            r = max(2, int(round(0.75 * dia * S["scale"])))
+            mu, mv = int(round(u * S["scale"])), int(round(v * S["scale"]))
+            contact = {}
+            for oid, p in S["players"][k].items():
+                if oid in off:
+                    continue
+                m = p["mask"]
+                if m[max(0, mv - r):mv + r + 1, max(0, mu - r):mu + r + 1].any():
+                    feet = cam.to_court([[(p["box"][0] + p["box"][2]) / 2, p["box"][3]]])[0]
+                    contact[oid] = float(np.linalg.norm(feet - X[:2]))
+            pick = H.pick_near(contact, {o: S["players"][k][o]["box"] for o in contact})
+            if pick is not None and (best is None or conf > best[1]):
+                best = (pick, conf)
+        out.append(best[0] if best else None)
+    return out
+
+
+def owner_timeline(S, res, cam, shot):
+    """Per cache frame: who wears the ring before the release (None = nobody).
+
+    1. the shot logic's holder where it has one (near the shot);
+    2. elsewhere, whoever holds any detected ball for LOCK frames in a row, kept until another
+       player locks or HOLD_EXPIRE_S passes without him being seen with it;
+    3. the shooter, walking back from the release for as long as nobody else held the ball, no
+       confident ball is seen away from him and he is tracked: a free-throw shooter at the line
+       keeps the ring although the far camera rarely sees the ball in his hands."""
+    t = np.asarray(S["times"], float)
+    n = len(t)
+    raw = raw_contacts(S, cam)
+    frames = res.get("frames") or [{}] * n
+    own, cur, seen, run_id, run_n = [None] * n, None, -1e9, None, 0
+    for k in range(n):
+        r = raw[k]
+        run_id, run_n = (r, run_n + 1) if (r is not None and r == run_id) else (r, 1 if r is not None else 0)
+        if run_id is not None and run_n >= H.LOCK:
+            cur = run_id
+        if cur is not None and (r == cur or frames[k].get("near") == cur):
+            seen = t[k]
+        if cur is not None and t[k] - seen > HOLD_EXPIRE_S:
+            cur = None
+        h = frames[k].get("holder")
+        own[k] = h if h is not None else cur
+    if shot and shot.get("shooter") is not None and shot.get("release_t") is not None:
+        sid = shot["shooter"]
+        ri = int(np.argmin(np.abs(t - shot["release_t"])))
+        last_seen = t[ri]
+        for k in range(ri, -1, -1):
+            if own[k] is not None and own[k] != sid:
+                break                          # someone else had the ball: his possession ends here
+            if sid not in S["players"][k]:
+                if last_seen - t[k] > GAP_S:
+                    break                      # lost him for too long
+                continue
+            if ball_away(S["balls"][k], S["players"][k][sid]["box"]):
+                break                          # the ball is clearly elsewhere
+            last_seen = t[k]
+            own[k] = sid                       # e.g. a free throw: the ball hidden in his hands
+    return own
+
+
+def ball_away(balls, box):
+    """A confident ball detection clearly away from this player (beyond AWAY_W box widths)."""
+    w = box[2] - box[0]
+    cx, cy = (box[0] + box[2]) / 2, (box[1] + box[3]) / 2
+    for d in balls:
+        conf, x1, y1, x2, y2 = (float(v) for v in d[:5])
+        if conf >= BALL_CONF and np.hypot((x1 + x2) / 2 - cx, (y1 + y2) / 2 - cy) > AWAY_W * w:
+            return True
+    return False
+
+
 def draw_marker(im, box, col):
     """Downward chevron well above the holder's head (clear of whoever stands behind him)."""
     x = int((box[0] + box[2]) / 2)
@@ -330,13 +423,14 @@ def render(out, clip_dir, name, dst_dir, vertical, make=None, badge_zone=None, S
     rel_t = shot["release_t"] if shot else None
     rim_t = shot["rim_t"] if shot else None
 
+    own = owner_timeline(S, res, cam, shot)
+
     def ring_owner(k):
         tt = out_t[k]
         if shot and rel_t <= tt:
             fade = 1.0 if tt <= rim_t else max(0.0, 1 - (tt - rim_t) / 0.5)
             return shot["shooter"], SHOT_COL, fade
-        h = frames[idx[k]].get("holder")
-        return h, RING_COL, 1.0
+        return own[idx[k]], RING_COL, 1.0
 
     def box_at(oid, k):
         """Holder's box interpolated between the two cache frames around out_t[k]."""
