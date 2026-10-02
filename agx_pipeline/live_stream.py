@@ -69,6 +69,8 @@ MAX_MIN = int(os.getenv("LIVE_MAX_MIN", "180"))
 # Refuse to start if the disk is already tight. HLS is small (~4.5 GB/angle for
 # a 2h game) but recording's needs come first.
 MIN_FREE_GB = float(os.getenv("LIVE_MIN_FREE_GB", "40"))
+# Bounded so a camera that is genuinely gone does not spin forever.
+MAX_RESTARTS = int(os.getenv("LIVE_MAX_RESTARTS", "10"))
 
 
 def _now_iso() -> str:
@@ -97,6 +99,9 @@ class _AnglePublisher:
         self._sent: set[str] = set()
         self._stop = threading.Event()
         self._uploader: Optional[threading.Thread] = None
+        self._log = None
+        self._pgid: Optional[int] = None
+        self.restarts = 0
 
     # ---- pipeline ---------------------------------------------------------
     def _gst_cmd(self) -> str:
@@ -139,41 +144,71 @@ class _AnglePublisher:
         os.makedirs(self.dir, exist_ok=True)
         cmd = f"{self._gst_cmd()} | {self._ffmpeg_cmd()}"
         try:
+            # Keep stderr. A publisher that dies silently cannot be diagnosed
+            # after the fact, and we have lost two weeks before to a subprocess
+            # whose error output was thrown away.
+            self._log = open(os.path.join(self.dir, "publish.log"), "ab", buffering=0)
             self.proc = subprocess.Popen(
                 ["bash", "-c", cmd],
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                stderr=self._log,
                 preexec_fn=os.setsid,
             )
+            # setsid makes the child its own session and group leader, so the
+            # group id IS the pid. Capture it now: once the wrapper exits and is
+            # reaped, os.getpgid(pid) raises and the group becomes unkillable by
+            # lookup — which is exactly how the orphans survived.
+            self._pgid = self.proc.pid
         except OSError as e:
             logger.error("[LIVE] %s publisher failed to spawn: %s", self.angle, e)
             self.proc = None
             return False
-        self._uploader = threading.Thread(
-            target=self._upload_loop, name=f"live-upload-{self.angle}", daemon=True
-        )
-        self._uploader.start()
+        if self._uploader is None or not self._uploader.is_alive():
+            self._uploader = threading.Thread(
+                target=self._upload_loop, name=f"live-upload-{self.angle}", daemon=True
+            )
+            self._uploader.start()
         logger.info("[LIVE] %s <- %s publishing to %s", self.angle, self.source_angle, self.playlist_url)
         return True
 
-    def stop(self) -> None:
-        """SIGINT ffmpeg so it finalises the playlist with EXT-X-ENDLIST.
+    def _teardown(self) -> None:
+        """SIGINT the whole process group, then make sure nothing survived.
 
-        That matters: with ENDLIST the annotator's player turns cleanly into a
-        recording at the final horn instead of hanging on a stream that stopped
-        advancing. SIGKILL would leave the playlist open forever.
+        The group matters. `self.proc` is a `bash -c "gst | ffmpeg"` wrapper, and
+        bash can exit while gst and ffmpeg keep running — they are then reparented
+        to init and go on writing segments and uploading them. Signalling only the
+        wrapper leaves those orphans behind; measured once as a second publisher
+        writing into the same directory, which left that angle's playlist without
+        an ENDLIST and its segment count 11 ahead of the other angle.
+
+        SIGINT first so ffmpeg finalises the playlist with EXT-X-ENDLIST — that
+        is what turns the annotator's player cleanly into a recording at the
+        final horn instead of hanging.
         """
         p, self.proc = self.proc, None
-        if p is not None and p.poll() is None:
+        pgid, self._pgid = self._pgid, None
+        if pgid is None:
+            return
+        try:
+            os.killpg(pgid, signal.SIGINT)
+        except OSError:
+            return  # group already gone
+        if p is not None:
             try:
-                os.killpg(os.getpgid(p.pid), signal.SIGINT)
                 p.wait(timeout=10)
-            except (OSError, subprocess.TimeoutExpired):
-                try:
-                    os.killpg(os.getpgid(p.pid), signal.SIGKILL)
-                except OSError:
-                    pass
+            except subprocess.TimeoutExpired:
+                pass
+        else:
+            time.sleep(2)  # wrapper already reaped; give ffmpeg time to finalise
+        # Whatever ignored the SIGINT, or was orphaned by the wrapper dying first.
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except OSError:
+            pass  # group gone — the normal case
+
+    def stop(self) -> None:
+        self._teardown()
         # Let the uploader make one final pass so the last segment and the
         # finalised playlist both reach S3, then stop it.
         time.sleep(UPLOAD_POLL * 2)
@@ -374,7 +409,14 @@ class LivePublisher:
 
     # ---- watchdog ---------------------------------------------------------
     def _watch(self) -> None:
-        """Report each angle's PDT anchor once it exists, and enforce the cap."""
+        """Restart a dead angle, report its PDT anchor, and enforce the cap.
+
+        The restart is the important half. An angle whose pipeline dies — at
+        startup under contention, or mid-game when a camera hiccups — would
+        otherwise stay dead for the whole game, and the annotator would simply
+        never get that side. Measured in testing: FR died at launch while FL ran
+        fine, and nothing retried it.
+        """
         reported: set[str] = set()
         while not self._stop_evt.wait(5):
             try:
@@ -383,6 +425,16 @@ class LivePublisher:
                     threading.Thread(target=self.stop, daemon=True).start()
                     return
                 for a in self._angles:
+                    if not a.alive() and a.restarts < MAX_RESTARTS:
+                        a.restarts += 1
+                        logger.warning("[LIVE] %s died — restart %d/%d",
+                                       a.angle, a.restarts, MAX_RESTARTS)
+                        # Tear the old group down first. `alive()` only watches
+                        # the bash wrapper, so its children can still be running
+                        # and would otherwise keep writing beside the new ones.
+                        a._teardown()
+                        a.start()
+                        continue
                     if a.angle in reported:
                         continue
                     pdt = a.first_pdt()
