@@ -100,6 +100,7 @@ class _AnglePublisher:
         self._stop = threading.Event()
         self._uploader: Optional[threading.Thread] = None
         self._log = None
+        self._pgid: Optional[int] = None
         self.restarts = 0
 
     # ---- pipeline ---------------------------------------------------------
@@ -154,6 +155,11 @@ class _AnglePublisher:
                 stderr=self._log,
                 preexec_fn=os.setsid,
             )
+            # setsid makes the child its own session and group leader, so the
+            # group id IS the pid. Capture it now: once the wrapper exits and is
+            # reaped, os.getpgid(pid) raises and the group becomes unkillable by
+            # lookup — which is exactly how the orphans survived.
+            self._pgid = self.proc.pid
         except OSError as e:
             logger.error("[LIVE] %s publisher failed to spawn: %s", self.angle, e)
             self.proc = None
@@ -166,23 +172,43 @@ class _AnglePublisher:
         logger.info("[LIVE] %s <- %s publishing to %s", self.angle, self.source_angle, self.playlist_url)
         return True
 
-    def stop(self) -> None:
-        """SIGINT ffmpeg so it finalises the playlist with EXT-X-ENDLIST.
+    def _teardown(self) -> None:
+        """SIGINT the whole process group, then make sure nothing survived.
 
-        That matters: with ENDLIST the annotator's player turns cleanly into a
-        recording at the final horn instead of hanging on a stream that stopped
-        advancing. SIGKILL would leave the playlist open forever.
+        The group matters. `self.proc` is a `bash -c "gst | ffmpeg"` wrapper, and
+        bash can exit while gst and ffmpeg keep running — they are then reparented
+        to init and go on writing segments and uploading them. Signalling only the
+        wrapper leaves those orphans behind; measured once as a second publisher
+        writing into the same directory, which left that angle's playlist without
+        an ENDLIST and its segment count 11 ahead of the other angle.
+
+        SIGINT first so ffmpeg finalises the playlist with EXT-X-ENDLIST — that
+        is what turns the annotator's player cleanly into a recording at the
+        final horn instead of hanging.
         """
         p, self.proc = self.proc, None
-        if p is not None and p.poll() is None:
+        pgid, self._pgid = self._pgid, None
+        if pgid is None:
+            return
+        try:
+            os.killpg(pgid, signal.SIGINT)
+        except OSError:
+            return  # group already gone
+        if p is not None:
             try:
-                os.killpg(os.getpgid(p.pid), signal.SIGINT)
                 p.wait(timeout=10)
-            except (OSError, subprocess.TimeoutExpired):
-                try:
-                    os.killpg(os.getpgid(p.pid), signal.SIGKILL)
-                except OSError:
-                    pass
+            except subprocess.TimeoutExpired:
+                pass
+        else:
+            time.sleep(2)  # wrapper already reaped; give ffmpeg time to finalise
+        # Whatever ignored the SIGINT, or was orphaned by the wrapper dying first.
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except OSError:
+            pass  # group gone — the normal case
+
+    def stop(self) -> None:
+        self._teardown()
         # Let the uploader make one final pass so the last segment and the
         # finalised playlist both reach S3, then stop it.
         time.sleep(UPLOAD_POLL * 2)
@@ -403,6 +429,10 @@ class LivePublisher:
                         a.restarts += 1
                         logger.warning("[LIVE] %s died — restart %d/%d",
                                        a.angle, a.restarts, MAX_RESTARTS)
+                        # Tear the old group down first. `alive()` only watches
+                        # the bash wrapper, so its children can still be running
+                        # and would otherwise keep writing beside the new ones.
+                        a._teardown()
                         a.start()
                         continue
                     if a.angle in reported:
