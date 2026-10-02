@@ -209,6 +209,56 @@ def test_problems_ignores_records_outside_the_window(cov):
 
 
 @pytest.mark.unit
+def test_the_live_publisher_is_a_stage_coverage_knows_about(cov, monkeypatch):
+    """It is env-gated like the others, so an enabled publisher that reports
+    nothing has to show up the same way."""
+    monkeypatch.setenv("LIVE_STREAM_ENABLED", "true")
+    assert cov.enabled_stages()["live_stream"] is True
+    cov.record("g1", "shot_detect", expected=10, processed=10)
+    assert cov.finalize("g1")["stages"]["live_stream"]["silent"] is True
+
+
+@pytest.mark.unit
+def test_one_angle_of_two_is_a_problem(cov):
+    """The FR failure: one angle published, the other died at launch with no
+    segments and no retry."""
+    cov.record("g1", "live_stream", expected=2, processed=1,
+               per_angle={"FL": {"alive": True, "segments": 37},
+                          "FR": {"alive": False, "segments": 0}})
+    cov.finalize("g1")
+    found = cov.problems()
+    assert any("live_stream covered 1 of 2" in p for p in found), found
+
+
+@pytest.mark.unit
+def test_both_angles_publishing_is_not_a_problem(cov):
+    cov.record("g1", "live_stream", expected=2, processed=2)
+    cov.finalize("g1")
+    assert cov.problems() == []
+
+
+@pytest.mark.unit
+def test_a_closed_record_stays_closed_when_a_slow_stage_reports_late(cov):
+    """Stages stop on their own threads. A late number is worth keeping, but it
+    must not put a finished game back into "running" and make it look dead."""
+    cov.record("g1", "live_stream", expected=2, processed=2)
+    cov.finalize("g1")
+    cov.record("g1", "shot_detect", expected=40, processed=40)   # arrives after
+    doc = cov.read("g1")
+    assert doc["status"] == "closed"
+    assert doc["stages"]["shot_detect"]["processed"] == 40
+    assert cov.problems() == []
+
+
+@pytest.mark.unit
+def test_an_unattached_recording_writes_nothing(cov):
+    """No game id means no game in the annotation tool to attribute this to."""
+    cov.record(None, "live_stream", expected=2, processed=2)
+    assert cov.finalize(None) == {}
+    assert not list(Path(cov.root()).glob("*.json")) if Path(cov.root()).exists() else True
+
+
+@pytest.mark.unit
 def test_summarize_names_the_silent_stage(cov, monkeypatch):
     monkeypatch.setenv("SHOT_LIVE_TYPING", "true")
     cov.record("g1", "shot_detect", expected=10, processed=9)

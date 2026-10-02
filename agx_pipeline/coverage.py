@@ -50,6 +50,7 @@ STAGE_FLAGS: Dict[str, str] = {
     "shot_detect": "SHOT_LIVE_ENABLED",
     "typing": "SHOT_LIVE_TYPING",
     "who": "SHOT_LIVE_WHO_SCAN",
+    "live_stream": "LIVE_STREAM_ENABLED",
 }
 
 _DEFAULT_OUTPUT = "/home/dev/app/recordings"
@@ -129,6 +130,8 @@ def record(game_id: str, stage: str, expected: Optional[int],
     reported as unknown rather than guessed, because a fabricated denominator is
     worse than an honest gap.
     """
+    if not game_id:
+        return          # unattached recording: no game to attribute coverage to
     try:
         _merge(game_id, {stage: _entry(expected, processed, detail)})
     except Exception as exc:  # noqa: BLE001 -- coverage must never break the pipeline
@@ -143,6 +146,8 @@ def finalize(game_id: str) -> Dict:
     reported is the shape both real incidents took, and it is only visible by
     comparing what was enabled against what spoke.
     """
+    if not game_id:
+        return {}       # unattached recording: nothing was ever recorded for it
     try:
         with _lock:
             sources = dict(_sources)
@@ -282,9 +287,15 @@ def _merge(game_id: str, stages: Dict[str, Dict], closing: bool = False) -> Dict
     # Only the third is a night you can read coverage numbers off with confidence,
     # and the second is invisible unless the record is written as the game runs
     # rather than only at the end.
-    doc["status"] = "closed" if closing else "running"
+    # Closed is sticky. Stages stop on their own threads and a slow one can
+    # report after the game has been closed out; that late number is worth
+    # keeping, but it must not put the record back into "running" and make a
+    # finished game look like one that died.
     if closing:
+        doc["status"] = "closed"
         doc["closed_at"] = doc["updated_at"]
+    elif doc.get("status") != "closed":
+        doc["status"] = "running"
     _write(game_id, doc)
     return doc
 
