@@ -36,6 +36,7 @@ from agx_pipeline.recording import RecordingController, load_config
 from agx_pipeline.camrec_controller import CamrecController
 from agx_pipeline.shot_recording import AravisRecorder
 from agx_pipeline.highlight import HighlightBuffer, cut_highlight
+from agx_pipeline.live_stream import LivePublisher
 from agx_pipeline.grafana_annotate import annotate
 from agx_pipeline.shot_detect.live import LiveShotScorer, live_enabled
 from agx_pipeline.side_attribution import scoring_hoop_side
@@ -65,6 +66,10 @@ SHOT = AravisRecorder(CFG) if CFG.shot_cameras else None
 HIGHLIGHT = (HighlightBuffer(CFG)
              if os.getenv("HIGHLIGHT_RECORDER", "true").lower() in ("1", "true", "yes")
              else None)
+# Live HLS publisher: FL/FR to the annotation tool while the game runs, so an
+# annotator can work from tip-off instead of waiting for ingest. Gated by
+# LIVE_STREAM_ENABLED and entirely best-effort — see agx_pipeline/live_stream.py.
+LIVESTREAM = LivePublisher(CFG)
 logger.info("recording backend: %s (shot cameras: %d)", _BACKEND, len(CFG.shot_cameras))
 FB = get_firebase_service()
 TRACKER = AgxSessionTracker(FB, CFG.jetson_id) if FB else None
@@ -356,6 +361,11 @@ def _do_start(game_id=None, label=None, force=False):
                 HIGHLIGHT.start(label)
             except Exception as e:  # noqa: BLE001
                 logger.warning("highlight recorder failed to start: %s", e)
+        try:
+            # Never allowed to break the recording it rides along with.
+            LIVESTREAM.start(label, game_id)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("live publisher failed to start: %s", e)
         if LIVE:
             try:
                 LIVE.start(label, game_id, _starting_side_team1(game_id))
@@ -407,6 +417,12 @@ def _do_stop():
                 HIGHLIGHT.stop()
             except Exception as e:  # noqa: BLE001
                 logger.warning("highlight recorder stop failed: %s", e)
+        try:
+            # SIGINTs ffmpeg so the playlist gets EXT-X-ENDLIST and the
+            # annotator's player becomes a recording cleanly at the final horn.
+            LIVESTREAM.stop()
+        except Exception as e:  # noqa: BLE001
+            logger.warning("live publisher stop failed: %s", e)
         if LIVE:
             try:
                 LIVE.stop()
@@ -529,6 +545,19 @@ def _do_highlight(cmd: Dict):
 def highlight_clip():
     payload, status = _do_highlight(request.get_json(silent=True) or {})
     return jsonify(payload), status
+
+
+@app.route("/api/live/status")
+def live_status():
+    """Publisher state: which angles are up, how many segments, the CDN URLs.
+
+    The quickest check during bring-up — if `publishing` is false it also says
+    why, so a refused start is never silent.
+    """
+    try:
+        return jsonify(LIVESTREAM.status())
+    except Exception as e:  # noqa: BLE001
+        return jsonify({"enabled": False, "error": str(e)}), 500
 
 
 @app.route("/api/preview", methods=["POST", "GET"])

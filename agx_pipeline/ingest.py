@@ -746,9 +746,13 @@ def run_ingestion(fb, cfg, pipeline_id: str, state: Dict, stopped: Dict, tracker
                 else:
                     run.set_shot_detection(0, 0, 0, 0, 0, source="live", status="none")
                 if SHOT_CARDS_ENABLED and client and game_uuid and live.get("shots"):
-                    from plays_sync import create_plays_from_shot_live
+                    from plays_sync import create_plays_from_shot_live, rosters_from_annotation_game
                     csum: Dict = {}
-                    n_cv = create_plays_from_shot_live(client, game_uuid, fresh, summary=csum)
+                    try:   # jersey suggestions only from the shooting team's roster, with names
+                        rosters = rosters_from_annotation_game(client.get_game_by_firebase_id(firebase_game_id))
+                    except Exception:  # noqa: BLE001 - suggestions fall back to the plain number
+                        rosters = {}
+                    n_cv = create_plays_from_shot_live(client, game_uuid, fresh, summary=csum, rosters=rosters)
                     run.log("info", f"CV cards: {n_cv} created"
                             + (" (skipped — already carded)" if csum.get("skipped_existing") else ""))
             except Exception as e:  # noqa: BLE001

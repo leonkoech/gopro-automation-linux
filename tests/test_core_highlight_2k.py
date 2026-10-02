@@ -62,3 +62,20 @@ def test_cv_clip_takes_the_tracker_team():
     g = {"logs": [], "highlights": {"cv_1789785674_left": {"status": "ready", "url": "u", "angle": "FL"}},
          "tracker_teams": {"switch_epoch": 1789785000.0, "left_basket_first": "left"}}
     assert build_reel("g", g)["clips"][0]["team"] == "right"     # after half-time the right team attacks left
+
+
+def _dense_game():
+    hl = {"cv_%d_left" % e: {"status": "ready", "url": "u%d" % e} for e in range(1789500000, 1789500120, 8)}
+    hl["cv_1789500400_left"] = {"status": "ready", "url": "real"}
+    return {"highlights": hl}
+
+
+def test_warmup_burst_is_left_out_of_the_reel(monkeypatch):
+    monkeypatch.delenv("CORE_REEL_DROP_DENSE", raising=False)
+    reel = build_reel("g", _dense_game())
+    assert [c["url"] for c in reel["clips"]] == ["real"]
+
+
+def test_dense_filter_can_be_switched_off(monkeypatch):
+    monkeypatch.setenv("CORE_REEL_DROP_DENSE", "false")
+    assert len(build_reel("g", _dense_game())["clips"]) == 16
