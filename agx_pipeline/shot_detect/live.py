@@ -340,6 +340,14 @@ class LiveShotScorer:
         logger.info("shot-live stopped game=%s segments=%d shots=%d unscanned=%d",
                     game_id, n_seg, len(shadow), len(leftover))
 
+        # This stage's own numbers already went into the coverage record via
+        # _write_shadow above. Closing it is a separate act: it pulls what every
+        # OTHER stage has been counting, marks any stage that was enabled and
+        # never spoke, and stamps the record closed so a checker can tell a
+        # finished game from one that was killed halfway.
+        from agx_pipeline import coverage
+        coverage.finalize(game_id)
+
     # ---- per-window (recall fixes: sliding window + rim accumulation) ------- #
     def _process_window(self, scan, detector, rims, path, idx, angle, fps, imgsz,
                         stride, spawned_iso, starting_side, scored, shadow, game_id,
@@ -669,6 +677,22 @@ class LiveShotScorer:
                       t0: float, status: str,
                       backlog: Optional[Dict] = None,
                       unscanned: int = 0, unscanned_s: float = 0.0) -> None:
+        # Coverage first, and deliberately ahead of the `self.fb` guard below:
+        # this record is local and has to survive a box with no Firebase as well
+        # as a box that never reaches the end of the game. Written on every
+        # shadow publish rather than only at stop, because a run that is killed
+        # or loses power never reaches the stop path at all -- and a missing
+        # record then looks exactly like a night with no game, which is the one
+        # confusion this whole exercise exists to remove.
+        from agx_pipeline import coverage
+        coverage.record(
+            game_id, "shot_detect",
+            expected=n_seg + (unscanned if status == "stopped"
+                              else (backlog or {}).get("now", 0)),
+            processed=n_seg,
+            status=status, shots=len(shadow), unscanned=unscanned,
+            unscanned_s=round(unscanned_s, 1))
+
         if not self.fb:
             return
         n_make = sum(1 for s in shadow if s["made"])

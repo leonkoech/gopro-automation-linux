@@ -49,6 +49,9 @@ logger = logging.getLogger("agx.service")
 
 app = Flask(__name__)
 CFG = load_config()
+# Coverage records live beside the recordings; the config knows where that is.
+from agx_pipeline import coverage as _coverage  # noqa: E402
+_coverage.configure(CFG.output_dir)
 # Recording backend: "camrec" drives geoffbauer's per-camera FastAPI recorder
 # (robust, watchdog-supervised); "gstreamer" (default) is our own single
 # gst-launch. Both expose the same start()/stop() interface.
@@ -258,9 +261,62 @@ def system_info():
                     "disk": {"total": total, "used": used, "free": free}})
 
 
+@app.route("/api/coverage")
+def coverage_status():
+    """Recent games and anything wrong with them.
+
+    Exposed here because this is the surface the fleet monitor already polls, so
+    a coverage shortfall reaches the same alert path as an offline box or a full
+    disk. Games still being played are not reported as problems.
+    """
+    from agx_pipeline import coverage
+    try:
+        hours = float(request.args.get("hours", 24))
+    except (TypeError, ValueError):
+        hours = 24.0
+    games = [{"game_id": d.get("game_id"), "status": d.get("status"),
+              "updated_at": d.get("updated_at"),
+              "summary": coverage.summarize(d)} for d in coverage.recent(hours)]
+    return jsonify({"success": True, "jetson_id": CFG.jetson_id,
+                    "problems": coverage.problems(hours), "games": games})
+
+
 # --------------------------------------------------------------------------- #
 # Recording control
 # --------------------------------------------------------------------------- #
+def _record_live_coverage(game_id) -> None:
+    """How many angles were asked to publish, and how many actually did.
+
+    The publisher knows its own per-angle segment counts; nothing was comparing
+    them. On the first two-camera run after it shipped, FR died at launch while
+    FL ran fine — no segments, no retry, no error, for the whole recording. That
+    is `1 of 2` here, which the nightly check and the fleet monitor both read.
+
+    Best-effort, like every other coverage call: this must never be able to
+    interfere with starting or stopping a recording.
+    """
+    try:
+        if not game_id:
+            return
+        st = LIVESTREAM.status()
+        angles = st.get("angles") or []
+        if not angles:
+            # Enabled but publishing nothing is worth recording as such; it is
+            # not the same as the stage being switched off.
+            if st.get("enabled"):
+                _coverage.record(game_id, "live_stream", expected=None,
+                                 processed=None, publishing=False)
+            return
+        produced = sum(1 for a in angles if (a.get("segments") or 0) > 0)
+        _coverage.record(
+            game_id, "live_stream", expected=len(angles), processed=produced,
+            per_angle={a.get("angle"): {"alive": a.get("alive"),
+                                        "segments": a.get("segments") or 0}
+                       for a in angles})
+    except Exception as e:  # noqa: BLE001
+        logger.warning("live coverage record failed: %s", e)
+
+
 def _do_start(game_id=None, label=None, force=False):
     """Start recording. Shared by the HTTP route and the Firebase relay.
 
@@ -343,6 +399,7 @@ def _do_start(game_id=None, label=None, force=False):
             LIVESTREAM.start(label, game_id)
         except Exception as e:  # noqa: BLE001
             logger.warning("live publisher failed to start: %s", e)
+        _record_live_coverage(game_id)
         if LIVE:
             try:
                 LIVE.start(label, game_id, _starting_side_team1(game_id))
@@ -394,6 +451,9 @@ def _do_stop():
                 HIGHLIGHT.stop()
             except Exception as e:  # noqa: BLE001
                 logger.warning("highlight recorder stop failed: %s", e)
+        # Taken BEFORE stop(), which empties the angle list. This is the only
+        # moment the finished per-angle segment counts exist.
+        _record_live_coverage(state.get("firebase_game_id"))
         try:
             # SIGINTs ffmpeg so the playlist gets EXT-X-ENDLIST and the
             # annotator's player becomes a recording cleanly at the final horn.
@@ -405,6 +465,12 @@ def _do_stop():
                 LIVE.stop()
             except Exception as e:  # noqa: BLE001
                 logger.warning("shot-live stop failed: %s", e)
+        # Close the game's coverage record here, where the game actually ends.
+        # The shot scorer also closes it when it winds down, but it is only one
+        # stage and it can be switched off — leaving a record open forever and
+        # indistinguishable from a run that died. Closing is sticky, so whichever
+        # happens last is harmless and the scorer's final numbers still land.
+        _coverage.finalize(state.get("firebase_game_id"))
     if track_err is not None:
         return {"success": False, "error": track_err}, 500
     if TRACKER:
