@@ -1,0 +1,274 @@
+# Event schema — draft for review
+
+**Status: proposal. Nothing implements this yet.**
+
+One schema for everything the pipeline emits, so that the clip cutter, the
+uploader, the registrar and the annotation tool can consume events without
+knowing what a rim is.
+
+This is the first step of separating the sport from the pipeline. The step after
+it moves rim geometry, make/miss and shot typing behind a module; this document
+defines what crosses the boundary between them. It is written against two sports
+on purpose — basketball because we run it, volleyball because it breaks
+assumptions basketball lets us keep. A schema validated against one sport is
+just that sport's record with general-sounding field names.
+
+---
+
+## 1. What we emit today
+
+Three producers, three unrelated shapes, all basketball-specific.
+
+**The live detector** (`shot_detect/live.py`, the `shadow` record):
+
+```json
+{"cam": "SL", "side": "left", "seg": 418, "t_shot": 2.417,
+ "made": true, "verdict": "MAKE", "rho": 0.71,
+ "wallclock": "2026-09-14T19:22:31.880Z", "detected_at": "2026-09-14T19:22:48.114Z",
+ "latency_s": 16.2, "scan_s": 3.9}
+```
+
+**Typing** (`shot_typing_live.py`, written to `cv_points.{logId}`):
+
+```json
+{"zone": "3PT", "points": 3, "who": "23", "angle": "FL",
+ "typed_at": "2026-09-14T19:23:19.004Z", "proc_s": 28.0,
+ "confidence": 0.9, "zone_source": "strict", "pose_degenerate": false}
+```
+
+**The highlight trigger** (`live.py`, `_maybe_highlight`):
+
+```json
+{"logId": "cv_1757877751_left", "ts": "2026-09-14T19:22:31.880Z",
+ "side": "left", "firebase_game_id": "...", "pre": 5.0, "post": 2.0}
+```
+
+### Four problems in those shapes
+
+**1. "Side" means two different things, and we have already been bitten.**
+`side_attribution.py` exists precisely because of this: the scoreboard's
+`team` field is "left"/"right" meaning *team identity*, while the detector's
+`side` means *physical hoop*, and the two diverge after half-time. One word,
+two concepts, a module to translate between them. Any schema that keeps a bare
+`side` inherits that confusion and exports it to the next sport.
+
+**2. An event is assumed to be an instant.** `t_shot` is a moment. A basketball
+shot is a moment, so nothing has pushed back. A volleyball rally is an interval
+and the scoring event is its *end* — nothing crossed a plane; a return failed.
+Interval support is nearly free now and a migration later.
+
+**3. Observation, interpretation and telemetry are in one object.** `rho` and
+`verdict` are evidence and conclusion; `latency_s` and `scan_s` are how the
+pipeline performed; `made` is a basketball fact. They have different audiences,
+different lifetimes, and only one of the three should cross the sport boundary.
+
+**4. The two confidences are not comparable.** The detector's `rho` is a
+geometric distance; typing's `confidence` is 0.9 or 0.4 — two levels, not a
+scale, as its own source comments say. Consumers currently cannot compare them
+and nothing says so.
+
+---
+
+## 2. The model
+
+Four kinds of message, not one.
+
+| Kind | Who emits | Sport-aware? | Example |
+| --- | --- | --- | --- |
+| **Observation** | a detector | no | the ball passed through the hoop plane at T, downward, 0.71 off centre |
+| **Interpretation** | the sport module | yes | 3 points, credited to the home team |
+| **Enrichment** | any later stage | yes | the shooter was number 23 |
+| **Command** | the sport module | no | cut a clip from T−5s to T+2s on the left camera |
+
+Everything left of the boundary emits and consumes **observations** and
+**commands**. Only the sport module emits **interpretations**, and only it
+reads observations as meaning anything.
+
+A command is deliberately not an event. The clip cutter is told to cut; it does
+not infer that it should.
+
+### What "sport-agnostic" covers, and what it does not
+
+**Decided: sport-agnostic is a claim about the software platform only. Camera
+topology is expected to change per sport.**
+
+The recording, transcoding, segmenting and clip-cutting code does not need to
+know the sport. Where the cameras go, how many there are and what they are
+pointed at does — basketball puts high-frame-rate cameras at two fixed rims
+because that is where the decisive moment happens, while a sport whose decisive
+moment can occur anywhere along a net or a boundary line needs a different rig.
+
+This matters beyond the schema. A new sport is not only a module: it is a site
+survey, a camera count and a calibration. Per-site configuration has to express
+that, which is why `where.structure` names a structure from the site's
+calibration rather than a camera — the same code reads a two-rim court and a
+net, and only the configuration differs.
+
+---
+
+## 3. The schema
+
+### Common envelope
+
+Every message carries this.
+
+```json
+{
+  "id": "ev_01JBQ7X3M9TCZ8YQF4R2",
+  "schema": "uai.event.v1",
+  "game_id": "7cef734e-...",
+  "site_id": "court-a",
+  "kind": "observation.plane_cross",
+  "t": {"start": "2026-09-14T19:22:31.880Z", "end": "2026-09-14T19:22:31.880Z"},
+  "observed_by": ["SL"],
+  "produced_by": {"stage": "shot_detect", "version": "v3-trt-1.90",
+                  "method": "aperture"},
+  "emitted_at": "2026-09-14T19:22:48.114Z",
+  "confidence": {"value": 0.92, "scale": "calibrated"},
+  "phase": "play"
+}
+```
+
+| Field | Why it is here |
+| --- | --- |
+| `id` | so enrichments can refer to an event instead of re-describing it |
+| `schema` | the version, present from the first message, not added after the first breaking change |
+| `t.start` / `t.end` | equal for an instant, different for an interval. This is the field that makes volleyball expressible |
+| `observed_by` | which sensors saw it. A list: two cameras may witness one event |
+| `produced_by.version` | which model and which settings. We have already lost time to an eval drifting from production |
+| `confidence.scale` | `calibrated` (a probability), `ordinal` (ranked, not a probability), or `none`. Typing's 0.9/0.4 is `ordinal` and must say so |
+| `phase` | `warmup`, `play`, `break`, `postgame`. `deadball.py` already decides this after the fact; the field gives it somewhere to live |
+
+`emitted_at` minus `t.end` is the detection latency, so `latency_s` and `scan_s`
+stop being event fields. Pipeline telemetry belongs in the coverage record, not
+in the event.
+
+### Observation
+
+Sport-neutral geometry and kinematics. The sport module interprets these; the
+pipeline never does.
+
+```json
+{
+  "kind": "observation.plane_cross",
+  "where": {"structure": "goal_left", "direction": "downward"},
+  "evidence": {"offset": 0.71, "frames": 4, "unit": "normalized"}
+}
+```
+
+Proposed observation kinds, with the sports that need them:
+
+| Kind | Meaning | Basketball | Volleyball |
+| --- | --- | --- | --- |
+| `observation.plane_cross` | an object crossed a defined plane | ball through the hoop | ball over the net |
+| `observation.region_enter` | an object entered a defined region | ball in the paint | ball lands in/out |
+| `observation.contact` | two tracked things touched | — | ball touches floor |
+| `observation.possession_change` | the tracked object changed holder | rebound, turnover | — |
+| `observation.absence` | an expected event did not occur in a window | shot clock expiry | no successful return |
+
+`observation.absence` is the one basketball would never have taught us. A
+volleyball point is awarded because something *failed to happen*, and there is no
+plane crossing to hang it on.
+
+`where.structure` names a thing in the site's calibration — `goal_left`,
+`net`, `court_boundary` — not a camera and not a team. The structure list is
+per-sport configuration; the field itself is not.
+
+### Interpretation
+
+What it means. Only the sport module emits these.
+
+```json
+{
+  "kind": "interpretation.score",
+  "derived_from": ["ev_01JBQ7X3M9TCZ8YQF4R2"],
+  "credit": {"team": "team1", "player": null},
+  "value": {"points": 3, "class": "3PT"}
+}
+```
+
+`credit.team` is who benefits. `where.structure` is which physical thing was
+involved. They are separate fields because they are separate facts, and
+conflating them is exactly the bug `side_attribution.py` was written to undo.
+
+### Enrichment
+
+A later, better answer about an event already emitted. Never a rewrite.
+
+```json
+{
+  "kind": "enrichment.identity",
+  "derived_from": ["ev_01JBQ7X3M9TCZ8YQF4R2"],
+  "credit": {"player": "23"},
+  "confidence": {"value": 0.9, "scale": "ordinal"},
+  "produced_by": {"stage": "typing", "version": "v2-strict", "method": "release_pose"}
+}
+```
+
+This is what typing and WHO emit today, writing into a Firestore field instead.
+Consumers that already acted on the original event apply the correction; they do
+not wait for it. That is the existing decoupling, written down.
+
+---
+
+## 4. The two-sport test
+
+The same play, in both sports, using only the fields above.
+
+**Basketball — a made three.**
+
+1. `observation.plane_cross` — SL, `goal_left`, downward, offset 0.71
+2. `interpretation.score` — 3 points, team1, derived from (1)
+3. `command.cut_clip` — T−5s to T+2s, left camera
+4. `enrichment.identity` — player 23, confidence 0.9 ordinal, derived from (1)
+
+**Volleyball — a point won on a failed return.**
+
+1. `observation.plane_cross` — ball over `net`, toward the home side
+2. `observation.contact` — ball touches `floor`, inside `court_home`,
+   `t.start == t.end`
+3. `observation.absence` — no `observation.contact` with a player in the window
+   between (1) and (2)
+4. `interpretation.score` — 1 point, team2, derived from (1), (2) and (3),
+   `t.start` = the serve, `t.end` = the floor contact
+5. `command.cut_clip` — the rally interval, not a fixed window around a moment
+
+Step 4 is the test. Its `t` is an interval spanning the rally, it derives from
+three observations rather than one, and no single observation "is" the point. A
+schema with a scalar timestamp and one-to-one derivation cannot express it.
+
+Step 5 is the second test: the clip window comes from the event's own interval
+rather than from a pre/post constant. Basketball's fixed 5s/2s becomes a special
+case of an interval, not the only shape the cutter understands.
+
+---
+
+## 5. What this does not decide
+
+- **Transport.** Events ride a local durable queue on the box; which one is a
+  separate choice.
+- **Storage.** Whether events are the system of record or a projection of it.
+- **The migration.** Today's Firestore shapes have live consumers. Nothing here
+  says how we get from one to the other, and that sequencing is its own piece of
+  work.
+- **Per-sport geometry format.** `where.structure` names a structure; what
+  defines a structure (the rim ellipse today) stays sport-specific
+  configuration.
+
+## 6. Open questions for review
+
+1. **Is `observation.absence` worth carrying now?** It costs little and
+   basketball has one use (shot-clock expiry) we do not currently detect. It is
+   also the field most likely to be wrong in detail without a second sport in
+   front of us.
+2. **Should `confidence` be a single number plus a scale, or a per-producer
+   evidence blob?** The current two confidences are not comparable, and declaring
+   a scale is the cheapest honest fix — but it does not make them comparable, it
+   only stops consumers pretending they are.
+3. **Is `phase` observed or assigned?** `deadball.py` decides it after the game
+   from clip density. Live, nothing knows it. Emitting `"phase": "unknown"` and
+   back-filling is honest; it also means consumers must handle it.
+4. **One `id` scheme across sites.** The existing `logId` is
+   `cv_<epoch>_<side>`, which is already a composite key with a sport concept in
+   it. A site-unique opaque id is cleaner, but the annotation tool consumes the
+   current form.
