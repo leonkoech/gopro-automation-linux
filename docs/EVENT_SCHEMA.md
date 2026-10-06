@@ -114,7 +114,8 @@ Every message carries this.
 
 ```json
 {
-  "id": "ev_01JBQ7X3M9TCZ8YQF4R2",
+  "id": "ev_c0a8f1e2d4b7",
+  "external_ids": {"annotation_tool": "cv_1757877751_left"},
   "schema": "uai.event.v1",
   "game_id": "7cef734e-...",
   "site_id": "court-a",
@@ -124,21 +125,22 @@ Every message carries this.
   "produced_by": {"stage": "shot_detect", "version": "v3-trt-1.90",
                   "method": "aperture"},
   "emitted_at": "2026-09-14T19:22:48.114Z",
-  "confidence": {"value": 0.92, "scale": "calibrated"},
-  "phase": "play"
+  "confidence": {"value": 0.92, "scale": "ordinal"},
+  "phase": "unknown"
 }
 ```
 
 | Field | Why it is here |
 | --- | --- |
-| `id` | so enrichments can refer to an event instead of re-describing it |
+| `id` | so enrichments can refer to an event instead of re-describing it. Derived, not random — see §6 |
+| `external_ids` | ids other systems already use for this event, during migration. Never the primary key |
 | `schema` | the version, present from the first message, not added after the first breaking change |
 | `t.start` / `t.end` | equal for an instant, different for an interval. This is the field that makes volleyball expressible |
 | `observed_by` | which sensors saw it. A list: two cameras may witness one event |
 | `produced_by.version` | which model and which settings. We have already lost time to an eval drifting from production |
 | `confidence.value` | gates human review; it is not a probability and must not be read as one. Producer-specific evidence lives in `evidence`, which generic code never reads |
 | `confidence.scale` | mandatory, no default: `calibrated` (earned against ground truth), `ordinal` (ranked only), or `none`. Typing's 0.9/0.4 is `ordinal` |
-| `phase` | `warmup`, `play`, `break`, `postgame`. `deadball.py` already decides this after the fact; the field gives it somewhere to live |
+| `phase` | `warmup`, `play`, `break`, `postgame`, or `unknown` when nothing can yet tell. Corrected by `enrichment.phase`, never rewritten in place — see §6 |
 
 `emitted_at` minus `t.end` is the detection latency, so `latency_s` and `scan_s`
 stop being event fields. Pipeline telemetry belongs in the coverage record, not
@@ -182,7 +184,7 @@ What it means. Only the sport module emits these.
 ```json
 {
   "kind": "interpretation.score",
-  "derived_from": ["ev_01JBQ7X3M9TCZ8YQF4R2"],
+  "derived_from": ["ev_c0a8f1e2d4b7"],
   "credit": {"team": "team1", "player": null},
   "value": {"points": 3, "class": "3PT"}
 }
@@ -199,7 +201,7 @@ A later, better answer about an event already emitted. Never a rewrite.
 ```json
 {
   "kind": "enrichment.identity",
-  "derived_from": ["ev_01JBQ7X3M9TCZ8YQF4R2"],
+  "derived_from": ["ev_c0a8f1e2d4b7"],
   "credit": {"player": "23"},
   "confidence": {"value": 0.9, "scale": "ordinal"},
   "produced_by": {"stage": "typing", "version": "v2-strict", "method": "release_pose"}
@@ -209,6 +211,16 @@ A later, better answer about an event already emitted. Never a rewrite.
 This is what typing and WHO emit today, writing into a Firestore field instead.
 Consumers that already acted on the original event apply the correction; they do
 not wait for it. That is the existing decoupling, written down.
+
+| Kind | Corrects | Produced by |
+| --- | --- | --- |
+| `enrichment.identity` | who the player was | typing, WHO |
+| `enrichment.value` | what the score was worth | typing |
+| `enrichment.phase` | whether the event was in play at all | the post-game pass today, the live detector later |
+
+`enrichment.phase` is how `deadball.py`'s work reaches an event that was emitted
+long before anything could tell. It carries the same `derived_from` as any other
+enrichment, so an event's phase history is readable rather than overwritten.
 
 ---
 
@@ -286,12 +298,44 @@ ground truth to earn it — 180 shots from the TensorRT parity run, the 505-shot
 benchmark, 28 annotated games. Until a producer is calibrated against it, that
 producer says `ordinal` and consumers know where they stand.
 
+**`phase` is an envelope field from the start, corrected by enrichment and never
+rewritten.** Phase detection will run after the game first and live later; the
+field has to survive that change without a schema change.
+
+An event carries the best value known when it is emitted, which is `unknown`
+while nothing can tell. The post-game pass does not go back and edit those
+events — it emits `enrichment.phase` referring to them, the same way typing
+already corrects a score it arrived too late to inform. Consumers that have
+already acted apply the correction.
+
+Rewriting the field in place was the alternative and it does not work: events
+are emitted to consumers that may have acted on them, so a value that silently
+changes afterwards is a value nobody can trust at the moment they read it. When
+phase detection goes live, the same field simply starts being right at emit time
+and fewer enrichments are produced. Nothing else changes.
+
+**One id scheme, derived rather than random, with the old id kept as an alias.**
+A single site-unique id with no sport concept in it, so `side` leaves the
+identifier.
+
+Derived matters more than it looks. `cv_<epoch>_<side>` is computed from the
+event, so re-running the same footage produces the same id — which is free
+deduplication, and we do reprocess: backfills, re-cuts, and the deferred scan of
+segments the live loop never reached. A randomly generated id would produce a
+duplicate on the second pass instead of a match. So the new id is a deterministic
+function of a natural key — site, producer, event time, structure — not a random
+one.
+
+The annotation tool consumes `cv_<epoch>_<side>` today. That is a migration
+constraint, not a reason for a second permanent scheme, so the old form lives in
+`external_ids` for as long as it is needed and never as the primary key.
+
 ## 7. Open questions for review
 
-1. **Is `phase` observed or assigned?** `deadball.py` decides it after the game
-   from clip density. Live, nothing knows it. Emitting `"phase": "unknown"` and
-   back-filling is honest; it also means consumers must handle it.
-2. **One `id` scheme across sites.** The existing `logId` is
-   `cv_<epoch>_<side>`, which is already a composite key with a sport concept in
-   it. A site-unique opaque id is cleaner, but the annotation tool consumes the
-   current form.
+None outstanding on the schema itself. What remains is in §5 — transport,
+storage, the migration from today's Firestore shapes, and the per-sport geometry
+format — none of which this document sets out to decide.
+
+The next thing that would change this document is an attempt to implement it:
+moving rim geometry, make/miss and shot typing behind a module, and finding out
+which of these fields turn out to be wrong.
