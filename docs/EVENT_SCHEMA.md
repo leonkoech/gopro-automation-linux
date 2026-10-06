@@ -136,7 +136,8 @@ Every message carries this.
 | `t.start` / `t.end` | equal for an instant, different for an interval. This is the field that makes volleyball expressible |
 | `observed_by` | which sensors saw it. A list: two cameras may witness one event |
 | `produced_by.version` | which model and which settings. We have already lost time to an eval drifting from production |
-| `confidence.scale` | `calibrated` (a probability), `ordinal` (ranked, not a probability), or `none`. Typing's 0.9/0.4 is `ordinal` and must say so |
+| `confidence.value` | gates human review; it is not a probability and must not be read as one. Producer-specific evidence lives in `evidence`, which generic code never reads |
+| `confidence.scale` | mandatory, no default: `calibrated` (earned against ground truth), `ordinal` (ranked only), or `none`. Typing's 0.9/0.4 is `ordinal` |
 | `phase` | `warmup`, `play`, `break`, `postgame`. `deadball.py` already decides this after the fact; the field gives it somewhere to live |
 
 `emitted_at` minus `t.end` is the detection latency, so `latency_s` and `scan_s`
@@ -255,20 +256,42 @@ case of an interval, not the only shape the cutter understands.
   defines a structure (the rim ellipse today) stays sport-specific
   configuration.
 
-## 6. Open questions for review
+## 6. Decided
 
-1. **Is `observation.absence` worth carrying now?** It costs little and
-   basketball has one use (shot-clock expiry) we do not currently detect. It is
-   also the field most likely to be wrong in detail without a second sport in
-   front of us.
-2. **Should `confidence` be a single number plus a scale, or a per-producer
-   evidence blob?** The current two confidences are not comparable, and declaring
-   a scale is the cheapest honest fix — but it does not make them comparable, it
-   only stops consumers pretending they are.
-3. **Is `phase` observed or assigned?** `deadball.py` decides it after the game
+**`observation.absence` is in from the start.** It costs little and there is no
+harm in having it before the sport that forces it. Basketball has one use we do
+not currently detect — shot-clock expiry.
+
+**Confidence is a scalar and an evidence object, not one or the other.** The
+scalar's sanctioned use is "should a person look at this", not "how likely this
+is to be correct". `scale` is mandatory and has no default.
+
+The reason for not stopping at a scalar: the two numbers we have today are a
+scale of different things. Typing's 0.9 against 0.4 records which code path ran
+— whether STRICT committed or fell back — and its own source calls it two
+levels, not a scale. The detector's `rho` is a geometric distance and
+`clf_prob`, where it exists, is a probability. In one field they are unrelated
+facts wearing the same clothes, and something will eventually threshold, sort or
+average them: the annotation tool already flags cards against a 0.7 threshold on
+typing's number.
+
+So `evidence` stays per-producer and opaque, read by the sport module and by a
+person debugging, never by generic code — which is also what keeps `rho` from
+leaking out of the sport module. The scalar stays because consumers need
+something simple to gate on, and requiring every consumer to understand `rho`
+would defeat the boundary.
+
+`calibrated` has to be earned per producer rather than declared. We have the
+ground truth to earn it — 180 shots from the TensorRT parity run, the 505-shot
+benchmark, 28 annotated games. Until a producer is calibrated against it, that
+producer says `ordinal` and consumers know where they stand.
+
+## 7. Open questions for review
+
+1. **Is `phase` observed or assigned?** `deadball.py` decides it after the game
    from clip density. Live, nothing knows it. Emitting `"phase": "unknown"` and
    back-filling is honest; it also means consumers must handle it.
-4. **One `id` scheme across sites.** The existing `logId` is
+2. **One `id` scheme across sites.** The existing `logId` is
    `cv_<epoch>_<side>`, which is already a composite key with a sport concept in
    it. A site-unique opaque id is cleaner, but the annotation tool consumes the
    current form.
