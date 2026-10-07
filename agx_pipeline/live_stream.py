@@ -44,6 +44,19 @@ logger = logging.getLogger("agx.live")
 ENABLED = os.getenv("LIVE_STREAM_ENABLED", "false").lower() in ("1", "true", "yes")
 # Angles the annotation player understands today. FL -> LEFT, FR -> RIGHT.
 ANGLE_MAP = {"FL": "LEFT", "FR": "RIGHT"}
+# Failover order per player-facing angle, same convention as the highlight
+# recorder. FL and NL both watch the left hoop, FR and NR the right, so a dead
+# primary is covered by its own side's near camera rather than by one pointing
+# at the other basket. Without this, an angle whose camera dies is simply
+# absent for the rest of the game.
+ANGLE_SOURCES = {
+    "LEFT": [a.strip() for a in os.getenv("LIVE_LEFT_ANGLES", "FL,NL").split(",") if a.strip()],
+    "RIGHT": [a.strip() for a in os.getenv("LIVE_RIGHT_ANGLES", "FR,NR").split(",") if a.strip()],
+}
+# Consecutive failures on one camera before trying the next. Retry once first:
+# most deaths are a transient RTSP blip, and rotating immediately would move the
+# annotator off the better camera for nothing.
+FAILS_BEFORE_ROTATE = int(os.getenv("LIVE_FAILS_BEFORE_ROTATE", "2"))
 SEG_SEC = int(os.getenv("LIVE_SEGMENT_SEC", "4"))
 WIDTH = int(os.getenv("LIVE_WIDTH", "1280"))
 HEIGHT = int(os.getenv("LIVE_HEIGHT", "720"))
@@ -87,10 +100,11 @@ def _free_gb(path: str) -> float:
 class _AnglePublisher:
     """One camera -> one HLS playlist on disk, plus an uploader to S3."""
 
-    def __init__(self, cam, session_dir: str, s3_prefix: str):
-        self.cam = cam
-        self.angle = ANGLE_MAP[cam.angle]        # LEFT / RIGHT
-        self.source_angle = cam.angle            # FL / FR
+    def __init__(self, cams, angle: str, session_dir: str, s3_prefix: str):
+        self.cams = list(cams)                   # candidates, in preference order
+        self._cam_idx = 0
+        self.angle = angle                       # LEFT / RIGHT
+        self.consecutive_fails = 0
         self.dir = os.path.join(session_dir, self.angle)
         self.s3_prefix = f"{s3_prefix}/{self.angle}"
         self.proc: Optional[subprocess.Popen] = None
@@ -102,6 +116,23 @@ class _AnglePublisher:
         self._log = None
         self._pgid: Optional[int] = None
         self.restarts = 0
+
+    @property
+    def cam(self):
+        return self.cams[self._cam_idx]
+
+    @property
+    def source_angle(self) -> str:
+        """Which camera is feeding this angle right now — FL/NL or FR/NR."""
+        return self.cams[self._cam_idx].angle
+
+    def rotate(self) -> bool:
+        """Hand this angle to the next camera. False when there is only one."""
+        if len(self.cams) < 2:
+            return False
+        self._cam_idx = (self._cam_idx + 1) % len(self.cams)
+        self.consecutive_fails = 0
+        return True
 
     # ---- pipeline ---------------------------------------------------------
     def _gst_cmd(self) -> str:
@@ -322,9 +353,9 @@ class LivePublisher:
         free = _free_gb(OUT_ROOT if os.path.isdir(OUT_ROOT) else "/")
         if free < MIN_FREE_GB:
             return f"only {free:.0f} GB free, need {MIN_FREE_GB:.0f}"
-        cams = [c for c in self.cfg.cameras if c.angle in ANGLE_MAP]
-        if not cams:
-            return "no FL/FR cameras configured"
+        have = {c.angle for c in self.cfg.cameras}
+        if not any(set(order) & have for order in ANGLE_SOURCES.values()):
+            return "no camera configured for either angle"
         return None
 
     # ---- lifecycle --------------------------------------------------------
@@ -347,11 +378,14 @@ class LivePublisher:
 
                 self._session_id = self._open_session(game_id, label)
 
+                by_angle = {c.angle: c for c in self.cfg.cameras}
                 self._angles = []
-                for cam in self.cfg.cameras:
-                    if cam.angle not in ANGLE_MAP:
+                for player_angle, order in ANGLE_SOURCES.items():
+                    cams = [by_angle[a] for a in order if a in by_angle]
+                    if not cams:
+                        logger.warning("[LIVE] no camera for %s (wanted %s)", player_angle, order)
                         continue
-                    pub = _AnglePublisher(cam, session_dir, s3_prefix)
+                    pub = _AnglePublisher(cams, player_angle, session_dir, s3_prefix)
                     if pub.start():
                         self._angles.append(pub)
 
@@ -427,14 +461,23 @@ class LivePublisher:
                 for a in self._angles:
                     if not a.alive() and a.restarts < MAX_RESTARTS:
                         a.restarts += 1
-                        logger.warning("[LIVE] %s died — restart %d/%d",
-                                       a.angle, a.restarts, MAX_RESTARTS)
+                        a.consecutive_fails += 1
+                        was = a.source_angle
+                        if a.consecutive_fails >= FAILS_BEFORE_ROTATE and a.rotate():
+                            logger.warning("[LIVE] %s: %s keeps failing — switching to %s",
+                                           a.angle, was, a.source_angle)
+                            reported.discard(a.angle)   # re-announce the new camera
+                        else:
+                            logger.warning("[LIVE] %s died on %s — restart %d/%d",
+                                           a.angle, was, a.restarts, MAX_RESTARTS)
                         # Tear the old group down first. `alive()` only watches
                         # the bash wrapper, so its children can still be running
                         # and would otherwise keep writing beside the new ones.
                         a._teardown()
                         a.start()
                         continue
+                    if a.alive() and a.segment_count() > 0:
+                        a.consecutive_fails = 0     # producing again; blip over
                     if a.angle in reported:
                         continue
                     pdt = a.first_pdt()
