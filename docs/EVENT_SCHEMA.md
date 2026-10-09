@@ -11,7 +11,9 @@ it moves rim geometry, make/miss and shot typing behind a module; this document
 defines what crosses the boundary between them. It is written against two sports
 on purpose — basketball because we run it, volleyball because it breaks
 assumptions basketball lets us keep. A schema validated against one sport is
-just that sport's record with general-sounding field names.
+just that sport's record with general-sounding field names. Soccer and
+pickleball were looked at too, and §4 records only what they break rather than
+designing for sports we are not building.
 
 ---
 
@@ -118,7 +120,8 @@ Every message carries this.
   "external_ids": {"annotation_tool": "cv_1757877751_left"},
   "schema": "uai.event.v1",
   "game_id": "7cef734e-...",
-  "site_id": "court-a",
+  "site_id": "riverside",
+  "surface_id": "court-a",
   "kind": "observation.plane_cross",
   "t": {"start": "2026-09-14T19:22:31.880Z", "end": "2026-09-14T19:22:31.880Z"},
   "observed_by": ["SL"],
@@ -134,6 +137,7 @@ Every message carries this.
 | --- | --- |
 | `id` | so enrichments can refer to an event instead of re-describing it. Derived, not random — see §6 |
 | `external_ids` | ids other systems already use for this event, during migration. Never the primary key |
+| `surface_id` | which playing surface at the site. `where.structure` is meaningless without it the moment a venue has more than one court, and `cameras.json` currently has a single `location: "court-a"` doing both jobs |
 | `schema` | the version, present from the first message, not added after the first breaking change |
 | `t.start` / `t.end` | equal for an instant, different for an interval. This is the field that makes volleyball expressible |
 | `observed_by` | which sensors saw it. A list: two cameras may witness one event |
@@ -254,6 +258,40 @@ Step 5 is the second test: the clip window comes from the event's own interval
 rather than from a pre/post constant. Basketball's fixed 5s/2s becomes a special
 case of an interval, not the only shape the cutter understands.
 
+### What other sports would break
+
+Two sports were looked at and deliberately not written up as full examples.
+Most of what they would exercise, volleyball already does, and four parallel
+worked examples is a document people stop reading. Each breaks one thing that
+is genuinely new, and those two things are recorded here rather than designed
+for — we are not building either sport, and an abstraction built for four
+hypothetical ones usually fits none of them.
+
+**Soccer: an event that is retroactively void.** The goal is a plane crossing,
+which is nothing new. Offside and VAR are. The event happened, was emitted, and
+consumers acted on it — and then a rule evaluated over earlier state says it
+does not count. That is not what `enrichment.value` means: changing 3 to 2 says
+the value was wrong, whereas a disallowed goal says the event should never have
+scored. Whether an event can be *voided*, as distinct from corrected, is left
+open.
+
+Basketball already has a weaker form of this, which is why it is not
+hypothetical: the scorekeeper is authoritative over CV, and `cv_points`
+deliberately never writes to `logs[]`. That precedence between producers exists
+in the code today and appears nowhere in this schema.
+
+**Pickleball: several courts running at once.** A pickleball venue runs four to
+eight courts simultaneously. Basketball is one court per facility, and the
+system assumes it throughout — `cameras.json` carries a single
+`location: "court-a"`, and the coverage record assumes one game per box. This
+is the one finding acted on here: `surface_id` is in the envelope from the
+start, because `where.structure` says nothing useful once a site has more than
+one playing surface, and adding an identifier later is a migration.
+
+It is worth being clear that this is a schema fix only. Several simultaneous
+courts is a capacity and topology problem well beyond the envelope, and nothing
+in this document addresses it.
+
 ---
 
 ## 5. What this does not decide
@@ -336,9 +374,21 @@ constraint, not a reason for a second permanent scheme, so the old form lives in
 
 ## 7. Open questions for review
 
-None outstanding on the schema itself, in the sense that section 6 offers a
-position on each one — but those positions still need agreeing, and that is the
-review this document is asking for.
+Section 6 offers a position on each of the questions this draft opened with;
+those positions still need agreeing, and that is the review this document is
+asking for. Two questions remain genuinely open, both raised by looking at
+sports we are not building (§4):
+
+1. **Can an event be voided, as distinct from corrected?** A disallowed goal is
+   not a value that was wrong. Basketball's nearest equivalent today is a
+   scorekeeper overruling CV.
+2. **What is the precedence between producers?** The scorekeeper already
+   outranks CV — `cv_points` never writes to `logs[]` — and that ordering lives
+   in code rather than in the schema. If two producers disagree about the same
+   event, nothing here says who wins.
+
+Neither needs answering before an implementation starts, and both would be
+answered badly in the abstract.
 
 What remains beyond them is in §5: transport, storage, the migration from
 today's Firestore shapes, and the per-sport geometry format, none of which this
