@@ -522,15 +522,43 @@ class LivePublisher:
             logger.warning("[LIVE] %s failed: %s", path, e)
             return None
 
-    def _game_uuid(self, firebase_game_id: str) -> Optional[str]:
+    def _game_uuid(self, firebase_game_id: str, label: str) -> Optional[str]:
+        """The annotation game for this firebase game, creating it if needed.
+
+        Ingest creates the annotation game when the footage lands, which is
+        hours after tip-off — so at the moment a game starts there is normally
+        no game to attach a live session to, and looking one up would fail for
+        every genuinely new game. We therefore create it here, with the same
+        helper ingest uses: it keys on the firebase id, so ingest finds this
+        one later instead of making a second.
+        """
         client = self._client()
         if not client:
             return None
         try:
             game = client.get_game_by_firebase_id(firebase_game_id)
-            return game.get("id") if game else None
+            if game:
+                return game.get("id")
         except Exception as e:  # noqa: BLE001
             logger.warning("[LIVE] game lookup failed: %s", e)
+            return None
+        try:
+            # Imported here, not at module scope: ingest pulls in the whole
+            # upload/transcode stack, which the publisher has no other use for.
+            from agx_pipeline.ingest import _create_or_get_game, _local_date
+            from firebase_service import get_firebase_service
+
+            fb = get_firebase_service()
+            fb_game = (fb.get_game(firebase_game_id) if fb else None) or {}
+            created = _create_or_get_game(client, fb, fb_game, firebase_game_id,
+                                          _local_date(label), final=False)
+            uuid = (created or {}).get("id")
+            if uuid:
+                logger.info("[LIVE] created annotation game %s for firebase %s",
+                            uuid[:8], firebase_game_id)
+            return uuid
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[LIVE] could not create annotation game: %s", e)
             return None
 
     def _open_session(self, firebase_game_id: str, label: str) -> Optional[str]:
@@ -539,7 +567,7 @@ class LivePublisher:
         If this fails we still publish: the segments keep landing in S3, so the
         feed can be attached by hand. It must never stop the recording.
         """
-        game_uuid = self._game_uuid(firebase_game_id)
+        game_uuid = self._game_uuid(firebase_game_id, label)
         if not game_uuid:
             logger.warning("[LIVE] no annotation game for firebase id %s", firebase_game_id)
             return None
