@@ -366,13 +366,23 @@ def _resolve_checkin_roster(fb, game: Dict) -> "tuple[Optional[list], Optional[l
     return roster1, roster2
 
 
-def _create_or_get_game(client, fb, game: Dict, firebase_game_id: str, date: str) -> Optional[Dict]:
+def _create_or_get_game(client, fb, game: Dict, firebase_game_id: str, date: str,
+                        final: bool = True) -> Optional[Dict]:
+    """Find or create the annotation game for a firebase game.
+
+    `final=False` is the live-publisher path, which runs at TIP-OFF: the final
+    score does not exist yet, so it is left unset rather than written as 0-0.
+    Ingest then calls this with `final=True` after the game and fills in what
+    was not knowable at the start — see `_backfill_live_game`.
+    """
     existing = client.get_game_by_firebase_id(firebase_game_id) if firebase_game_id else None
     # Reuse ONLY on an exact firebase-id match — a fuzzy/arbitrary match here
     # attaches this recording's uploads to another game's S3 keys (the
     # 2026-08-13 manual-recording overwrite). No firebase game => always a NEW
     # annotation game.
     if existing and existing.get("firebase_game_id") == firebase_game_id:
+        if final:
+            _backfill_live_game(client, fb, game, existing)
         return existing
     left, right = game.get("leftTeam", {}) or {}, game.get("rightTeam", {}) or {}
     roster1, roster2 = _resolve_checkin_roster(fb, game)
@@ -395,9 +405,13 @@ def _create_or_get_game(client, fb, game: Dict, firebase_game_id: str, date: str
         # be born with the new convention; the annotation tool only sets it for
         # games created through its own UI, not for ones we create here.
         "timestamps_in_base_coords": True,
-        "team1_score": left.get("finalScore"),
-        "team2_score": right.get("finalScore"),
     }
+    # At tip-off `finalScore` is 0-0 for every game. Writing that would be
+    # indistinguishable from a real 0-0 and nothing would ever correct it, so
+    # the live path leaves the scores NULL and ingest fills them in later.
+    if final:
+        payload["team1_score"] = left.get("finalScore")
+        payload["team2_score"] = right.get("finalScore")
     # Only send rosters when we actually have them, so an empty list never
     # overwrites anything and matches the /api/games/sync payload shape.
     if roster1:
@@ -405,6 +419,35 @@ def _create_or_get_game(client, fb, game: Dict, firebase_game_id: str, date: str
     if roster2:
         payload["roster_team2"] = roster2
     return client.create_game(payload)
+
+
+def _backfill_live_game(client, fb, game: Dict, existing: Dict) -> None:
+    """Fill in what a tip-off-created game could not know yet.
+
+    A game streamed live is created when it starts, so its final score is NULL
+    and its roster may be empty (players check in after the game is created).
+    Only ever fills a hole: a score already on the row is left alone, so an
+    annotator's correction is never overwritten and a re-run is a no-op.
+    """
+    left, right = game.get("leftTeam", {}) or {}, game.get("rightTeam", {}) or {}
+    fields: Dict = {}
+    if existing.get("team1_score") is None and left.get("finalScore") is not None:
+        fields["team1_score"] = left.get("finalScore")
+    if existing.get("team2_score") is None and right.get("finalScore") is not None:
+        fields["team2_score"] = right.get("finalScore")
+    if not existing.get("roster_team1") or not existing.get("roster_team2"):
+        roster1, roster2 = _resolve_checkin_roster(fb, game)
+        if roster1 and not existing.get("roster_team1"):
+            fields["roster_team1"] = roster1
+        if roster2 and not existing.get("roster_team2"):
+            fields["roster_team2"] = roster2
+    if not fields:
+        return
+    try:
+        client.update_game(existing["id"], fields)
+    except Exception as e:  # noqa: BLE001
+        # Never fail ingestion over a backfill — the footage matters more.
+        logger.warning("live-game backfill failed for %s: %s", existing.get("id"), e)
 
 
 def _notify_annotators_ready(cfg, date: str, game: Dict, game_uuid: Optional[str]) -> None:

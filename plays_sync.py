@@ -272,6 +272,165 @@ def rosters_from_annotation_game(game: Optional[Dict[str, Any]]) -> Dict[str, Di
     return out
 
 
+def _cv_card(s: Dict[str, Any], firebase_game: Dict[str, Any], cv_points: Dict[str, Any],
+             game_start: Optional[datetime], uball_game_id: str,
+             rosters: Optional[Dict[str, Dict[str, str]]]) -> Dict[str, Any]:
+    """The annotation card for one detected shot (shared by card creation and the later refresh):
+    type from the tracker, team, roster-filtered jersey suggestion, and the green/yellow/red flag
+    with its reason on the first event, plus a fingerprint of what was written (`cv_written`) so
+    a refresh can tell a card an annotator has since changed."""
+    typed = False
+    classification = "FG_MAKE" if s.get("made") else "FG_MISS"
+    confidence = CV_PLACEHOLDER_CONFIDENCE
+    # Upgrade to the real shot type when typing reached a verdict, and carry
+    # ITS confidence rather than the flat placeholder — that number is what
+    # the editor's green/red flag reads.
+    _v = _typing_verdict(cv_points, s)
+    if _v:
+        _typed = _ZONE_CLASS.get((_v.get("zone"), bool(s.get("made"))))
+        if _typed:
+            classification = _typed
+            typed = True
+            try:
+                confidence = float(_v.get("confidence", CV_PLACEHOLDER_CONFIDENCE))
+            except (TypeError, ValueError):
+                pass
+    # Video-timeline seconds: prefer wallclock - game_start; fall back to the
+    # segment offset. Approximate (SL/SR vs tracking-cam sync) — the annotator
+    # nudges it; the card + rough position is what saves them the work.
+    ts = None
+    # `video_ts` is the rebuilt time: the rim crossing found on the SL/SR
+    # master, in video seconds, cut straight from cross_frame/measured_fps.
+    # Prefer it over everything else — the two fallbacks below are the same
+    # arithmetic that put clips minutes from their shot, so a card built on
+    # them lands just as wrong. Scored against a hand-annotated game, the
+    # rebuilt times sit within 0.78s of what a human marked.
+    if s.get("video_ts") is not None:
+        try:
+            ts = float(s["video_ts"])
+        except (TypeError, ValueError):
+            ts = None
+    wc = s.get("wallclock")
+    if ts is None and wc and game_start:
+        try:
+            ts = (datetime.fromisoformat(wc) - game_start).total_seconds()
+        except Exception:  # noqa: BLE001
+            ts = None
+    if ts is None:
+        ts = float(s.get("seg", 0)) * 4.0 + float(s.get("t_shot", 0.0))
+    ts = max(0.0, ts)
+    angle = _HOOP_ANGLE.get(s.get("side"))
+    label = SHOT_LABELS.get(classification, classification)
+    note = f"CV: {label}" + (f" ({s.get('cam')} · {s.get('side')} rim)" if s.get("cam") else "")
+    # Jersey SUGGESTION from the possession tracker (cv_points.{id}.who): shown in the note
+    # only — the player field stays the annotator's call. Validated at 83% right when it
+    # speaks on 395 annotated shots, so it is a hint, never a fill.
+    # Team from the tracker's half-time switch (basket side + time), makes AND misses — the
+    # score goes to the team even when no player is named.
+    _team = None
+    try:
+        from agx_pipeline.team_assign import team_for_shot
+        _ep = datetime.fromisoformat(s["wallclock"]).timestamp() if s.get("wallclock") else None
+        _team = team_for_shot(firebase_game.get("tracker_teams"), s.get("side"), _ep)
+    except Exception:  # noqa: BLE001
+        _team = None
+    # Only numbers on the SHOOTING team's roster are suggested, with the player's name
+    # (unseen games: right 81% when it speaks vs 78% on any number).
+    _who = _who_suggestion(_v, _team, rosters or {})
+    if _who:
+        note += f" · Tracker suggests #{_who[0]}" + (f" {_who[1]}" if _who[1] else "")
+
+    play_data: Dict[str, Any] = {
+        "game_id": uball_game_id,
+        "classification": classification,
+        "note": note,
+        "timestamp_seconds": ts,
+        "start_timestamp": max(0.0, ts - 5.0),
+        "end_timestamp": ts + 3.0,
+        "source": "cv",
+        "confidence": confidence,
+        "events": [{
+            "label": classification,
+            "playerA": None, "playerAId": None,
+            "playerB": None, "playerBId": None,
+            "confidence": confidence,
+        }],
+    }
+    if angle:
+        play_data["angle"] = angle
+    # No `team` on a CV card: the annotation backend uses a play's team ONLY to add a make's points
+    # to the game's official score (it is not stored on the play), and CV predictions -- warm-ups
+    # included -- must never change that score. The team still picks the roster above.
+
+
+    from agx_pipeline.card_flag import CONFIDENCE, card_flag
+    flag, why = card_flag(_v, _who)
+    play_data["confidence"] = CONFIDENCE[flag]
+    play_data["events"][0].update({"confidence": CONFIDENCE[flag], "cv_flag": flag, "cv_flag_reason": why})
+    play_data["note"] += f" · {flag.upper()}: {why}"
+    play_data["events"][0]["cv_written"] = _card_fingerprint(play_data)
+    play_data["_typed"] = typed
+    return play_data
+
+
+def _card_fingerprint(card: Dict[str, Any]) -> str:
+    """What an annotator would change: type, note, player, time. Equal = untouched since written."""
+    import hashlib
+    key = "|".join(str(card.get(k) or "") for k in ("classification", "note", "player_a_id"))
+    key += "|%.1f" % float(card.get("timestamp_seconds") or 0)
+    return hashlib.sha1(key.encode()).hexdigest()[:12]
+
+
+def refresh_cv_cards(client: Any, uball_game_id: str, firebase_game: Dict[str, Any],
+                     rosters: Optional[Dict[str, Dict[str, str]]] = None,
+                     dry_run: bool = False) -> Dict[str, int]:
+    """Bring a game's CV cards up to date with the tracker's later results (type, jersey
+    suggestion, green/yellow/red flag). Cards are created at ingest, often before the tracker has
+    finished that game; this rewrites each card ONLY while it is exactly as the pipeline left it
+    (its `cv_written` fingerprint still matches), so nothing an annotator changed is touched.
+    Cards made before flags existed carry no fingerprint and are left alone too."""
+    stats = {"cards": 0, "updated": 0, "unchanged": 0, "edited_by_annotator": 0, "no_fingerprint": 0, "no_shot": 0}
+    if not uball_game_id:
+        return stats
+    shots = (firebase_game.get("shot_live") or {}).get("shots") or []
+    created_at_raw = firebase_game.get("createdAt")
+    game_start = (datetime.fromisoformat(created_at_raw.replace("Z", "+00:00")) if created_at_raw else None)
+    cv_points = firebase_game.get("cv_points") or {}
+    fresh = {}
+    for sh in shots:
+        c = _cv_card(sh, firebase_game, cv_points, game_start, uball_game_id, rosters)
+        c.pop("_typed", None)
+        fresh[(c.get("angle"), round(float(c["timestamp_seconds"]), 1))] = c
+    for p in client.list_plays(uball_game_id):
+        if (p.get("source") or "") != "cv":
+            continue
+        stats["cards"] += 1
+        ev = (p.get("events") or [{}])[0] or {}
+        new = fresh.get((p.get("angle"), round(float(p.get("timestamp_seconds") or 0), 1)))
+        if new is None:
+            stats["no_shot"] += 1
+            continue
+        if not ev.get("cv_written"):
+            stats["no_fingerprint"] += 1
+            continue
+        if ev["cv_written"] != _card_fingerprint(p):
+            stats["edited_by_annotator"] += 1
+            continue
+        fields = {k: new[k] for k in ("classification", "note", "confidence", "events")}
+        if all(p.get(k) == v for k, v in fields.items()):
+            stats["unchanged"] += 1
+            continue
+        if not dry_run:
+            try:
+                client.update_play(p["id"], fields)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(f"[PlaysSync/CV] refresh of card {p.get('id')} failed: {exc}")
+                continue
+        stats["updated"] += 1
+    logger.info(f"[PlaysSync/CV] refresh {uball_game_id}: {stats}")
+    return stats
+
+
 def create_plays_from_shot_live(
     client: Any,
     uball_game_id: str,
@@ -326,87 +485,10 @@ def create_plays_from_shot_live(
     cv_points = firebase_game.get("cv_points") or {}
     n_typed = 0
     for s in shots:
-        classification = "FG_MAKE" if s.get("made") else "FG_MISS"
-        confidence = CV_PLACEHOLDER_CONFIDENCE
-        # Upgrade to the real shot type when typing reached a verdict, and carry
-        # ITS confidence rather than the flat placeholder — that number is what
-        # the editor's green/red flag reads.
-        _v = _typing_verdict(cv_points, s)
-        if _v:
-            _typed = _ZONE_CLASS.get((_v.get("zone"), bool(s.get("made"))))
-            if _typed:
-                classification = _typed
-                n_typed += 1
-                try:
-                    confidence = float(_v.get("confidence", CV_PLACEHOLDER_CONFIDENCE))
-                except (TypeError, ValueError):
-                    pass
-        # Video-timeline seconds: prefer wallclock - game_start; fall back to the
-        # segment offset. Approximate (SL/SR vs tracking-cam sync) — the annotator
-        # nudges it; the card + rough position is what saves them the work.
-        ts = None
-        # `video_ts` is the rebuilt time: the rim crossing found on the SL/SR
-        # master, in video seconds, cut straight from cross_frame/measured_fps.
-        # Prefer it over everything else — the two fallbacks below are the same
-        # arithmetic that put clips minutes from their shot, so a card built on
-        # them lands just as wrong. Scored against a hand-annotated game, the
-        # rebuilt times sit within 0.78s of what a human marked.
-        if s.get("video_ts") is not None:
-            try:
-                ts = float(s["video_ts"])
-            except (TypeError, ValueError):
-                ts = None
-        wc = s.get("wallclock")
-        if ts is None and wc and game_start:
-            try:
-                ts = (datetime.fromisoformat(wc) - game_start).total_seconds()
-            except Exception:  # noqa: BLE001
-                ts = None
-        if ts is None:
-            ts = float(s.get("seg", 0)) * 4.0 + float(s.get("t_shot", 0.0))
-        ts = max(0.0, ts)
-        angle = _HOOP_ANGLE.get(s.get("side"))
-        label = SHOT_LABELS.get(classification, classification)
-        note = f"CV: {label}" + (f" ({s.get('cam')} · {s.get('side')} rim)" if s.get("cam") else "")
-        # Jersey SUGGESTION from the possession tracker (cv_points.{id}.who): shown in the note
-        # only — the player field stays the annotator's call. Validated at 83% right when it
-        # speaks on 395 annotated shots, so it is a hint, never a fill.
-        # Team from the tracker's half-time switch (basket side + time), makes AND misses — the
-        # score goes to the team even when no player is named.
-        _team = None
-        try:
-            from agx_pipeline.team_assign import team_for_shot
-            _ep = datetime.fromisoformat(s["wallclock"]).timestamp() if s.get("wallclock") else None
-            _team = team_for_shot(firebase_game.get("tracker_teams"), s.get("side"), _ep)
-        except Exception:  # noqa: BLE001
-            _team = None
-        # Only numbers on the SHOOTING team's roster are suggested, with the player's name
-        # (unseen games: right 81% when it speaks vs 78% on any number).
-        _who = _who_suggestion(_v, _team, rosters or {})
-        if _who:
-            note += f" · Tracker suggests #{_who[0]}" + (f" {_who[1]}" if _who[1] else "")
-
-        play_data: Dict[str, Any] = {
-            "game_id": uball_game_id,
-            "classification": classification,
-            "note": note,
-            "timestamp_seconds": ts,
-            "start_timestamp": max(0.0, ts - 5.0),
-            "end_timestamp": ts + 3.0,
-            "source": "cv",
-            "confidence": confidence,
-            "events": [{
-                "label": classification,
-                "playerA": None, "playerAId": None,
-                "playerB": None, "playerBId": None,
-                "confidence": confidence,
-            }],
-        }
-        if angle:
-            play_data["angle"] = angle
-        if _team in ("left", "right"):
-            play_data["team"] = "team1" if _team == "left" else "team2"
-
+        play_data = _cv_card(s, firebase_game, cv_points, game_start, uball_game_id, rosters)
+        classification = play_data["classification"]
+        n_typed += bool(play_data.pop("_typed", False))
+        ts = play_data["timestamp_seconds"]
         if dry_run:
             created += 1
             by_label[classification] = by_label.get(classification, 0) + 1
