@@ -238,6 +238,40 @@ def test_both_angles_publishing_is_not_a_problem(cov):
 
 
 @pytest.mark.unit
+def test_an_angle_serving_from_its_failover_camera_is_degraded(cov):
+    """Both angles published, so the count balances — but FR came from NR.
+    Working and not-as-configured is the state that goes unnoticed."""
+    cov.record("g1", "live_stream", expected=2, processed=2,
+               per_angle={"FL": {"alive": True, "segments": 37, "source": "FL"},
+                          "FR": {"alive": True, "segments": 35, "source": "NR"}},
+               degraded=["FR<-NR"])
+    cov.finalize("g1")
+    e = cov.read("g1")["stages"]["live_stream"]
+    assert e["complete"] is True
+    assert e["degraded"] == ["FR<-NR"]
+    assert any("ran degraded (FR<-NR)" in p for p in cov.problems())
+
+
+@pytest.mark.unit
+def test_no_failover_is_not_degraded(cov):
+    cov.record("g1", "live_stream", expected=2, processed=2,
+               per_angle={"FL": {"alive": True, "segments": 37, "source": "FL"}})
+    cov.finalize("g1")
+    assert "degraded" not in cov.read("g1")["stages"]["live_stream"]
+    assert cov.problems() == []
+
+
+@pytest.mark.unit
+def test_degraded_is_reported_alongside_a_shortfall(cov):
+    """They are different faults and a stage can have both at once."""
+    cov.record("g1", "live_stream", expected=2, processed=1, degraded=["FR<-NR"])
+    cov.finalize("g1")
+    found = cov.problems()
+    assert any("covered 1 of 2" in p for p in found), found
+    assert any("ran degraded" in p for p in found), found
+
+
+@pytest.mark.unit
 def test_a_closed_record_stays_closed_when_a_slow_stage_reports_late(cov):
     """Stages stop on their own threads. A late number is worth keeping, but it
     must not put a finished game back into "running" and make it look dead."""

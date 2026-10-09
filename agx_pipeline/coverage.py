@@ -238,6 +238,12 @@ def problems(hours: float = 24.0) -> List[str]:
             elif e.get("complete") is False:
                 found.append(f"{game}: {stage} covered {e.get('processed')} of "
                              f"{e.get('expected')}")
+            # Reported even when the numbers balance: the work got done, but
+            # something underneath had to be worked around, and that is the
+            # state nobody notices until it stops being survivable.
+            if e.get("degraded"):
+                found.append(f"{game}: {stage} ran degraded "
+                             f"({', '.join(str(d) for d in e['degraded'])})")
     return found
 
 
@@ -272,7 +278,16 @@ def _entry(expected: Optional[int], processed: Optional[int],
     if silent:
         e["silent"] = True
     if detail:
-        e["detail"] = detail
+        detail = dict(detail)
+        # "Did all the work, but not the way it was configured to" — a stage
+        # whose numbers balance while something underneath it has failed over or
+        # fallen back. Lifted out of detail so a reader does not have to know
+        # what a particular stage puts there.
+        degraded = detail.pop("degraded", None)
+        if degraded:
+            e["degraded"] = degraded
+        if detail:
+            e["detail"] = detail
     return e
 
 

@@ -292,6 +292,12 @@ def _record_live_coverage(game_id) -> None:
     FL ran fine — no segments, no retry, no error, for the whole recording. That
     is `1 of 2` here, which the nightly check and the fleet monitor both read.
 
+    Each angle also records the camera it was actually served from. Since
+    failover landed, an angle can publish from its own side's near camera
+    instead of the one it was configured for, so segments alone no longer mean
+    the rig behaved: FR publishing from NR is working, but degraded, and that is
+    worth being able to see after the fact.
+
     Best-effort, like every other coverage call: this must never be able to
     interfere with starting or stopping a recording.
     """
@@ -308,11 +314,22 @@ def _record_live_coverage(game_id) -> None:
                                  processed=None, publishing=False)
             return
         produced = sum(1 for a in angles if (a.get("segments") or 0) > 0)
+        per_angle = {}
+        failed_over = []
+        for a in angles:
+            angle, source = a.get("angle"), a.get("source")
+            per_angle[angle] = {"alive": a.get("alive"),
+                                "segments": a.get("segments") or 0,
+                                "source": source}
+            if source and source != angle:
+                failed_over.append(f"{angle}<-{source}")
         _coverage.record(
             game_id, "live_stream", expected=len(angles), processed=produced,
-            per_angle={a.get("angle"): {"alive": a.get("alive"),
-                                        "segments": a.get("segments") or 0}
-                       for a in angles})
+            per_angle=per_angle,
+            # `degraded` is the generic "did the work, but not as configured"
+            # channel. Promoted out of per_angle so a reader does not have to
+            # compare every angle against its source to notice.
+            degraded=failed_over or None)
     except Exception as e:  # noqa: BLE001
         logger.warning("live coverage record failed: %s", e)
 
