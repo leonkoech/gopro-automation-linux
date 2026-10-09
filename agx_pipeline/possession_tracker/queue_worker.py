@@ -59,6 +59,7 @@ def _flag(name, default):
 QUEUE = os.environ.get("TRACKER_QUEUE_DIR", "/home/dev/possession/queue")
 USE_SAM3 = _flag("TRACKER_SAM3", "false")
 SAM3_MAX = int(os.environ.get("TRACKER_SAM3_MAX_PER_GAME", "6"))
+REFRESH_CARDS = os.environ.get("TRACKER_REFRESH_CARDS", "true").lower() in ("1", "true", "yes")
 SAM3_NEAR_PX = float(os.environ.get("TRACKER_SAM3_NEAR_PX", "40"))
 DO_2K = _flag("TRACKER_2K", "true")
 TV_2K = _flag("TRACKER_TV_2K", "false")
@@ -240,7 +241,8 @@ def read_who(clip, res, shot, job=None):
     import who_eval as W
     boxes = (res.get("tracks") or {}).get(str(shot["shooter"]), [])
     reads = W.read_track(jersey_stack(), clip, boxes)
-    if WHO_EXTEND and job is not None and W.speak(reads, None) is None:
+    who_from = "clip" if W.speak(reads, None) is not None else None
+    if WHO_EXTEND and job is not None and who_from is None:
         try:
             import who_extend_live as XL
             n0 = len(reads)
@@ -249,12 +251,14 @@ def read_who(clip, res, shot, job=None):
         except Exception as e:  # noqa: BLE001 - the clip-only answer stands
             job["who_extend_error"] = "%s: %s" % (type(e).__name__, e)
     num = W.speak(reads, None)
+    if num is not None and who_from is None:
+        who_from = "timeline"          # found only after following the player back
     votes = {}
     for n, c in reads:
         if c >= W.READ_MIN:
             votes[n] = round(votes.get(n, 0) + c, 2)
     top = sorted(votes.items(), key=lambda kv: -kv[1])[:3]
-    return num, top
+    return num, top, who_from
 
 
 def process_fast(name, job):
@@ -278,9 +282,9 @@ def process_fast(name, job):
                 job["kit_error"] = "%s: %s" % (type(e).__name__, e)
         if WHO and shot is not None:
             try:
-                num, top = read_who(clip, res, shot, job)
+                num, top, who_from = read_who(clip, res, shot, job)
                 job["who"] = num
-                extra.update({"who": num, "who_votes": dict(top), "who_source": "tracker"})
+                extra.update({"who": num, "who_votes": dict(top), "who_source": "tracker", "who_from": who_from})
             except Exception as e:  # noqa: BLE001 - WHO never blocks the type
                 job["who_error"] = "%s: %s" % (type(e).__name__, e)
         if zone:
@@ -351,6 +355,21 @@ def maybe_publish():
                 log("game %s teams: half-time %s, left basket first: %s" % (g, tt.get("switch_epoch"), tt.get("left_basket_first")))
         except Exception as e:  # noqa: BLE001
             log("team pass failed for %s: %s" % (g, e))
+        # the game's annotation cards, if ingest has already made them: bring them up to date with
+        # this game's tracker results (type, jersey, green/yellow/red flag); cards an annotator
+        # changed are never touched. If ingest comes later it builds the cards from these results.
+        if REFRESH_CARDS:
+            try:
+                sys.path.insert(0, "/home/dev/gopro-automation-linux")
+                from uball_client import UballClient
+                from plays_sync import refresh_cv_cards, rosters_from_annotation_game
+                uc = UballClient()
+                ag = uc.get_game_by_firebase_id(g)
+                if ag and ag.get("id"):
+                    st = refresh_cv_cards(uc, ag["id"], d, rosters_from_annotation_game(ag))
+                    log("game %s cards refreshed: %s" % (g, st))
+            except Exception as e:  # noqa: BLE001
+                log("card refresh failed for %s: %s" % (g, e))
         from agx_pipeline.core_highlight import publish_core_highlight
         date = None
         for h in (d.get("highlights") or {}).values():

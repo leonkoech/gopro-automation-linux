@@ -100,3 +100,71 @@ def test_rosters_from_annotation_game_maps_team1_to_left():
          "roster_team2": [{"name": "Nick Rosso", "jersey_number": 0}]}
     assert plays_sync.rosters_from_annotation_game(g) == {"left": {"7": "Giovanni Garcia"}, "right": {"0": "Nick Rosso"}}
     assert plays_sync.rosters_from_annotation_game(None) == {}
+
+
+class StoreClient(FakeClient):
+    """Keeps created cards so refresh can list and patch them."""
+    def __init__(self):
+        super().__init__()
+        self.patched = []
+
+    def list_plays(self, game_id):
+        return [dict(c, id="p%d" % i, source="cv") for i, c in enumerate(self.created)]
+
+    def update_play(self, pid, fields):
+        self.patched.append((pid, fields))
+        self.created[int(pid[1:])].update(fields)
+
+
+def _flag_game(cv):
+    g = _game(cv)
+    g["tracker_teams"] = {"switch_epoch": None, "left_basket_first": "left"}
+    return g
+
+
+def _cv_id():
+    return "cv_%d_left" % int(datetime(2026, 9, 16, 2, 20, 0, tzinfo=timezone.utc).timestamp())
+
+
+@pytest.mark.unit
+def test_card_carries_its_flag_and_reason():
+    c = StoreClient()
+    plays_sync.create_plays_from_shot_live(
+        c, "G", _flag_game({_cv_id(): {"zone": "2PT", "line_px": 90.0, "who": "7", "who_votes": {"7": 9.0},
+                                       "who_from": "clip"}}), rosters=ROSTERS)
+    ev = c.created[0]["events"][0]
+    assert ev["cv_flag"] == "green" and c.created[0]["confidence"] == 0.9
+    assert "GREEN" in c.created[0]["note"] and ev["cv_written"]
+
+
+@pytest.mark.unit
+def test_untyped_card_is_red_then_refresh_upgrades_it():
+    c = StoreClient()
+    plays_sync.create_plays_from_shot_live(c, "G", _flag_game({}), rosters=ROSTERS)   # tracker not done yet
+    assert c.created[0]["events"][0]["cv_flag"] == "red"
+    later = _flag_game({_cv_id(): {"zone": "3PT", "line_px": 10.0, "who": "7", "who_votes": {"7": 9.0},
+                                   "who_from": "clip"}})
+    stats = plays_sync.refresh_cv_cards(c, "G", later, ROSTERS)
+    assert stats["updated"] == 1
+    card = c.created[0]
+    assert card["classification"] == "3PT_MAKE" and card["events"][0]["cv_flag"] == "yellow"
+
+
+@pytest.mark.unit
+def test_refresh_never_touches_a_card_an_annotator_changed():
+    c = StoreClient()
+    plays_sync.create_plays_from_shot_live(c, "G", _flag_game({}), rosters=ROSTERS)
+    c.created[0]["classification"] = "3PT_MAKE"          # annotator fixed it in the editor
+    later = _flag_game({_cv_id(): {"zone": "2PT", "line_px": 90.0, "who": "7", "who_votes": {"7": 9.0},
+                                   "who_from": "clip"}})
+    stats = plays_sync.refresh_cv_cards(c, "G", later, ROSTERS)
+    assert stats["edited_by_annotator"] == 1 and not c.patched
+
+
+@pytest.mark.unit
+def test_refresh_leaves_cards_from_before_flags_alone():
+    c = StoreClient()
+    c.created.append({"classification": "FG_MAKE", "note": "CV: old", "timestamp_seconds": 1.0,
+                      "angle": "LEFT", "events": [{"label": "FG_MAKE"}]})
+    stats = plays_sync.refresh_cv_cards(c, "G", _flag_game({}), ROSTERS)
+    assert not c.patched and stats["updated"] == 0
