@@ -89,7 +89,7 @@ not infer that it should.
 
 ### What "sport-agnostic" covers, and what it does not
 
-**Decided: sport-agnostic is a claim about the software platform only. Camera
+**Proposed: sport-agnostic is a claim about the software platform only. Camera
 topology is expected to change per sport.**
 
 The recording, transcoding, segmenting and clip-cutting code does not need to
@@ -268,13 +268,17 @@ case of an interval, not the only shape the cutter understands.
   defines a structure (the rim ellipse today) stays sport-specific
   configuration.
 
-## 6. Decided
+## 6. Proposals
 
-**`observation.absence` is in from the start.** It costs little and there is no
+These came out of reviewing the draft. They are proposals, not agreements —
+nothing here has been through the team, and each is written as a position to
+argue with rather than a settled point.
+
+**Carry `observation.absence` from the start.** It costs little and there is no
 harm in having it before the sport that forces it. Basketball has one use we do
 not currently detect — shot-clock expiry.
 
-**Confidence is a scalar and an evidence object, not one or the other.** The
+**Make confidence a scalar and an evidence object, not one or the other.** The
 scalar's sanctioned use is "should a person look at this", not "how likely this
 is to be correct". `scale` is mandatory and has no default.
 
@@ -314,7 +318,7 @@ changes afterwards is a value nobody can trust at the moment they read it. When
 phase detection goes live, the same field simply starts being right at emit time
 and fewer enrichments are produced. Nothing else changes.
 
-**One id scheme, derived rather than random, with the old id kept as an alias.**
+**Use one id scheme, derived rather than random, with the old id kept as an alias.**
 A single site-unique id with no sport concept in it, so `side` leaves the
 identifier.
 
@@ -332,9 +336,13 @@ constraint, not a reason for a second permanent scheme, so the old form lives in
 
 ## 7. Open questions for review
 
-None outstanding on the schema itself. What remains is in §5 — transport,
-storage, the migration from today's Firestore shapes, and the per-sport geometry
-format — none of which this document sets out to decide.
+None outstanding on the schema itself, in the sense that section 6 offers a
+position on each one — but those positions still need agreeing, and that is the
+review this document is asking for.
+
+What remains beyond them is in §5: transport, storage, the migration from
+today's Firestore shapes, and the per-sport geometry format, none of which this
+document sets out to settle.
 
 The next thing that would change this document is an attempt to implement it:
 moving rim geometry, make/miss and shot typing behind a module, and finding out
