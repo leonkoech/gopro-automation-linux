@@ -53,7 +53,7 @@ def main():
             name, staged = Q.stage_clip(job, work)
             S, res, shot, zone, feet = Q.track(staged, cam, name, work, job["pre"], "fast")
             job["clip"] = clip
-            num, top = Q.read_who(staged, res, shot, job) if shot else (None, None)
+            num, top, _ = Q.read_who(staged, res, shot, job) if shot else (None, None, None)
         print("[whox] %s t=%.1f truth #%s | clip-only: none | live extended: #%s (extra reads %s, error %s)" % (
             e["game"][:8], e["t"], e["gt"], num, job.get("who_extended_reads"), job.get("who_extend_error")),
             flush=True)
