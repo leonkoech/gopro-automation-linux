@@ -358,8 +358,9 @@ def _cv_card(s: Dict[str, Any], firebase_game: Dict[str, Any], cv_points: Dict[s
     }
     if angle:
         play_data["angle"] = angle
-    if _team in ("left", "right"):
-        play_data["team"] = "team1" if _team == "left" else "team2"
+    # No `team` on a CV card: the annotation backend uses a play's team ONLY to add a make's points
+    # to the game's official score (it is not stored on the play), and CV predictions -- warm-ups
+    # included -- must never change that score. The team still picks the roster above.
 
 
     from agx_pipeline.card_flag import CONFIDENCE, card_flag

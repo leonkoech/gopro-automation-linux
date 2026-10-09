@@ -25,6 +25,9 @@ def _game(cv_points):
             "shot_live": {"shots": [{"made": True, "side": "left", "cam": "SL", "wallclock": wc.isoformat()}]}}
 
 
+ROSTERS = {"left": {"7": "Giovanni Garcia", "2": "Kevin Garcia"}, "right": {"0": "Nick Rosso", "12": "Ryan Jackson"}}
+
+
 def _run(game, monkeypatch):
     c = FakeClient()
     plays_sync.create_plays_from_shot_live(c, "G", game)
@@ -49,15 +52,17 @@ def test_no_who_no_suggestion(monkeypatch):
 
 
 @pytest.mark.unit
-def test_cv_card_gets_the_team_from_the_half_time_rule(monkeypatch):
+def test_cv_card_never_changes_the_official_score(monkeypatch):
+    # the backend adds a make's points to the game score when a play carries `team`
     epoch = int(datetime(2026, 9, 16, 2, 20, 0, tzinfo=timezone.utc).timestamp())
-    g = _game({})
+    g = _game({"cv_%d_left" % epoch: {"zone": "3PT", "who": "0", "who_votes": {"0": 9.0}, "line_px": 90.0,
+                                       "who_from": "clip"}})
     g["tracker_teams"] = {"switch_epoch": epoch + 600, "left_basket_first": "right"}
-    created = _run(g, monkeypatch)
-    assert created[0]["team"] == "team2"            # right team attacks the left basket first
+    c = FakeClient()
+    plays_sync.create_plays_from_shot_live(c, "G", g, rosters=ROSTERS)
+    assert "team" not in c.created[0]
+    assert "#0 Nick Rosso" in c.created[0]["note"]    # still the right team's roster: right attacks left first
 
-
-ROSTERS = {"left": {"7": "Giovanni Garcia", "2": "Kevin Garcia"}, "right": {"0": "Nick Rosso", "12": "Ryan Jackson"}}
 
 
 @pytest.mark.unit
