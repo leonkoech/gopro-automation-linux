@@ -26,8 +26,13 @@ def enabled() -> bool:
     return os.getenv("CORE_REEL_DROP_DENSE", "true").lower() in ("1", "true", "yes", "on")
 
 
-def dense_shooting(keys: Iterable) -> Set[str]:
-    """The subset of CV clip ids that fall in a dense-shooting burst at their basket."""
+def dense_shooting(keys: Iterable, window_s: float = None, core_min: int = None,
+                   edge_s: float = None) -> Set[str]:
+    """The subset of CV clip ids that fall in a dense-shooting burst at their basket. The defaults
+    are the reel's (makes only); card flags pass their own (they count makes AND misses)."""
+    window_s = WINDOW_S if window_s is None else window_s
+    core_min = CORE_MIN if core_min is None else core_min
+    edge_s = EDGE_S if edge_s is None else edge_s
     shots = []
     for k in keys:
         m = _ID.match(str(k)) if k is not None else None
@@ -37,9 +42,9 @@ def dense_shooting(keys: Iterable) -> Set[str]:
     for side in ("left", "right"):
         s = sorted((e, k) for e, sd, k in shots if sd == side)
         ts = [e for e, _ in s]
-        core = [sum(1 for u in ts if abs(u - t) <= WINDOW_S) - 1 >= CORE_MIN for t in ts]
+        core = [sum(1 for u in ts if abs(u - t) <= window_s) - 1 >= core_min for t in ts]
         core_ts = [t for t, c in zip(ts, core) if c]
         for t, k in s:
-            if any(abs(t - c) <= EDGE_S for c in core_ts):
+            if any(abs(t - c) <= edge_s for c in core_ts):
                 out.add(k)
     return out

@@ -272,9 +272,26 @@ def rosters_from_annotation_game(game: Optional[Dict[str, Any]]) -> Dict[str, Di
     return out
 
 
+def _shot_key(s: Dict[str, Any]) -> Optional[str]:
+    """cv_<epoch>_<side> for a shot_live shot (the id highlights / cv_points use)."""
+    try:
+        return f"cv_{int(datetime.fromisoformat(s['wallclock']).timestamp())}_{s['side']}"
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _game_context(firebase_game: Dict[str, Any]) -> Dict[str, Any]:
+    """Whole-game facts each card's flag needs: shots inside a shooting burst, paused clock."""
+    from agx_pipeline.card_flag import burst_shots, paused_intervals
+    shots = (firebase_game.get("shot_live") or {}).get("shots") or []
+    keys = [k for k in (_shot_key(s) for s in shots) if k]
+    return {"burst": burst_shots(keys), "paused": paused_intervals(firebase_game.get("logs") or [])}
+
+
 def _cv_card(s: Dict[str, Any], firebase_game: Dict[str, Any], cv_points: Dict[str, Any],
              game_start: Optional[datetime], uball_game_id: str,
-             rosters: Optional[Dict[str, Dict[str, str]]]) -> Dict[str, Any]:
+             rosters: Optional[Dict[str, Dict[str, str]]],
+             ctx: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """The annotation card for one detected shot (shared by card creation and the later refresh):
     type from the tracker, team, roster-filtered jersey suggestion, and the green/yellow/red flag
     with its reason on the first event, plus a fingerprint of what was written (`cv_written`) so
@@ -363,8 +380,15 @@ def _cv_card(s: Dict[str, Any], firebase_game: Dict[str, Any], cv_points: Dict[s
     # included -- must never change that score. The team still picks the roster above.
 
 
-    from agx_pipeline.card_flag import CONFIDENCE, card_flag
-    flag, why = card_flag(_v, _who)
+    from agx_pipeline.card_flag import CONFIDENCE, card_flag, is_paused
+    ctx = ctx or {}
+    _key = _shot_key(s)
+    try:
+        _ep = datetime.fromisoformat(s["wallclock"]).timestamp() if s.get("wallclock") else None
+    except Exception:  # noqa: BLE001
+        _ep = None
+    flag, why = card_flag(_v, _who, paused=is_paused(ctx.get("paused"), _ep),
+                          burst=bool(_key) and _key in (ctx.get("burst") or set()))
     play_data["confidence"] = CONFIDENCE[flag]
     play_data["events"][0].update({"confidence": CONFIDENCE[flag], "cv_flag": flag, "cv_flag_reason": why})
     play_data["note"] += f" · {flag.upper()}: {why}"
@@ -397,8 +421,9 @@ def refresh_cv_cards(client: Any, uball_game_id: str, firebase_game: Dict[str, A
     game_start = (datetime.fromisoformat(created_at_raw.replace("Z", "+00:00")) if created_at_raw else None)
     cv_points = firebase_game.get("cv_points") or {}
     fresh = {}
+    ctx = _game_context(firebase_game)
     for sh in shots:
-        c = _cv_card(sh, firebase_game, cv_points, game_start, uball_game_id, rosters)
+        c = _cv_card(sh, firebase_game, cv_points, game_start, uball_game_id, rosters, ctx)
         c.pop("_typed", None)
         fresh[(c.get("angle"), round(float(c["timestamp_seconds"]), 1))] = c
     for p in client.list_plays(uball_game_id):
@@ -484,8 +509,9 @@ def create_plays_from_shot_live(
     by_label: Dict[str, int] = {}
     cv_points = firebase_game.get("cv_points") or {}
     n_typed = 0
+    ctx = _game_context(firebase_game)
     for s in shots:
-        play_data = _cv_card(s, firebase_game, cv_points, game_start, uball_game_id, rosters)
+        play_data = _cv_card(s, firebase_game, cv_points, game_start, uball_game_id, rosters, ctx)
         classification = play_data["classification"]
         n_typed += bool(play_data.pop("_typed", False))
         ts = play_data["timestamp_seconds"]
