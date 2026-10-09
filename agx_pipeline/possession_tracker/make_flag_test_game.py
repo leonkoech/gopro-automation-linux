@@ -9,7 +9,9 @@ and the team from the half-time rule. The real game and its cards are not touche
 
 Usage: make_flag_test_game.py <g8> [--into <test game id>]   (box; repo .env.agx sourced)
   --into rewrites that TEST game's own cards in place (matched by basket + time) instead of
-  creating a new game. FLAGTEST_REPO = the repo copy holding the branch's plays_sync.
+  creating a new game. --create-in <game id> adds the CV cards to that EXISTING game (production card
+  code: the game's own CV cards are skipped if it already has some, and CV cards never change its
+  score). FLAGTEST_REPO = the repo copy holding the branch's plays_sync.
 """
 import json
 import os
@@ -36,6 +38,7 @@ def signed_line(arcs, feet):
 def main():
     g8 = sys.argv[1]
     into = sys.argv[3] if len(sys.argv) > 3 and sys.argv[2] == "--into" else None
+    create_in = sys.argv[3] if len(sys.argv) > 3 and sys.argv[2] == "--create-in" else None
     # the branch's card code must win over the box repo that the imports above put on the path
     sys.path.insert(0, os.environ.get("FLAGTEST_REPO", "/home/dev/gopro-automation-linux"))
     from uball_client import UballClient
@@ -50,8 +53,8 @@ def main():
     orig = uc.get_game_by_firebase_id(gt["firebase"])
     if not orig or orig.get("id") != gt["game"]:
         raise SystemExit("original annotation game not found")
-    if into:
-        gid, name = into, None
+    if into or create_in:
+        gid, name = into or create_in, None
     else:
         # the test game: same teams, rosters, colours, videos
         name = "[TEST — CV flags — DO NOT ANNOTATE] %s" % (orig.get("video_name") or g8)
