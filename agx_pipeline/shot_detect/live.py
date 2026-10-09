@@ -429,6 +429,10 @@ class LiveShotScorer:
                                  if wc_epoch else None),
                    "scan_s": scan_s}
             shadow.append(rec)
+            # The same shot in the proposed event shape, written beside the
+            # record above and read by nothing. Off unless EVENT_STREAM_ENABLED.
+            # See agx_pipeline/events.py for why this is a dual write.
+            self._emit_events(rec, v, game_id)
             logger.info("shot-live %s %s win@%d t=%.2f -> %s (latency=%ss scan=%ss)",
                         game_id, angle, base_idx, t_shot, v["verdict"],
                         rec["latency_s"], scan_s)
@@ -445,6 +449,39 @@ class LiveShotScorer:
             if rec["made"] and autohighlight_enabled():
                 self._maybe_highlight(game_id, rec)
         self._advance_prev(prev_seg, angle, idx, path)
+
+    def _emit_events(self, rec: Dict, verdict: Dict, game_id: str) -> None:
+        """Write this shot into the event stream as well. Never raises.
+
+        A dual write under test: nothing reads these, and the comparison in
+        scripts/event_stream_compare.py is what says whether the schema can
+        actually carry what the detector knows.
+        """
+        try:
+            from agx_pipeline import events
+            if not events.enabled():
+                return
+            events.configure(self.cfg.output_dir)
+            wc = rec.get("wallclock")
+            side = rec.get("side")
+            # The id the annotation tool already uses for this make, so the two
+            # records can be lined up during a migration.
+            ext = None
+            if rec.get("made") and wc and side:
+                epoch = self._epoch(wc)
+                if epoch:
+                    ext = {"annotation_tool": f"cv_{int(epoch)}_{side}"}
+            events.emit(game_id, events.from_shot(
+                rec, verdict, game_id,
+                site_id=getattr(self.cfg, "location", "unknown"),
+                # One surface per site today; the field exists because that
+                # stops being true the moment a venue has more than one court.
+                surface_id=getattr(self.cfg, "location", "unknown"),
+                version=os.path.basename(
+                    os.getenv("SHOT_DET_WEIGHT", "") or "default"),
+                external_ids=ext))
+        except Exception as e:  # noqa: BLE001 -- never break the scan loop
+            logger.warning("event emit failed: %s", e)
 
     def _concat(self, a: str, b: str) -> Optional[str]:
         """Stream-copy concat [a, b] -> temp mp4 for one scan window. None on error
