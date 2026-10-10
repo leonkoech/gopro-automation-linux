@@ -28,6 +28,8 @@ from typing import Dict, Optional, Tuple
 
 from logging_service import get_logger
 
+from agx_pipeline import coverage
+
 logger = get_logger("agx.shot_typing_live")
 
 TYPING_CWD = os.getenv("SHOT_TYPING_CWD", "/home/dev/shot_typing")
@@ -173,9 +175,27 @@ class LiveTyper:
         else:
             logger.info("typing preflight ok — %s/agx_classify.py", TYPING_CWD)
         self._q: "queue.Queue[Dict]" = queue.Queue(maxsize=64)
+        # Coverage counters. `queued + dropped` is what should have been typed;
+        # `typed` is what was. Registered unconditionally -- ESPECIALLY when the
+        # preflight above just failed, because that is the fifteen-day case: the
+        # record then shows 47 expected against 0 done, which is a fact something
+        # can alert on. An error log is not.
+        self._count_lock = threading.Lock()
+        self._n = {"queued": 0, "dropped": 0, "typed": 0, "failed": 0}
+        coverage.register_source("typing", self._coverage)
         self._thread = threading.Thread(target=self._run, name="shot-typing-live",
                                         daemon=True)
         self._thread.start()
+
+    def _bump(self, key: str) -> None:
+        with self._count_lock:
+            self._n[key] += 1
+
+    def _coverage(self):
+        """(expected, processed, detail) for the game's coverage record."""
+        with self._count_lock:
+            n = dict(self._n)
+        return n["queued"] + n["dropped"], n["typed"], n
 
     def enqueue(self, game_id: str, log_id: str, angle: str,
                 clip_path: str, pre_s: float) -> None:
@@ -183,9 +203,11 @@ class LiveTyper:
                 "clip": clip_path, "pre": float(pre_s)}
         try:
             self._q.put_nowait(item)
+            self._bump("queued")
             logger.info("typing queued %s (%s, depth=%d)", log_id, angle,
                         self._q.qsize())
         except queue.Full:
+            self._bump("dropped")
             logger.warning("typing queue FULL — dropped %s (stays pending; "
                            "nightly typing still covers its card)", log_id)
 
@@ -196,11 +218,13 @@ class LiveTyper:
             try:
                 self._type(item)
             except Exception as e:  # noqa: BLE001 — one bad clip never kills the queue
+                self._bump("failed")
                 logger.warning("typing failed for %s: %s", item.get("log_id"), e)
 
     def _type(self, item: Dict) -> None:
         log_id, angle, clip = item["log_id"], item["angle"], item["clip"]
         if not os.path.isfile(clip):
+            self._bump("failed")
             logger.warning("typing skipped %s — clip missing (%s)", log_id, clip)
             return
         # The rim moment sits `pre` seconds into the trimmed clip; it is both
@@ -241,6 +265,7 @@ class LiveTyper:
             # A non-zero rc means the classifier never reached a verdict, and its
             # stderr says why. Logging only the number is what hid a dead symlink
             # for fifteen days — the answer was in cp.stderr the whole time.
+            self._bump("failed")
             if cp.returncode != 0:
                 tail = (cp.stderr or "").strip().splitlines()[-3:]
                 logger.error("typing FAILED for %s (rc=%d): %s", log_id,
@@ -299,9 +324,13 @@ class LiveTyper:
         try:
             self.fb.db.collection("basketball-games").document(item["game_id"]).set(
                 {"cv_points": {log_id: rec}}, merge=True)
+            self._bump("typed")
             logger.info("typing DONE %s -> %s (%dpt, who=%s, %.0fs)", log_id,
                         zone, _POINTS[zone], who, rec["proc_s"] or -1)
         except Exception as e:  # noqa: BLE001
+            # The zone was found but never landed anywhere a consumer reads, so
+            # it counts against coverage exactly like a classifier failure.
+            self._bump("failed")
             logger.warning("typing write failed for %s: %s", log_id, e)
 
 
