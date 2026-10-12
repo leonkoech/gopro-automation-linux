@@ -98,6 +98,7 @@ class JetsonStatus:
     gopro_count: int = 0
     gopro_names: tuple[str, ...] = field(default_factory=tuple)
     gopro_error: Optional[str] = None
+    coverage_problems: tuple[str, ...] = field(default_factory=tuple)
     service_checked: bool = True  # False => only Tailscale online/offline was checked
     error: Optional[str] = None
 
@@ -192,6 +193,20 @@ def check_gopros(tailscale_ip: str) -> tuple[int, tuple[str, ...], Optional[floa
     return gopro_count, gopro_names, disk_free_gb, None
 
 
+def check_coverage(tailscale_ip: str) -> tuple[str, ...]:
+    """Ask a Jetson what went short on its recent games.
+
+    Single attempt and errors swallowed: a box that cannot answer this is
+    already reported by the checks above, and a failure here must not turn into
+    a second alert for the same box. An older build without the endpoint simply
+    returns nothing.
+    """
+    data, _ = _fetch_json(f"http://{tailscale_ip}:5000/api/coverage", 1)
+    if not data:
+        return ()
+    return tuple(str(p) for p in data.get("problems", []))
+
+
 # --- Main check ---
 
 def check_all_jetsons() -> list[JetsonStatus]:
@@ -246,9 +261,18 @@ def check_all_jetsons() -> list[JetsonStatus]:
         gopro_names: tuple[str, ...] = ()
         disk_free_gb: Optional[float] = None
         gopro_error: Optional[str] = None
+        coverage_problems: tuple[str, ...] = ()
 
         if is_online and check_service:
             gopro_count, gopro_names, disk_free_gb, gopro_error = check_gopros(ts_ip)
+
+        # Coverage is asked for regardless of check_service. That flag turns off
+        # the recorder/disk queries for boxes whose health comes from elsewhere,
+        # but coverage has no other carrier, and the AGX -- the box that runs the
+        # games -- is configured with check_service off. A device that does not
+        # serve the endpoint returns nothing and raises no alert either way.
+        if is_online:
+            coverage_problems = check_coverage(ts_ip)
 
         statuses.append(JetsonStatus(
             name=name, tailscale_hostname=ts_hostname,
@@ -257,6 +281,7 @@ def check_all_jetsons() -> list[JetsonStatus]:
             disk_free_gb=disk_free_gb,
             gopro_count=gopro_count, gopro_names=gopro_names,
             gopro_error=gopro_error,
+            coverage_problems=coverage_problems,
             service_checked=check_service,
         ))
 
@@ -287,6 +312,12 @@ def build_alert(statuses: list[JetsonStatus]) -> Optional[str]:
             if s.disk_free_gb is not None and s.disk_free_gb < 5.0:
                 issues.append(
                     f"WARNING — {s.name}: Low disk space ({s.disk_free_gb:.1f} GB free)"
+                )
+            if s.coverage_problems:
+                detail = "\n   ".join(s.coverage_problems)
+                issues.append(
+                    f"WARNING — {s.name}: a stage did not cover its game"
+                    f"\n   {detail}"
                 )
 
     if not issues:
