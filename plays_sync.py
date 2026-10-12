@@ -241,6 +241,7 @@ def _typing_verdict(cv_points: Dict[str, Any], shot: Dict[str, Any],
 
 
 # Same vote thresholds as the tracker's own (possession_tracker/who_eval.speak).
+_LOOKS_MIN = 0.6      # appearance-model confidence needed to suggest a shooter by looks alone
 _WHO_V_MIN = 1.5
 _WHO_V_RATIO = 1.5
 
@@ -258,10 +259,25 @@ def _who_suggestion(v: Optional[Dict[str, Any]], team: Optional[str],
     votes = v.get("who_votes")
     if roster and isinstance(votes, dict) and votes:
         ok = sorted(((str(n), float(w)) for n, w in votes.items() if str(n) in roster), key=lambda x: -x[1])
-        if not ok or ok[0][1] < _WHO_V_MIN or (len(ok) > 1 and ok[0][1] < _WHO_V_RATIO * ok[1][1]):
-            return None
-        return ok[0][0], roster[ok[0][0]]
+        if ok and ok[0][1] >= _WHO_V_MIN and (len(ok) == 1 or ok[0][1] >= _WHO_V_RATIO * ok[1][1]):
+            return ok[0][0], roster[ok[0][0]]
+        return _looks_suggestion(v, roster)
+    if roster:
+        return _looks_suggestion(v, roster) or ((str(v["who"]), None) if v.get("who") else None)
     return (str(v["who"]), None) if v.get("who") else None
+
+
+def _looks_suggestion(v: Dict[str, Any], roster: Dict[str, str]) -> Optional[tuple]:
+    """(number, name, "looks") when no number was read but the game's appearance model places the
+    shooter on the shooting team with enough confidence (possession_tracker/looks.py: 75-81% right
+    on annotated games at this bar -- a hint, so the card stays yellow)."""
+    lk = v.get("who_looks")
+    try:
+        if isinstance(lk, dict) and str(lk.get("n")) in roster and float(lk.get("conf") or 0) >= _LOOKS_MIN:
+            return str(lk["n"]), roster[str(lk["n"])], "looks"
+    except (TypeError, ValueError):
+        pass
+    return None
 
 
 def rosters_from_annotation_game(game: Optional[Dict[str, Any]]) -> Dict[str, Dict[str, str]]:
@@ -366,7 +382,8 @@ def _cv_card(s: Dict[str, Any], firebase_game: Dict[str, Any], cv_points: Dict[s
     # (unseen games: right 81% when it speaks vs 78% on any number).
     _who = _who_suggestion(_v, _team, rosters or {})
     if _who:
-        note += f" · Tracker suggests #{_who[0]}" + (f" {_who[1]}" if _who[1] else "")
+        note += (f" · Looks like #{_who[0]}" if len(_who) > 2 else f" · Tracker suggests #{_who[0]}") + (
+            f" {_who[1]}" if _who[1] else "")
 
     play_data: Dict[str, Any] = {
         "game_id": uball_game_id,

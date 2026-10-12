@@ -51,6 +51,8 @@ def card_flag(v: Optional[Dict[str, Any]], suggestion: Optional[tuple],
         near = False
     if near:
         return "yellow", "shooter's feet were close to a line"
+    if len(suggestion) > 2:
+        return "yellow", "player named by appearance, the number was not read"
     if v.get("who_from") == "timeline":
         return "yellow", "jersey found only after the player was followed back"
     return "green", "shot type and jersey both clear"
