@@ -338,10 +338,23 @@ def maybe_publish():
         d = game_doc(g).get().to_dict() or {}
         if d.get("status") != "completed" and not d.get("endedAt"):
             continue
-        # team for every shot: one half-time switch found from the shooters' kit colours
+        # the two rosters (from the annotation game, once ingest or tip-off has made it): the team
+        # call reads them against the jersey numbers, and the card refresh below names players
+        ag, rosters = None, {}
+        try:
+            sys.path.insert(0, "/home/dev/gopro-automation-linux")
+            from uball_client import UballClient
+            from plays_sync import rosters_from_annotation_game
+            uc = UballClient()
+            ag = uc.get_game_by_firebase_id(g)
+            rosters = rosters_from_annotation_game(ag) if ag else {}
+        except Exception as e:  # noqa: BLE001 - the team call falls back to kit colour alone
+            log("roster lookup failed for %s: %s" % (g, e))
+        # team for every shot: one half-time switch found from the jersey numbers read on the
+        # shooters (against the rosters) and their kit colours
         try:
             from agx_pipeline.team_assign import assign_game, team_for_shot
-            tt = assign_game(d)
+            tt = assign_game(d, rosters)
             if tt:
                 patch = {"tracker_teams": tt}
                 for lid in (d.get("cv_points") or {}):
@@ -352,7 +365,8 @@ def maybe_publish():
                             patch["cv_points.%s.team" % lid] = team
                 game_doc(g).update(patch)
                 d = game_doc(g).get().to_dict() or {}
-                log("game %s teams: half-time %s, left basket first: %s" % (g, tt.get("switch_epoch"), tt.get("left_basket_first")))
+                log("game %s teams (%s): half-time %s, left basket first: %s" % (
+                    g, tt.get("source"), tt.get("switch_epoch"), tt.get("left_basket_first")))
         except Exception as e:  # noqa: BLE001
             log("team pass failed for %s: %s" % (g, e))
         # the game's annotation cards, if ingest has already made them: bring them up to date with
@@ -360,13 +374,9 @@ def maybe_publish():
         # changed are never touched. If ingest comes later it builds the cards from these results.
         if REFRESH_CARDS:
             try:
-                sys.path.insert(0, "/home/dev/gopro-automation-linux")
-                from uball_client import UballClient
-                from plays_sync import refresh_cv_cards, rosters_from_annotation_game
-                uc = UballClient()
-                ag = uc.get_game_by_firebase_id(g)
+                from plays_sync import refresh_cv_cards
                 if ag and ag.get("id"):
-                    st = refresh_cv_cards(uc, ag["id"], d, rosters_from_annotation_game(ag))
+                    st = refresh_cv_cards(uc, ag["id"], d, rosters)
                     log("game %s cards refreshed: %s" % (g, st))
             except Exception as e:  # noqa: BLE001
                 log("card refresh failed for %s: %s" % (g, e))
