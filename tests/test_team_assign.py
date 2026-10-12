@@ -99,3 +99,14 @@ def test_assign_game_reads_votes_and_rosters():
     cv = {"cv_%d_%s" % (1700000000 + int(t), s): {"kit_lab": k, "who_votes": v} for t, s, k, v in _numbered()}
     tt = assign_game({"cv_points": cv, "leftTeam": {"jerseyColor": "#f97316"}, "rightTeam": {"jerseyColor": "#ec4899"}}, ROSTERS)
     assert tt["source"] == "numbers" and tt["left_basket_first"] == "left"
+
+
+@pytest.mark.unit
+def test_assign_game_counts_tracked_misses_as_evidence():
+    from agx_pipeline.team_assign import assign_game
+    shots = _numbered()
+    cv = {"cv_%d_%s" % (1700000000 + int(t), s): {"kit_lab": k, "who_votes": v} for t, s, k, v in shots[:3]}
+    ms = {"cv_%d_%s" % (1700000000 + int(t), s): {"kit_lab": k, "who_votes": v} for t, s, k, v in shots[3:]}
+    game = {"cv_points": cv, "cv_misses": ms, "leftTeam": {"jerseyColor": "#f97316"}, "rightTeam": {"jerseyColor": "#ec4899"}}
+    assert assign_game(dict(game, cv_misses={}), ROSTERS) is None or assign_game(dict(game, cv_misses={}), ROSTERS).get("source") != "numbers"
+    assert assign_game(game, ROSTERS)["source"] == "numbers"

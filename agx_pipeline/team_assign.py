@@ -156,9 +156,10 @@ def assign_game(game: Dict, rosters: Optional[Dict] = None) -> Optional[Dict]:
     """tracker_teams for a Firebase game doc from its cv_points kit colours and, when the two
     rosters are given ({"left": {number: name}, "right": {...}}), the jersey numbers read."""
     shots = []
-    for log_id, v in (game.get("cv_points") or {}).items():
-        m = _ID.match(str(log_id))
-        if m and isinstance(v, dict) and (v.get("kit_lab") or v.get("who_votes")):
-            shots.append((float(m.group(1)), m.group(2), v.get("kit_lab"), v.get("who_votes")))
+    for field in ("cv_points", "cv_misses"):        # makes, and misses when the tracker ran on them
+        for log_id, v in (game.get(field) or {}).items():
+            m = _ID.match(str(log_id))
+            if m and isinstance(v, dict) and (v.get("kit_lab") or v.get("who_votes")):
+                shots.append((float(m.group(1)), m.group(2), v.get("kit_lab"), v.get("who_votes")))
     return solve(shots, (game.get("leftTeam") or {}).get("jerseyColor"),
                  (game.get("rightTeam") or {}).get("jerseyColor"), rosters)

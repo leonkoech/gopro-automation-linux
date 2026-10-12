@@ -347,6 +347,51 @@ def _run(cmd: List[str], timeout: int = 600) -> bool:
     return cp.returncode == 0
 
 
+def cut_for_tracker(cfg, recorder: HighlightRecorder, req: Dict) -> Optional[str]:
+    """A missed shot's clip for the possession tracker only: the covering buffer segments joined
+    by stream copy (no decode, no GPU, no upload, no highlights entry) and queued as a RAW job --
+    the low-priority worker trims and scales it when it gets there. Returns the queued job path.
+    Never raises."""
+    game_id, log_id = req["game_id"], req["log_id"]
+    t = float(req["ts_epoch"])
+    pre = float(req.get("pre") or PRE_SEC)
+    post = float(req.get("post") or POST_SEC)
+    label = req.get("label") or recorder.status().get("label")
+    t0, t1 = t - pre, t + post
+    try:
+        deadline = t1 + 2 * SEG_SEC + 20
+        while time.time() < deadline:
+            segs = recorder.segments(label)
+            if segs and segs[-1][0] >= t1:
+                break
+            time.sleep(2)
+        picked = _select_segments(recorder.segments(label), t0, t1)
+        if not picked:
+            raise RuntimeError("window not in highlight buffer")
+        angle = picked[0][1]
+        work = os.path.join(cfg.output_dir, "tracker_raw", label or "unlabeled")
+        os.makedirs(work, exist_ok=True)
+        raw = os.path.join(work, f"{log_id}_{angle}_raw.mp4")
+        lst = os.path.join(work, f"{log_id}_list.txt")
+        with open(lst, "w") as f:
+            f.writelines(f"file '{p}'\n" for _s, _a, p in picked)
+        ok = _run(["ffmpeg", "-nostdin", "-y", "-f", "concat", "-safe", "0",
+                   "-i", lst, "-c", "copy", raw])
+        try:
+            os.remove(lst)
+        except OSError:
+            pass
+        if not (ok and os.path.isfile(raw) and os.path.getsize(raw) > 0):
+            raise RuntimeError("segment concat failed")
+        from agx_pipeline.tracker_queue import enqueue_tracker_job
+        return enqueue_tracker_job(game_id, log_id, angle, raw, pre, None, False,
+                                   extra={"raw": True, "offset": round(max(0.0, t0 - picked[0][0]), 2),
+                                          "dur": round(pre + post, 2)})
+    except Exception as e:  # noqa: BLE001 -- a miss without a tracker clip stays an untyped card
+        logger.warning("tracker clip for miss %s/%s failed: %s", game_id, log_id, e)
+        return None
+
+
 def cut_highlight(fb, cfg, recorder: HighlightRecorder, req: Dict) -> None:
     """req: {game_id, log_id, ts_epoch, label, pre?, post?}. Never raises."""
     game_id, log_id = req["game_id"], req["log_id"]
