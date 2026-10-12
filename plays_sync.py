@@ -285,7 +285,8 @@ def _game_context(firebase_game: Dict[str, Any]) -> Dict[str, Any]:
     from agx_pipeline.card_flag import burst_shots, paused_intervals
     shots = (firebase_game.get("shot_live") or {}).get("shots") or []
     keys = [k for k in (_shot_key(s) for s in shots) if k]
-    return {"burst": burst_shots(keys), "paused": paused_intervals(firebase_game.get("logs") or [])}
+    return {"burst": burst_shots(keys), "paused": paused_intervals(firebase_game.get("logs") or []),
+            "make_keys": {_shot_key(s) for s in shots if s.get("made")} - {None}}
 
 
 def _cv_card(s: Dict[str, Any], firebase_game: Dict[str, Any], cv_points: Dict[str, Any],
@@ -303,6 +304,10 @@ def _cv_card(s: Dict[str, Any], firebase_game: Dict[str, Any], cv_points: Dict[s
     # ITS confidence rather than the flat placeholder — that number is what
     # the editor's green/red flag reads.
     _v = _typing_verdict(cv_points, s)
+    # A miss and the make right after it (ball bounces off, then drops in) can fall in the same
+    # second and so share an id; the verdict stored under it was produced from the make's clip.
+    if _v and not s.get("made") and _shot_key(s) in (ctx or {}).get("make_keys", ()):
+        _v = None
     if _v:
         _typed = _ZONE_CLASS.get((_v.get("zone"), bool(s.get("made"))))
         if _typed:

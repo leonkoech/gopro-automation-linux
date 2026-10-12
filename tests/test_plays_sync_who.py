@@ -173,3 +173,20 @@ def test_refresh_leaves_cards_from_before_flags_alone():
                       "angle": "LEFT", "events": [{"label": "FG_MAKE"}]})
     stats = plays_sync.refresh_cv_cards(c, "G", _flag_game({}), ROSTERS)
     assert not c.patched and stats["updated"] == 0
+
+
+@pytest.mark.unit
+def test_a_miss_in_the_same_second_as_the_make_after_it_does_not_borrow_its_verdict():
+    """Ball bounces off (miss) and drops in 0.6 s later (make): both share cv_<epoch>_left."""
+    g = _flag_game({_cv_id(): {"zone": "3PT", "line_px": 90.0, "who": "7", "who_votes": {"7": 9.0},
+                               "who_from": "clip"}})
+    make = g["shot_live"]["shots"][0]
+    miss = dict(make, made=False, wallclock=datetime(2026, 9, 16, 2, 20, 0, 100000, tzinfo=timezone.utc).isoformat())
+    make["wallclock"] = datetime(2026, 9, 16, 2, 20, 0, 700000, tzinfo=timezone.utc).isoformat()
+    g["shot_live"]["shots"] = [miss, make]
+    c = StoreClient()
+    plays_sync.create_plays_from_shot_live(c, "G", g, rosters=ROSTERS)
+    by_cls = {p["classification"]: p for p in c.created}
+    assert set(by_cls) == {"FG_MISS", "3PT_MAKE"}
+    assert by_cls["FG_MISS"]["events"][0]["cv_flag"] == "red"
+    assert by_cls["3PT_MAKE"]["events"][0]["cv_flag"] == "green"
