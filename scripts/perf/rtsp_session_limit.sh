@@ -1,7 +1,7 @@
 #!/bin/bash
-# P3 feasibility, stage 1: how many concurrent RTSP sessions will a camera serve?
+# Continuous-proxy feasibility, stage 1: how many concurrent RTSP sessions will a camera serve?
 #
-# P3 (continuous 1080p proxy on all four angles) puts THREE sessions on every
+# The continuous proxy (1080p on all four angles, during the game) puts THREE sessions on every
 # camera -- the 4K master recorder, the audio-only pull, and the proxy. FL and
 # FR already carry three every game night; NL and NR carry two. So the question
 # is not "can a camera do three" but the two things that would actually bite:
@@ -104,10 +104,10 @@ not the camera -- check that -c copy is really in the ffmpeg line above.
 
 Reading it:
   all sessions similar frames, gap < 3s, no errors
-      -> the camera serves N concurrently; P3's three per camera is a non-issue
+      -> the camera serves N concurrently; three sessions per camera is a non-issue
   session k shows NO CONNECT
       -> the ceiling is k-1; the reason is in its .err file
   an EARLIER session stalls or errors around the time a later one starts
       -> attaching a session degrades existing ones. This is the finding that
-         would block P3, because the degraded one could be a master recording.
+         would block the continuous proxy, because the degraded one could be a master recording.
 NOTE

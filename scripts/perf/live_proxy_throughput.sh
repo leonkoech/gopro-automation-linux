@@ -1,8 +1,8 @@
 #!/bin/bash
-# P3 feasibility, stage 2: can this box sustain N continuous 4K->1080p proxies?
+# Continuous-proxy feasibility, stage 2: can this box sustain N continuous 4K->1080p proxies?
 #
-# P3 transcodes every tracking angle for the whole game instead of converting
-# masters afterwards. That is N concurrent pipelines running at 1x realtime,
+# The continuous proxy transcodes every tracking angle for the whole game
+# instead of converting masters afterwards. That is N concurrent pipelines running at 1x realtime,
 # forever, on ONE NVDEC and ONE NVENC (confirmed 2026-09-05: the AGX Orin has
 # one of each, not the two an earlier draft assumed).
 #
@@ -24,9 +24,9 @@
 # stage 2 measures THIS BOX's engines, not the cameras, and stage 1 already
 # showed a camera serves six sessions untroubled.
 #
-#   ./p3_proxy_throughput.sh            # 4 pipelines, 180s
-#   ./p3_proxy_throughput.sh 2 300      # back off to 2 if 4 fails
-#   CAMS="10.1.10.142 10.1.10.51" ./p3_proxy_throughput.sh 2
+#   ./live_proxy_throughput.sh            # 4 pipelines, 180s
+#   ./live_proxy_throughput.sh 2 300      # back off to 2 if 4 fails
+#   CAMS="10.1.10.142 10.1.10.51" ./live_proxy_throughput.sh 2
 #
 set -u
 
@@ -68,7 +68,7 @@ echo
 # file needs clean EOS to write its moov atom, so any rough shutdown produces an
 # unreadable file and a frame count that lies; and this test only needs frames
 # counted, not a playable proxy. A partial .h264 is always countable.
-# The real P3 implementation WILL need a container, so the PTS problem has to be
+# A real implementation WILL need a container, so the PTS problem has to be
 # solved there -- likely mpegtsmux, or setting timestamps on the encoder output.
 pids=()
 for i in $(seq 1 "$N"); do
@@ -147,7 +147,7 @@ cat <<'NOTE'
 
 Reading it:
   every pipeline >=95% of realtime, no warnings
-      -> the box sustains this many continuous proxies. P3's throughput
+      -> the box sustains this many continuous proxies. the continuous proxy's throughput
          question is answered for N angles.
   one or more BEHIND
       -> saturated. Re-run with fewer to find the ceiling. Note the limit could

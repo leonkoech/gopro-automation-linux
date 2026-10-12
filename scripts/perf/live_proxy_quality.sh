@@ -1,16 +1,16 @@
 #!/bin/bash
-# P3 feasibility, stage 4: is the P3 proxy as good as today's post-game proxy?
+# Continuous-proxy feasibility, stage 4: is the live proxy as good as today's post-game proxy?
 #
 # Both paths decode 4K H.265 on NVDEC and encode 1080p H.264 on NVENC at the
 # same bitrate. Exactly ONE thing differs, and it is the reason this test
 # exists:
 #
 #   today (ingest.py:139 _transcode_hw)   nvv4l2decoder ! nvvideoconvert ! enc
-#   P3    (scripts/p3_proxy_throughput)   nvv4l2decoder ! nvvidconv     ! enc
+#   live  (live_proxy_throughput.sh)      nvv4l2decoder ! nvvidconv     ! enc
 #
 # nvvideoconvert is DeepStream's converter; nvvidconv is the L4T one. Both
 # scale on the VIC and both are "hardware", but they are different elements and
-# nothing guarantees they scale identically. If P3 is going to replace the
+# nothing guarantees they scale identically. If the live proxy is going to replace the
 # post-game transcode, its output has to be at least as good.
 #
 # Method: run ONE real 4K master through both pipelines, then score each output
@@ -22,12 +22,12 @@
 # File-based on purpose. No cameras, no game, no live streams -- run it any
 # time, and it is exactly reproducible because both paths see identical input.
 #
-#   ./p3_proxy_quality.sh /path/to/master.mp4
-#   ./p3_proxy_quality.sh /path/to/master.mp4 120     # only the first 120s
+#   ./live_proxy_quality.sh /path/to/master.mp4
+#   ./live_proxy_quality.sh /path/to/master.mp4 120     # only the first 120s
 #
 set -u
 
-SRC=${1:?usage: p3_proxy_quality.sh <4K-master.mp4> [seconds]}
+SRC=${1:?usage: live_proxy_quality.sh <4K-master.mp4> [seconds]}
 SECS=${2:-60}
 BITRATE=${BITRATE:-8000000}   # matches ingest.py HW_BITRATE
 FPS=${FPS:-30}
@@ -83,8 +83,8 @@ run_pipeline() {   # $1 = converter element, $2 = output file
 
 echo "encoding via nvvideoconvert (today's ingest path)..."
 run_pipeline nvvideoconvert "$OUT/today.h264" && A="$OUT/today.h264" || A=""
-echo "encoding via nvvidconv (the P3 path)..."
-run_pipeline nvvidconv "$OUT/p3.h264" && B="$OUT/p3.h264" || B=""
+echo "encoding via nvvidconv (the live-proxy path)..."
+run_pipeline nvvidconv "$OUT/live.h264" && B="$OUT/live.h264" || B=""
 echo
 
 # ---------------------------------------------------------------- settings
@@ -111,7 +111,7 @@ settings() {
 echo "── encoder settings ────────────────────────────────────────────────"
 printf "%-10s %-22s %s\n" "path" "WxH,fps" "checks"
 settings "$A" "today"
-settings "$B" "p3"
+settings "$B" "live"
 echo
 
 # ---------------------------------------------------------------- fidelity
@@ -130,19 +130,19 @@ score() {
 
 echo "── fidelity vs 1080p reference ─────────────────────────────────────"
 score "$A" "today"
-score "$B" "p3"
+score "$B" "live"
 
 cat <<'NOTE'
 
 Reading it:
   SSIM within ~0.005 and PSNR within ~0.5 dB
-      -> the two scalers are equivalent. P3 costs nothing in quality and
+      -> the two scalers are equivalent. the live proxy costs nothing in quality and
          stage 4 passes.
-  p3 materially lower
+  live proxy materially lower
       -> nvvidconv is the weaker scaler here. Options: use nvvideoconvert in
-         the P3 pipeline instead (it is available on the host), or raise the
-         P3 bitrate to compensate.
-  p3 materially HIGHER
+         the live-proxy pipeline instead (it is available on the host), or
+         raise its bitrate to compensate.
+  live proxy materially HIGHER
       -> worth knowing too; today's ingest proxies could be improved for free.
   IDR spacing not ~1s on either path
       -> a defect regardless of the comparison. Annotation-editor seeking

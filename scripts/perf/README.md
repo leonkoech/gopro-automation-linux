@@ -45,16 +45,16 @@ nohup docker events --filter type=container --filter event=start \
 
 Leave it past the night-end ingest so it catches the per-angle transcodes too.
 
-### P3 feasibility — continuous 1080p proxies on all four angles
+### Continuous-proxy feasibility — 1080p proxies on all four angles, during the game
 
-Staged so each gates the next. Stages 1, 2 and 4 have passed; stage 3 needs a
-game night.
+Staged so each gates the next. Stages 1 and 2 have passed. Stage 4 has never
+been run and needs no game; stage 3 needs a game night.
 
 | Script | Stage |
 |---|---|
 | `rtsp_session_limit.sh` | **1** — how many concurrent RTSP sessions a camera serves, and whether a new one disturbs those already connected. |
-| `p3_proxy_throughput.sh` | **2** — can the box sustain N continuous 4K→1080p pipelines at realtime. Also **3**, run during a game and judged on capture health rather than frame counts. |
-| `p3_proxy_quality.sh` | **4** — is the P3 proxy as good as today's ingest proxy. Isolates the one real difference: `nvvidconv` vs `nvvideoconvert`. |
+| `live_proxy_throughput.sh` | **2** — can the box sustain N continuous 4K→1080p pipelines at realtime. Also **3**, run during a game and judged on capture health rather than frame counts. |
+| `live_proxy_quality.sh` | **4** — is the live proxy as good as today's ingest proxy. Isolates the one real difference: `nvvidconv` vs `nvvideoconvert`. |
 
 ### Detector throughput and TensorRT
 
