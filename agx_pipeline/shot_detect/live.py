@@ -70,7 +70,13 @@ def _seg_real_time(path: str, prev: Optional[tuple]) -> tuple:
     return close, gap
 
 POLL_SEC = float(os.getenv("SHOT_LIVE_POLL_SEC", "2"))
-DEDUP_SEC = float(os.getenv("SHOT_LIVE_DEDUP_SEC", "2.5"))   # same-side makes within this window = one shot
+# Same side, within this many seconds = one shot -- EXCEPT a make AFTER a miss,
+# which is always kept: a ball that bounces off and drops in (or is put back)
+# gets a MISS verdict and then a MAKE verdict, and dropping the second one as a
+# duplicate lost 21 of the 31 annotated makes missing over seven test games.
+# A make just BEFORE a miss stays a duplicate: that is the ball seen entering
+# the ring and then bouncing out (3 of 3 such makes were phantoms by eye).
+DEDUP_SEC = float(os.getenv("SHOT_LIVE_DEDUP_SEC", "2.5"))
 SHADOW_CAP = int(os.getenv("SHOT_LIVE_SHADOW_CAP", "500"))   # max shots kept in the shadow doc
 # Recall fixes (raise live recall from the fragmented-segment baseline):
 #  - WINDOW: scan [prev_segment + current] so a shot straddling a 4s boundary is
@@ -253,7 +259,7 @@ class LiveShotScorer:
         self._confirm_keep: Dict[str, Dict[int, str]] = {}  # angle -> {idx: path} to re-read at full rate
         self._seg_reals: Dict[str, List[float]] = {}        # angle -> measured segment durations (s)
         processed: set = set()
-        scored: List[Dict] = []          # {wallclock_epoch, side} — dedup ledger
+        scored: List[Dict] = []          # {wallclock_epoch, side, made} — dedup ledger
         shadow: List[Dict] = []          # detections for the shadow field
         n_seg = 0
         backlog = {"now": 0, "max": 0}   # unprocessed-closed-segments queue depth
@@ -471,14 +477,15 @@ class LiveShotScorer:
                 # the shot, and let the drift show up in latency_s as before.
                 wc_iso = self._wallclock(spawned_iso, window_base + t_shot)
                 wc_epoch = self._epoch(wc_iso)
-            if self._is_dup(scored, wc_epoch, side):
+            made = v["verdict"] == "MAKE"
+            if self._is_dup(scored, wc_epoch, side, made):
                 continue   # overlap between consecutive windows -> one shot
-            scored.append({"wc": wc_epoch, "side": side})
+            scored.append({"wc": wc_epoch, "side": side, "made": made})
             # latency_s: shot happened (wallclock) -> verdict now. THE number the
             # green-button target is tuned on; scan_s isolates the decode+infer
             # share of it per window.
             rec = {"cam": angle, "side": side, "seg": base_idx,
-                   "t_shot": round(t_shot, 3), "made": v["verdict"] == "MAKE",
+                   "t_shot": round(t_shot, 3), "made": made,
                    "verdict": v["verdict"], "rho": v.get("rho"),
                    "wallclock": wc_iso, "detected_at": _utcnow_iso(),
                    "latency_s": (round(time.time() - wc_epoch, 1)
@@ -688,11 +695,16 @@ class LiveShotScorer:
         return out
 
     @staticmethod
-    def _is_dup(scored: List[Dict], wc_epoch: Optional[float], side: Optional[str]) -> bool:
+    def _is_dup(scored: List[Dict], wc_epoch: Optional[float], side: Optional[str],
+                made: bool = False) -> bool:
+        """A miss repeats any shot near it; a make repeats a nearby make, or a
+        nearby miss that is not before it."""
         if wc_epoch is None:
             return False
         return any(s["side"] == side and s["wc"] is not None
-                   and abs(s["wc"] - wc_epoch) <= DEDUP_SEC for s in scored)
+                   and abs(s["wc"] - wc_epoch) <= DEDUP_SEC
+                   and (not made or s.get("made", True) or s["wc"] >= wc_epoch)
+                   for s in scored)
 
     @staticmethod
     def _wallclock(spawned_iso: Optional[str], t: float) -> Optional[str]:

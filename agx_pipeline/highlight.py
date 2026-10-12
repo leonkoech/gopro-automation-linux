@@ -448,6 +448,14 @@ def cut_highlight(fb, cfg, recorder: HighlightRecorder, req: Dict) -> None:
         # onto cv_points.{logId} -> the CV scorecard). After the ready-mark so
         # the green button is never delayed; best-effort, never fails the cut.
         if log_id.startswith("cv_"):
+            # Possession tracker (shot type + 2K highlight), processed clip by clip by its own
+            # low-priority worker — this only writes a job file.
+            try:
+                from agx_pipeline.tracker_queue import enqueue_tracker_job, tracker_queue_enabled
+                if tracker_queue_enabled():
+                    enqueue_tracker_job(game_id, log_id, angle, final, pre, key, req.get("made"))
+            except Exception as e:  # noqa: BLE001
+                logger.warning("tracker enqueue failed for %s: %s", log_id, e)
             try:
                 from agx_pipeline.shot_typing_live import get_typer, typing_enabled
                 if typing_enabled():

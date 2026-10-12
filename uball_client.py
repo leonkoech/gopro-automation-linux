@@ -224,6 +224,44 @@ class UballClient:
             logger.error(f"[UballClient] Create game error: {e}")
             return None
 
+    def update_game(self, game_id: str, fields: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """
+        Partial-update a game.
+
+        Used by ingest to fill in what was not knowable when the game was
+        created. A live-streamed game is created at tip-off (so the Live tab
+        has something to open) when the final score does not exist yet, so
+        ingest patches it in once the game is over.
+
+        Args:
+            game_id: Annotation game UUID
+            fields: Only the fields to change
+
+        Returns:
+            Updated game data, or None on failure
+        """
+        if not fields:
+            return None
+        if not self._ensure_authenticated():
+            logger.error("[UballClient] Failed to authenticate for game update")
+            return None
+        try:
+            response = requests.patch(
+                f"{self.backend_url}/api/games/{game_id}",
+                json=fields,
+                headers=self._get_headers(),
+                timeout=15
+            )
+            if response.status_code in (200, 201):
+                logger.info(f"[UballClient] Game {game_id} updated: {sorted(fields)}")
+                return response.json()
+            logger.error(f"[UballClient] Update game failed: "
+                         f"{response.status_code} - {response.text[:200]}")
+            return None
+        except Exception as e:
+            logger.error(f"[UballClient] Update game error: {e}")
+            return None
+
     def get_game_by_firebase_id(self, firebase_game_id: str) -> Optional[Dict[str, Any]]:
         """
         Get a game by its Firebase game ID.
@@ -413,6 +451,18 @@ class UballClient:
         except Exception as e:
             logger.error(f"[UballClient] list_plays failed: {e}")
             return []
+
+    def update_play(self, play_id: str, fields: Dict[str, Any]) -> Dict[str, Any]:
+        """PATCH a play (only the given fields). Raises requests.HTTPError on failure."""
+        self._ensure_authenticated()
+        response = requests.patch(
+            f"{self.backend_url}/api/plays/{play_id}",
+            json=fields,
+            headers=self._get_headers(),
+            timeout=30
+        )
+        response.raise_for_status()
+        return response.json()
 
     def create_play(self, play_data: Dict[str, Any]) -> Dict[str, Any]:
         """
