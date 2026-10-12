@@ -171,3 +171,52 @@ def test_no_manifest_means_nothing_to_do(tmp_path):
     assert confirm.read_manifest(str(tmp_path)) is None
     (tmp_path / "UNSCANNED.json").write_text("{not json")
     assert confirm.read_manifest(str(tmp_path)) is None
+
+
+# ---- a make is never hidden by the miss before it -------------------------- #
+# Seven test games, 2026-10-10: 21 of 31 lost annotated makes were a ball that
+# bounced off (MISS verdict) and dropped in, or was put back, within 2.5 s. The
+# make verdict was produced and then discarded as a duplicate of the miss.
+@pytest.mark.unit
+def test_live_keeps_a_make_that_follows_a_miss():
+    scored = [{"wc": 100.0, "side": "left", "made": False}]
+    assert LiveShotScorer._is_dup(scored, 100.6, "left", True) is False
+
+
+@pytest.mark.unit
+def test_live_still_drops_a_second_make_and_a_miss_after_anything():
+    after_make = [{"wc": 100.0, "side": "left", "made": True}]
+    assert LiveShotScorer._is_dup(after_make, 101.0, "left", True) is True
+    assert LiveShotScorer._is_dup(after_make, 101.0, "left", False) is True
+    after_miss = [{"wc": 100.0, "side": "left", "made": False}]
+    assert LiveShotScorer._is_dup(after_miss, 101.0, "left", False) is True
+
+
+@pytest.mark.unit
+def test_live_ledger_entry_without_a_verdict_blocks_as_before():
+    assert LiveShotScorer._is_dup([{"wc": 100.0, "side": "left"}], 101.0, "left", True) is True
+
+
+@pytest.mark.unit
+def test_confirm_keeps_a_make_that_follows_a_live_miss():
+    have = [{"side": "left", "wallclock": _iso(100.0), "made": False}]
+    got = confirm.dedup_new([{"side": "left", "wallclock": _iso(101.5), "made": True}], have, 2.5)
+    assert len(got) == 1
+
+
+@pytest.mark.unit
+def test_confirm_drops_a_miss_or_a_second_make_near_a_live_shot():
+    make = [{"side": "left", "wallclock": _iso(100.0), "made": True}]
+    miss = [{"side": "left", "wallclock": _iso(100.0), "made": False}]
+    assert confirm.dedup_new([{"side": "left", "wallclock": _iso(101.5), "made": True}], make, 2.5) == []
+    assert confirm.dedup_new([{"side": "left", "wallclock": _iso(101.5), "made": False}], make, 2.5) == []
+    assert confirm.dedup_new([{"side": "left", "wallclock": _iso(101.5), "made": False}], miss, 2.5) == []
+
+
+# Three-game replay, 2026-10-12: the confirm pass found 3 "makes" 0.1-0.6 s BEFORE a live miss --
+# the ball entering the ring and bouncing out. All 3 were phantoms by eye.
+@pytest.mark.unit
+def test_a_make_just_before_a_miss_is_still_a_duplicate():
+    assert LiveShotScorer._is_dup([{"wc": 100.6, "side": "left", "made": False}], 100.0, "left", True) is True
+    have = [{"side": "left", "wallclock": _iso(100.6), "made": False}]
+    assert confirm.dedup_new([{"side": "left", "wallclock": _iso(100.0), "made": True}], have, 2.5) == []

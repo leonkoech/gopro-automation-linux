@@ -68,7 +68,9 @@ def window_wallclock(close: float, seg_real: Optional[float], t_shot: float,
 
 def dedup_new(found: List[Dict], existing: List[Dict], dedup_s: float) -> List[Dict]:
     """The confirmed shots that are genuinely new: not within dedup_s of a shot
-    the live loop already has on that side, nor of one another."""
+    the live loop already has on that side, nor of one another. A make is a
+    repeat of a nearby make, or of a nearby miss that is not before it -- never
+    of the miss before it (live._is_dup)."""
     def epoch(s: Dict) -> Optional[float]:
         try:
             return datetime.fromisoformat(s["wallclock"]).timestamp()
@@ -76,16 +78,17 @@ def dedup_new(found: List[Dict], existing: List[Dict], dedup_s: float) -> List[D
             return None
 
     kept: List[Dict] = []
-    have = [(s.get("side"), epoch(s)) for s in existing]
+    have = [(s.get("side"), epoch(s), s.get("made", True)) for s in existing]
     for s in sorted(found, key=lambda x: epoch(x) or 0.0):
         e = epoch(s)
         if e is None:
             continue
+        made = bool(s.get("made"))
         if any(side == s.get("side") and t is not None and abs(t - e) <= dedup_s
-               for side, t in have):
+               and (not made or was_make or t >= e) for side, t, was_make in have):
             continue
         kept.append(s)
-        have.append((s.get("side"), e))
+        have.append((s.get("side"), e, made))
     return kept
 
 
