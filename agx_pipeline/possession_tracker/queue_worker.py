@@ -66,6 +66,8 @@ TV_2K = _flag("TRACKER_TV_2K", "false")
 PUBLISH = _flag("TRACKER_PUBLISH_CORE", "true")
 WHO = _flag("TRACKER_WHO", "false")
 WHO_EXTEND = _flag("TRACKER_WHO_EXTEND", "false")
+LOOKS = _flag("TRACKER_LOOKS", "false")       # appearance model: name a shooter whose number is hidden
+LOOKS_DIR = os.environ.get("TRACKER_LOOKS_DIR", "/home/dev/possession/looks")
 WHO_PYSRC = os.environ.get("TRACKER_WHO_PYSRC", "/home/dev/who_deps_staging/pysrc")
 BACKLOG_MAX = int(os.environ.get("TRACKER_BACKLOG_MAX", "6"))
 BUCKET = os.environ.get("UPLOAD_BUCKET", "uball-videos-production")
@@ -310,6 +312,21 @@ def process_fast(name, job):
                 extra.update({"who": num, "who_votes": dict(top), "who_source": "tracker", "who_from": who_from})
             except Exception as e:  # noqa: BLE001 - WHO never blocks the type
                 job["who_error"] = "%s: %s" % (type(e).__name__, e)
+        if LOOKS:
+            # every player's reads + appearance in this clip, kept beside the queue until the
+            # game ends: the per-game model that names shooters by their looks is fitted then
+            try:
+                import holder as H
+                import looks as LK
+                t1 = time.time()
+                rec = LK.collect(jersey_stack(), S, clip, None if shot is None else shot["shooter"],
+                                 H.off_court_tracks(S, H.Camera(job["angle"])))
+                lid = job["log_id"].split("_")
+                LK.save(os.path.join(LOOKS_DIR, job["game_id"], name[:-5].split("__", 1)[1] + ".npz"), rec,
+                        {"side": lid[2], "epoch": float(lid[1]), "made": job.get("made")})
+                job["looks_s"] = round(time.time() - t1, 1)
+            except Exception as e:  # noqa: BLE001 - the number read stands on its own
+                job["looks_error"] = "%s: %s" % (type(e).__name__, e)
         if zone:
             job["line_px"] = round(line_px(job["angle"], feet), 1)
             write_type(job, zone, "fast", dict(extra, feet_px=[round(v) for v in feet], line_px=job["line_px"]))
@@ -380,6 +397,7 @@ def maybe_publish():
             log("roster lookup failed for %s: %s" % (g, e))
         # team for every shot: one half-time switch found from the jersey numbers read on the
         # shooters (against the rosters) and their kit colours
+        tt = None
         try:
             from agx_pipeline.team_assign import assign_game, team_for_shot
             tt = assign_game(d, rosters)
@@ -397,6 +415,26 @@ def maybe_publish():
                     g, tt.get("source"), tt.get("switch_epoch"), tt.get("left_basket_first")))
         except Exception as e:  # noqa: BLE001
             log("team pass failed for %s: %s" % (g, e))
+        # shooters by appearance: a hint for the shots whose number could not be read
+        if LOOKS and tt and rosters:
+            try:
+                import looks as LK
+                from agx_pipeline.team_assign import team_for_shot
+                clips = LK.load_game(os.path.join(LOOKS_DIR, g))
+                ans = LK.name_shooters(clips, rosters, lambda c: team_for_shot(tt, c.get("side"), c.get("epoch")))
+                patch = {}
+                for cname, a in ans.items():
+                    field, lid = ("cv_misses", cname[:-5]) if cname.endswith("_miss") else ("cv_points", cname)
+                    if lid in (d.get(field) or {}):
+                        patch["%s.%s.who_looks" % (field, lid)] = a
+                if patch:
+                    game_doc(g).update(patch)
+                    d = game_doc(g).get().to_dict() or {}
+                log("game %s shooters by appearance: %d of %d clips" % (g, len(patch), len(clips)))
+                if not pend:
+                    shutil.rmtree(os.path.join(LOOKS_DIR, g), ignore_errors=True)      # final publish
+            except Exception as e:  # noqa: BLE001
+                log("appearance pass failed for %s: %s" % (g, e))
         # the game's annotation cards, if ingest has already made them: bring them up to date with
         # this game's tracker results (type, jersey, green/yellow/red flag); cards an annotator
         # changed are never touched. If ingest comes later it builds the cards from these results.

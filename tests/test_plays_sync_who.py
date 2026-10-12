@@ -225,3 +225,34 @@ def test_a_miss_never_reads_the_scorecards_cv_points_entry_of_a_make_with_its_id
     assert plays_sync._typing_verdict({"cv_1_left": {"zone": "3PT"}}, {"side": "left", "made": False,
                                       "wallclock": datetime.fromtimestamp(1, timezone.utc).isoformat()},
                                       {"cv_1_left": {"zone": "2PT"}}) == {"zone": "2PT"}
+
+
+# ---- shooter named by appearance when no number was read ---------------------------------- #
+@pytest.mark.unit
+def test_looks_fill_a_silent_card_as_a_yellow_hint():
+    c = StoreClient()
+    plays_sync.create_plays_from_shot_live(
+        c, "G", _flag_game({_cv_id(): {"zone": "2PT", "line_px": 90.0, "who": None, "who_votes": {},
+                                       "who_looks": {"n": "7", "conf": 0.8}}}), rosters=ROSTERS)
+    card = c.created[0]
+    assert "Looks like #7 Giovanni Garcia" in card["note"]
+    assert card["events"][0]["cv_flag"] == "yellow" and "appearance" in card["events"][0]["cv_flag_reason"]
+
+
+@pytest.mark.unit
+def test_a_read_number_always_wins_over_looks():
+    c = StoreClient()
+    plays_sync.create_plays_from_shot_live(
+        c, "G", _flag_game({_cv_id(): {"zone": "2PT", "line_px": 90.0, "who": "2", "who_votes": {"2": 9.0},
+                                       "who_from": "clip", "who_looks": {"n": "7", "conf": 0.99}}}), rosters=ROSTERS)
+    assert "Tracker suggests #2" in c.created[0]["note"] and c.created[0]["events"][0]["cv_flag"] == "green"
+
+
+@pytest.mark.unit
+def test_weak_or_off_roster_looks_are_not_shown():
+    for lk in ({"n": "7", "conf": 0.5}, {"n": "12", "conf": 0.9}, "junk"):
+        c = StoreClient()
+        plays_sync.create_plays_from_shot_live(
+            c, "G", _flag_game({_cv_id(): {"zone": "2PT", "line_px": 90.0, "who": None, "who_votes": {}, "who_looks": lk}}),
+            rosters=ROSTERS)
+        assert "Looks like" not in c.created[0]["note"] and c.created[0]["events"][0]["cv_flag"] == "red"
