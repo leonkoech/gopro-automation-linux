@@ -217,21 +217,26 @@ _ZONE_CLASS = {
 }
 
 
-def _typing_verdict(cv_points: Dict[str, Any], shot: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+def _typing_verdict(cv_points: Dict[str, Any], shot: Dict[str, Any],
+                    cv_misses: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
     """The typing verdict for this shot, or None.
 
     Keyed the way shot_detect/live.py builds it: cv_{int(wallclock epoch)}_{side}.
-    Only MAKES have one — a highlight clip, and therefore a typing pass, is only
-    cut for a made shot — so misses keep the generic label.
+    A make's verdict is in cv_points (it rides on the highlight clip). A miss has one only
+    when the tracker ran on misses (SHOT_TRACK_MISSES), and then it is in cv_misses — kept
+    apart because cv_points feeds the scorecard and the reel.
     """
     side, wc = shot.get("side"), shot.get("wallclock")
-    if not (cv_points and side and wc):
+    if not (side and wc and (cv_points or cv_misses)):
         return None
     try:
         epoch = int(datetime.fromisoformat(wc).timestamp())
     except Exception:  # noqa: BLE001
         return None
-    v = cv_points.get(f"cv_{epoch}_{side}")
+    key = f"cv_{epoch}_{side}"
+    if not shot.get("made") and isinstance((cv_misses or {}).get(key), dict):
+        return cv_misses[key]
+    v = (cv_points or {}).get(key)
     return v if isinstance(v, dict) else None
 
 
@@ -303,10 +308,11 @@ def _cv_card(s: Dict[str, Any], firebase_game: Dict[str, Any], cv_points: Dict[s
     # Upgrade to the real shot type when typing reached a verdict, and carry
     # ITS confidence rather than the flat placeholder — that number is what
     # the editor's green/red flag reads.
-    _v = _typing_verdict(cv_points, s)
+    _v = _typing_verdict(cv_points, s, firebase_game.get("cv_misses"))
     # A miss and the make right after it (ball bounces off, then drops in) can fall in the same
     # second and so share an id; the verdict stored under it was produced from the make's clip.
-    if _v and not s.get("made") and _shot_key(s) in (ctx or {}).get("make_keys", ()):
+    if (_v and not s.get("made") and _shot_key(s) in (ctx or {}).get("make_keys", ())
+            and _v is not (firebase_game.get("cv_misses") or {}).get(_shot_key(s))):
         _v = None
     if _v:
         _typed = _ZONE_CLASS.get((_v.get("zone"), bool(s.get("made"))))

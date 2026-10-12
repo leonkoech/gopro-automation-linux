@@ -181,12 +181,30 @@ def track(clip, cam, name, work, pre, how):
 
 
 def stage_clip(job, work):
-    """Copy the clip into the work dir under a name that carries the camera (FL_/FR_)."""
+    """Put the clip into the work dir under a name that carries the camera (FL_/FR_). A RAW job
+    (a missed shot: untrimmed 4K buffer segments) is trimmed and scaled here to the same 1080p,
+    30 fps shape as a highlight clip."""
     cam = job["angle"]
     name = "%s_%s" % (cam, job["log_id"])
     dst = os.path.join(work, name + ".mp4")
-    shutil.copyfile(job["clip"], dst)
+    if job.get("raw"):
+        subprocess.run(["nice", "-n", "19", "ionice", "-c3", "ffmpeg", "-nostdin", "-y", "-loglevel", "error",
+                        "-ss", "%.2f" % float(job.get("offset") or 0.0), "-i", job["clip"],
+                        "-t", "%.2f" % float(job.get("dur") or 7.0), "-vf", "scale=1920:1080",
+                        "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-r", "30", "-vsync", "cfr",
+                        "-g", "30", "-an", dst], capture_output=True, text=True, timeout=600, check=True)
+    else:
+        shutil.copyfile(job["clip"], dst)
     return name, dst
+
+
+def drop_raw(job):
+    """A raw miss clip is only the tracker's: remove it once the job is finished."""
+    if job.get("raw"):
+        try:
+            os.remove(job["clip"])
+        except OSError:
+            pass
 
 
 def write_type(job, zone, source, extra):
@@ -194,7 +212,12 @@ def write_type(job, zone, source, extra):
            "typed_at": datetime.now(timezone.utc).isoformat(), "confidence": 0.9 if source == "sam3" else 0.8,
            "zone_source": "tracker_" + source}
     rec.update(extra)
-    game_doc(job["game_id"]).set({"cv_points": {job["log_id"]: rec}}, merge=True)
+    # a missed shot's verdict lives beside the makes', never among them: cv_points feeds the
+    # scorecard and the reel, and a miss can share its id with the make that follows it
+    field = "cv_misses" if job.get("made") is False else "cv_points"
+    if field == "cv_misses":
+        rec.update(points=0, made=False)
+    game_doc(job["game_id"]).set({field: {job["log_id"]: rec}}, merge=True)
 
 
 def render_2k(job, work, name, S, res, zone):
@@ -302,8 +325,10 @@ def process_fast(name, job):
         move(name, "pending", "sam3", job)
         log("%s fast=%s line=%s -> SAM3 queue (%.0fs)" % (job["log_id"], zone, job.get("line_px"), job["fast_s"]))
     else:
+        drop_raw(job)
         move(name, "pending", "done", job)
-        log("%s fast=%s line=%s 2k=%s who=%s (%.0fs)" % (job["log_id"], zone, job.get("line_px"),
+        log("%s%s fast=%s line=%s 2k=%s who=%s (%.0fs)" % (job["log_id"], " MISS" if job.get("made") is False else "",
+                                                         zone, job.get("line_px"),
                                                          "yes" if job.get("url_2k") else "no", job.get("who"), job["fast_s"]))
 
 
@@ -326,10 +351,13 @@ def maybe_publish():
         return
     games = {f.split("__")[0] for st in ("done", "failed") for f in os.listdir(qpath(st)) if f.endswith(".json")}
     for g in games:
-        if jobs("pending", g):
-            continue
+        pend = jobs("pending", g)
+        if any(j.get("made") is not False for _, j in pend):
+            continue                    # makes still to do: the reel is not ready
         n_done = len(jobs("done", g))
         if os.path.exists(qpath("published", g)):
+            if pend:
+                continue                # published once the makes were done; again when the misses are
             try:
                 if json.load(open(qpath("published", g))).get("done", 0) >= n_done:
                     continue            # nothing new since the last publish
@@ -395,7 +423,7 @@ def maybe_publish():
 # ---------------------------------------------------------------- main loop
 def step():
     """Do one unit of work. Returns True if something was processed."""
-    pend = jobs("pending")
+    pend = sorted(jobs("pending"), key=lambda nj: nj[1].get("made") is False)   # makes first: they feed the reel
     for name, job in pend:
         if detector_behind(job["game_id"]):
             continue

@@ -143,6 +143,11 @@ def clip_window(made: bool) -> tuple:
             float(os.getenv("CV_CLIP_POST_MISS_S", "4")))
 
 
+def track_misses_enabled() -> bool:
+    from agx_pipeline.tracker_queue import track_misses_enabled as _on
+    return _on()
+
+
 def autoscore_enabled() -> bool:
     return os.getenv("SHOT_AUTOSCORE_ENABLED", "false").strip().lower() in ("1", "true", "yes", "on")
 
@@ -451,6 +456,10 @@ class LiveShotScorer:
             # miss needs a timestamp, not a clip.
             if rec["made"] and autohighlight_enabled():
                 self._maybe_highlight(game_id, rec)
+            elif not rec["made"] and track_misses_enabled():
+                # still no highlight for a miss -- only a local clip for the possession
+                # tracker (type, shooter, team onto its card), joined by stream copy
+                self._maybe_track_miss(game_id, rec)
         self._advance_prev(prev_seg, angle, idx, path)
 
     def _concat(self, a: str, b: str) -> Optional[str]:
@@ -525,6 +534,25 @@ class LiveShotScorer:
                         shot.get("latency_s"), resp)
         except Exception as e:  # noqa: BLE001 — never break the detector
             logger.warning("shot-live auto-highlight failed for %s: %s", cmd["logId"], e)
+
+    def _maybe_track_miss(self, game_id: str, shot: Dict) -> None:
+        """Ask the service for a tracker-only clip of a CV miss (same id scheme as a make,
+        `cv_<epoch>_<side>`; the window is the make's, which the tracker was built on).
+        Best-effort: a failure leaves the miss an untyped card, as before."""
+        if self._on_make is None:
+            return
+        wc, side = shot.get("wallclock"), shot.get("side")
+        epoch = self._epoch(wc)
+        if not (wc and epoch and side in ("left", "right")):
+            return
+        pre_s, post_s = clip_window(True)
+        cmd = {"logId": f"cv_{int(epoch)}_{side}", "ts": wc, "side": side,
+               "firebase_game_id": game_id, "pre": pre_s, "post": post_s,
+               "made": False, "track_only": True}
+        try:
+            self._on_make(cmd)
+        except Exception as e:  # noqa: BLE001 — never break the detector
+            logger.warning("shot-live tracker clip failed for %s: %s", cmd["logId"], e)
 
     def _maybe_autoscore(self, game_id: str, shot: Dict, starting_side: Optional[str]) -> None:
         """Phase C: turn a CV make into +2 on the live scoreboard. Deliberately a

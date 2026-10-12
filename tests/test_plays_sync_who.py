@@ -190,3 +190,38 @@ def test_a_miss_in_the_same_second_as_the_make_after_it_does_not_borrow_its_verd
     assert set(by_cls) == {"FG_MISS", "3PT_MAKE"}
     assert by_cls["FG_MISS"]["events"][0]["cv_flag"] == "red"
     assert by_cls["3PT_MAKE"]["events"][0]["cv_flag"] == "green"
+
+
+# ---- missed shots typed by the tracker (cv_misses) ---------------------------------------- #
+@pytest.mark.unit
+def test_a_miss_card_takes_its_type_jersey_and_flag_from_cv_misses():
+    g = _flag_game({})
+    g["shot_live"]["shots"][0]["made"] = False
+    g["cv_misses"] = {_cv_id(): {"zone": "3PT", "line_px": 90.0, "who": "7", "who_votes": {"7": 9.0},
+                                 "who_from": "clip", "points": 0, "made": False}}
+    c = StoreClient()
+    plays_sync.create_plays_from_shot_live(c, "G", g, rosters=ROSTERS)
+    card = c.created[0]
+    assert card["classification"] == "3PT_MISS" and card["events"][0]["cv_flag"] == "green"
+    assert "#7" in card["note"]
+
+
+@pytest.mark.unit
+def test_a_miss_and_the_make_in_the_same_second_each_keep_their_own_verdict():
+    g = _flag_game({_cv_id(): {"zone": "2PT", "line_px": 90.0, "who": "2", "who_votes": {"2": 9.0}, "who_from": "clip"}})
+    make = g["shot_live"]["shots"][0]
+    miss = dict(make, made=False, wallclock=datetime(2026, 9, 16, 2, 20, 0, 100000, tzinfo=timezone.utc).isoformat())
+    make["wallclock"] = datetime(2026, 9, 16, 2, 20, 0, 700000, tzinfo=timezone.utc).isoformat()
+    g["shot_live"]["shots"] = [miss, make]
+    g["cv_misses"] = {_cv_id(): {"zone": "3PT", "line_px": 90.0, "who": "7", "who_votes": {"7": 9.0}, "who_from": "clip"}}
+    c = StoreClient()
+    plays_sync.create_plays_from_shot_live(c, "G", g, rosters=ROSTERS)
+    assert {p["classification"] for p in c.created} == {"3PT_MISS", "FG_MAKE"} or \
+        {p["classification"] for p in c.created} == {"3PT_MISS", "2PT_MAKE"}
+
+
+@pytest.mark.unit
+def test_a_miss_never_reads_the_scorecards_cv_points_entry_of_a_make_with_its_id():
+    assert plays_sync._typing_verdict({"cv_1_left": {"zone": "3PT"}}, {"side": "left", "made": False,
+                                      "wallclock": datetime.fromtimestamp(1, timezone.utc).isoformat()},
+                                      {"cv_1_left": {"zone": "2PT"}}) == {"zone": "2PT"}
