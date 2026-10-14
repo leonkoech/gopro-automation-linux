@@ -29,7 +29,7 @@ def test_anchor_is_first_frame_plus_live_lag(master):
 
 @pytest.mark.unit
 @pytest.mark.parametrize("extra", [
-    {"stall": {"segments": 2}},            # watchdog stitched it: mtime moved after stop
+    {"stall": {"segments": 2}},            # stitched, recorded before end_epoch was kept
     {"duration": None},
     {"duration": 0},
     {"path": "/nonexistent/master.mp4"},
@@ -77,3 +77,12 @@ def test_anchor_kept_when_master_finalized_at_the_stop(master):
 @pytest.mark.unit
 def test_no_anchor_when_master_was_touched_long_after_the_stop(master):
     assert ingest._live_anchor({"path": master, "duration": 2675.0}, "2026-10-14T15:59:44.000000Z") is None
+
+
+@pytest.mark.unit
+def test_stitched_master_anchors_on_its_last_segment_end(master):
+    # the rewrite moved the file's mtime 40 s past the stop; the recorder kept the true end
+    os.utime(master, (1_791_994_824.0, 1_791_994_824.0))
+    f = {"path": master, "duration": 2886.8, "stall": {"segments": 2, "end_epoch": 1_791_994_784.0}}
+    got = datetime.fromisoformat(ingest._live_anchor(f, "2026-10-14T16:19:44.000000Z")).timestamp()
+    assert got == pytest.approx(1_791_994_784.0 - 2886.8 + ingest.LIVE_PDT_LAG_SEC)

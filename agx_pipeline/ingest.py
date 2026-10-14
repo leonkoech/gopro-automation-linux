@@ -283,16 +283,17 @@ def _live_anchor(f: Dict, stopped_at: Optional[str] = None) -> Optional[str]:
     """The master's first frame on the live stream's clock (ISO, UTC), for the live-card rebase.
 
     A finalized master's mtime is when its last frame was written, so mtime - duration is when
-    the first one arrived. None when that cannot be trusted -- its live cards then stay pending
+    the first one arrived. A master the watchdog stitched from restart segments is rewritten
+    after stop, so its own mtime is useless; the recorder keeps the last segment's mtime from
+    before the rewrite (stall.end_epoch), and the stitched duration already holds the
+    re-inserted gaps. None when the end cannot be trusted -- its live cards then stay pending
     and can still be rebased by hand (POST /live/games/{id}/rebase):
-      - a master the watchdog stitched from restart segments (rewritten after stop, and it holds
-        re-inserted gaps);
-      - a master whose mtime is far from the recorder's stop (copied, repaired or restored)."""
-    if f.get("stall"):
-        return None
+      - a stitched master without end_epoch (recorded before this was kept);
+      - a master whose end is far from the recorder's stop (copied, repaired or restored)."""
+    stall = f.get("stall")
     try:
         dur = float(f["duration"])
-        mtime = os.path.getmtime(f["path"])
+        end = float(stall["end_epoch"]) if stall else os.path.getmtime(f["path"])
     except (KeyError, TypeError, ValueError, OSError):
         return None
     if dur <= 0:
@@ -302,11 +303,11 @@ def _live_anchor(f: Dict, stopped_at: Optional[str] = None) -> Optional[str]:
             stop = datetime.fromisoformat(stopped_at.replace("Z", "+00:00")).timestamp()
         except ValueError:
             stop = None
-        if stop is not None and abs(mtime - stop) > ANCHOR_STOP_TOLERANCE_SEC:
-            logger.warning("no live anchor for %s: mtime is %.0fs from the stop", f.get("angle"),
-                           mtime - stop)
+        if stop is not None and abs(end - stop) > ANCHOR_STOP_TOLERANCE_SEC:
+            logger.warning("no live anchor for %s: master ends %.0fs from the stop", f.get("angle"),
+                           end - stop)
             return None
-    return datetime.fromtimestamp(mtime - dur + LIVE_PDT_LAG_SEC, timezone.utc).isoformat()
+    return datetime.fromtimestamp(end - dur + LIVE_PDT_LAG_SEC, timezone.utc).isoformat()
 
 
 _s3_lock = threading.Lock()
