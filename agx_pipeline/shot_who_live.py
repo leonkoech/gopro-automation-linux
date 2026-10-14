@@ -20,7 +20,7 @@ from datetime import datetime, timezone
 from typing import Dict, Optional
 
 from logging_service import get_logger
-from shot_typing_live import TYPING_CWD, _classify_env
+from agx_pipeline.shot_typing_live import TYPING_CWD, _classify_env
 
 logger = get_logger("agx.shot_who_live")
 
