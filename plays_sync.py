@@ -422,11 +422,35 @@ def _cv_card(s: Dict[str, Any], firebase_game: Dict[str, Any], cv_points: Dict[s
                                      burst=bool(_key) and _key in (ctx.get("burst") or set()))
     play_data["confidence"] = CONFIDENCE[flag]
     play_data["events"][0].update({"confidence": CONFIDENCE[flag], "cv_flag": flag, "cv_flag_reason": why,
-                                   "cv_conf": conf})
+                                   "cv_conf": conf, "cv_suggest": _card_suggestions(_v, _who, _team, conf)})
     play_data["note"] += f" · {flag.upper()}: {why}"
     play_data["events"][0]["cv_written"] = _card_fingerprint(play_data)
     play_data["_typed"] = typed
     return play_data
+
+
+_OTHER_SIDE = {"2PT": "3PT", "3PT": "2PT", "4PT": "3PT"}
+
+
+def _card_suggestions(v: Optional[Dict[str, Any]], who: Optional[tuple], team: Optional[str],
+                      conf: Dict[str, float]) -> Dict[str, Any]:
+    """What the fill-in card offers beside each empty box, with the measured confidence:
+    the shooting team (left/right = team1/team2), the shooter, and the shot type -- two types
+    when the feet were near a line (the second gets the rest of the probability)."""
+    v = v or {}
+    out: Dict[str, Any] = {"team": team, "team_conf": conf.get("team")}
+    if who:
+        out["shooter"] = {"number": who[0], "name": who[1],
+                          "source": "appearance" if len(who) > 2 else (
+                              "followed back" if v.get("who_from") == "timeline" else "jersey read"),
+                          "conf": conf.get("shooter")}
+    zone = v.get("zone")
+    if zone:
+        types = [{"type": zone, "conf": conf.get("type")}]
+        if zone in _OTHER_SIDE and (conf.get("type") or 1.0) < 0.85:
+            types.append({"type": _OTHER_SIDE[zone], "conf": round(1.0 - float(conf.get("type") or 0), 2)})
+        out["types"] = types
+    return out
 
 
 def _card_fingerprint(card: Dict[str, Any]) -> str:
