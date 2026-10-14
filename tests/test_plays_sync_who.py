@@ -257,3 +257,14 @@ def test_weak_or_off_roster_looks_are_not_shown():
             c, "G", _flag_game({_cv_id(): {"zone": "2PT", "line_px": 90.0, "who": None, "who_votes": {}, "who_looks": lk}}),
             rosters=ROSTERS)
         assert "Looks like" not in c.created[0]["note"] and c.created[0]["events"][0]["cv_flag"] == "red"
+
+
+@pytest.mark.unit
+def test_card_carries_structured_suggestions_for_the_fill_in_boxes():
+    c = StoreClient()
+    plays_sync.create_plays_from_shot_live(
+        c, "G", _flag_game({_cv_id(): {"zone": "3PT", "line_px": -12.0, "who": "7", "who_votes": {"7": 9.0},
+                                       "who_from": "clip"}}), rosters=ROSTERS)
+    sug = c.created[0]["events"][0]["cv_suggest"]
+    assert sug["team"] == "left" and sug["shooter"] == {"number": "7", "name": "Giovanni Garcia", "source": "jersey read", "conf": 0.9}
+    assert sug["types"] == [{"type": "3PT", "conf": 0.72}, {"type": "2PT", "conf": 0.28}]
