@@ -67,6 +67,12 @@ MAX_PARALLEL = int(os.getenv("TRANSCODE_PARALLEL", "2"))
 # MAX_PARALLEL if a game is being captured. See _stage1_parallel().
 MAX_PARALLEL_IDLE = int(os.getenv("TRANSCODE_PARALLEL_IDLE", "4"))
 UBALL_ANGLE = {"FL": "LEFT", "FR": "RIGHT"}  # registered angles (annotation is 2-angle today)
+# How far the live stream's PROGRAM-DATE-TIME runs ahead of the master: a frame the
+# master holds at box time T is stamped about T + 5 s in the live HLS (decode, encode and mux in
+# the publisher). Frame-matched on the 14 Oct test game, the anchor below lands 0.01 s (FL) and
+# 0.06-0.14 s (FR) from the true one; the burned-in clock gave +5.06 s on 8 Oct. Live cards
+# carry that PDT, so the anchor is shifted the same way.
+LIVE_PDT_LAG_SEC = float(os.getenv("LIVE_PDT_LAG_SEC", "5.0"))
 SETTINGS_COLLECTION = "agx-settings"
 TRANSCODE_DEFAULT = os.getenv("TRANSCODE_ENABLED", "true").lower() in ("1", "true", "yes")
 
@@ -270,6 +276,25 @@ def _probe_dur(path: str) -> Optional[float]:
         return float(cp.stdout.strip())
     except ValueError:
         return None
+
+
+def _live_anchor(f: Dict) -> Optional[str]:
+    """The master's first frame on the live stream's clock (ISO, UTC), for the live-card rebase.
+
+    A finalized master's mtime is when its last frame was written, so mtime - duration is when
+    the first one arrived. Not for a master the watchdog stitched from restart segments: that
+    file is rewritten after stop (mtime moves) and holds re-inserted gaps, so None -- its live
+    cards stay pending and can still be rebased by hand (POST /live/games/{id}/rebase)."""
+    if f.get("stall"):
+        return None
+    try:
+        dur = float(f["duration"])
+        start = os.path.getmtime(f["path"]) - dur + LIVE_PDT_LAG_SEC
+    except (KeyError, TypeError, ValueError, OSError):
+        return None
+    if dur <= 0:
+        return None
+    return datetime.fromtimestamp(start, timezone.utc).isoformat()
 
 
 _s3_lock = threading.Lock()
@@ -555,7 +580,7 @@ def run_ingestion(fb, cfg, pipeline_id: str, state: Dict, stopped: Dict, tracker
                 if throttled:
                     _capture_throttle.release()
             return f["angle"], {"src": f["path"], "dst": dst, "filename": fn,
-                                "key": key, "ok": ok,
+                                "key": key, "ok": ok, "anchor": _live_anchor(f),
                                 "dur": _probe_dur(dst) if ok else None,
                                 "size": os.path.getsize(dst) if ok and os.path.exists(dst) else 0,
                                 "uploaded": False}
@@ -626,7 +651,8 @@ def run_ingestion(fb, cfg, pipeline_id: str, state: Dict, stopped: Dict, tracker
                 continue
             try:
                 client.register_video(game_id=game_uuid, s3_key=r["key"], angle=UBALL_ANGLE[angle],
-                                      filename=r["filename"], duration=r["dur"], file_size=r["size"])
+                                      filename=r["filename"], duration=r["dur"], file_size=r["size"],
+                                      start_wallclock=r.get("anchor"))
                 run.angle_done("register", angle)
                 registered_angles.append(angle)
             except Exception as e:  # noqa: BLE001

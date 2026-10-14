@@ -542,7 +542,8 @@ class UballClient:
         duration: Optional[float] = None,
         file_size: Optional[int] = None,
         file_hash: Optional[str] = None,
-        s3_bucket: str = 'uball-videos-production'
+        s3_bucket: str = 'uball-videos-production',
+        start_wallclock: Optional[str] = None
     ) -> Optional[Dict[str, Any]]:
         """
         Register a video in Uball Backend using confirm-upload endpoint.
@@ -556,6 +557,8 @@ class UballClient:
             file_size: Video file size in bytes
             file_hash: MD5 hash of the file (optional, will use placeholder if not provided)
             s3_bucket: S3 bucket name
+            start_wallclock: ISO time of the first frame on the live stream's clock; the
+                backend moves this game's live cards onto the master when it is set
 
         Returns:
             Created video metadata or None on failure
@@ -584,6 +587,8 @@ class UballClient:
 
             # Duration is required by video_metadata table - default to 0.0 if not provided
             payload["duration"] = duration if duration is not None else 0.0
+            if start_wallclock:
+                payload["start_wallclock"] = start_wallclock
 
             logger.info(f"[UballClient] Registering video with payload: {payload}")
 
