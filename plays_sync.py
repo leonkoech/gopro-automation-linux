@@ -408,17 +408,21 @@ def _cv_card(s: Dict[str, Any], firebase_game: Dict[str, Any], cv_points: Dict[s
     # included -- must never change that score. The team still picks the roster above.
 
 
-    from agx_pipeline.card_flag import CONFIDENCE, card_flag, is_paused
+    from agx_pipeline.card_confidence import card_confidence, flag_from_confidence
+    from agx_pipeline.card_flag import CONFIDENCE, is_paused
     ctx = ctx or {}
     _key = _shot_key(s)
     try:
         _ep = datetime.fromisoformat(s["wallclock"]).timestamp() if s.get("wallclock") else None
     except Exception:  # noqa: BLE001
         _ep = None
-    flag, why = card_flag(_v, _who, paused=is_paused(ctx.get("paused"), _ep),
-                          burst=bool(_key) and _key in (ctx.get("burst") or set()))
+    # measured confidence per answer (card_confidence.py); the weakest one sets the flag
+    conf = card_confidence(_v, _who, bool(s.get("made")), firebase_game.get("tracker_teams"))
+    flag, why = flag_from_confidence(conf, paused=is_paused(ctx.get("paused"), _ep),
+                                     burst=bool(_key) and _key in (ctx.get("burst") or set()))
     play_data["confidence"] = CONFIDENCE[flag]
-    play_data["events"][0].update({"confidence": CONFIDENCE[flag], "cv_flag": flag, "cv_flag_reason": why})
+    play_data["events"][0].update({"confidence": CONFIDENCE[flag], "cv_flag": flag, "cv_flag_reason": why,
+                                   "cv_conf": conf})
     play_data["note"] += f" · {flag.upper()}: {why}"
     play_data["events"][0]["cv_written"] = _card_fingerprint(play_data)
     play_data["_typed"] = typed

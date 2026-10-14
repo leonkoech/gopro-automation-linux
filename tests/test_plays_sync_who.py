@@ -123,7 +123,7 @@ class StoreClient(FakeClient):
 
 def _flag_game(cv):
     g = _game(cv)
-    g["tracker_teams"] = {"switch_epoch": None, "left_basket_first": "left"}
+    g["tracker_teams"] = {"switch_epoch": None, "left_basket_first": "left", "source": "numbers", "number_agreement": 0.8}
     return g
 
 
@@ -236,7 +236,8 @@ def test_looks_fill_a_silent_card_as_a_yellow_hint():
                                        "who_looks": {"n": "7", "conf": 0.8}}}), rosters=ROSTERS)
     card = c.created[0]
     assert "Looks like #7 Giovanni Garcia" in card["note"]
-    assert card["events"][0]["cv_flag"] == "yellow" and "appearance" in card["events"][0]["cv_flag_reason"]
+    assert card["events"][0]["cv_flag"] == "yellow" and "shooter" in card["events"][0]["cv_flag_reason"]
+    assert card["events"][0]["cv_conf"]["shooter"] == 0.83
 
 
 @pytest.mark.unit
