@@ -91,6 +91,9 @@ MAX_RESTARTS = int(os.getenv("LIVE_MAX_RESTARTS", "10"))
 # the clock on the wall clock; this is how far it may slip before one.
 PDT_DRIFT_MAX = float(os.getenv("LIVE_PDT_DRIFT_MAX_SEC", "3.0"))
 PDT_BASELINE_SEGS = 3   # segments after a (re)start that set the normal lag
+PDT_CONFIRM_SEGS = 3    # the newest segments that must ALL be past the limit (one late file is not a slip)
+# Own budget: a flaky-but-alive stream must never use up the restarts a dead pipeline needs.
+MAX_SLIP_RESTARTS = int(os.getenv("LIVE_MAX_SLIP_RESTARTS", "5"))
 
 
 def _pdt_slip(entries) -> Optional[float]:
@@ -100,13 +103,15 @@ def _pdt_slip(entries) -> Optional[float]:
     playlist order. written - (pdt + duration) is the normal pipeline lag (about -5 s:
     the clock runs ahead of the file write); it is constant while the clock keeps up and
     jumps when time is lost. Only the run after the last discontinuity counts, because a
-    restart re-anchors the clock. None until there is a baseline and a later segment."""
+    restart re-anchors the clock. The slip reported is the smallest of the newest
+    PDT_CONFIRM_SEGS, so it is past the limit only when all of them are. None until there
+    is a baseline and that many later segments."""
     start = max((i for i, e in enumerate(entries) if e[3]), default=0)
     run = [w - (p + d) for p, d, w, _ in entries[start:]]
-    if len(run) <= PDT_BASELINE_SEGS:
+    if len(run) < PDT_BASELINE_SEGS + PDT_CONFIRM_SEGS:
         return None
     base = sorted(run[:PDT_BASELINE_SEGS])[PDT_BASELINE_SEGS // 2]
-    return run[-1] - base
+    return min((x - base for x in run[-PDT_CONFIRM_SEGS:]), key=abs)
 
 
 def _now_iso() -> str:
@@ -139,6 +144,8 @@ class _AnglePublisher:
         self._log = None
         self._pgid: Optional[int] = None
         self.restarts = 0
+        self.slip_restarts = 0
+        self._slip_warned = False
 
     @property
     def cam(self):
@@ -344,8 +351,8 @@ class _AnglePublisher:
         return None
 
     def pdt_slip(self) -> Optional[float]:
-        """_pdt_slip() of this angle's playlist on disk."""
-        entries, pdt, dur, disc = [], None, None, False
+        """_pdt_slip() of this angle's playlist on disk (only the current run is stat-ed)."""
+        rows, pdt, dur, disc = [], None, None, False
         try:
             with open(self.playlist) as fh:
                 for line in fh:
@@ -353,15 +360,20 @@ class _AnglePublisher:
                     if line.startswith("#EXT-X-DISCONTINUITY"):
                         disc = True
                     elif line.startswith("#EXT-X-PROGRAM-DATE-TIME:"):
-                        pdt = datetime.strptime(line.split(":", 1)[1],
-                                                "%Y-%m-%dT%H:%M:%S.%f%z").timestamp()
+                        pdt = line.split(":", 1)[1]
                     elif line.startswith("#EXTINF:"):
                         dur = float(line[8:].rstrip(","))
                     elif line and not line.startswith("#") and pdt is not None and dur is not None:
-                        written = os.path.getmtime(os.path.join(self.dir, line))
-                        entries.append((pdt, dur, written, disc))
+                        rows.append((pdt, dur, line, disc))
                         pdt, dur, disc = None, None, False
-        except (OSError, ValueError):
+            start = max((i for i, r in enumerate(rows) if r[3]), default=0)
+            entries = [(datetime.strptime(p, "%Y-%m-%dT%H:%M:%S.%f%z").timestamp(), d,
+                        os.path.getmtime(os.path.join(self.dir, fn)), i == 0)
+                       for i, (p, d, fn, _) in enumerate(rows[start:])]
+        except (OSError, ValueError) as e:
+            if not self._slip_warned:       # once per run: a persistent cause must leave a trace
+                logger.warning("[LIVE] %s clock-slip check unavailable: %s", self.angle, e)
+                self._slip_warned = True
             return None
         return _pdt_slip(entries)
 
@@ -504,6 +516,8 @@ class LivePublisher:
                     threading.Thread(target=self.stop, daemon=True).start()
                     return
                 for a in self._angles:
+                    if self._stop_evt.is_set():
+                        return              # stop() is tearing the angles down; never respawn one
                     if not a.alive() and a.restarts < MAX_RESTARTS:
                         a.restarts += 1
                         a.consecutive_fails += 1
@@ -519,14 +533,27 @@ class LivePublisher:
                         # the bash wrapper, so its children can still be running
                         # and would otherwise keep writing beside the new ones.
                         a._teardown()
+                        if self._stop_evt.is_set():
+                            return
                         a.start()
                         continue
                     slip = a.pdt_slip() if a.alive() else None
-                    if slip is not None and abs(slip) > PDT_DRIFT_MAX and a.restarts < MAX_RESTARTS:
-                        a.restarts += 1
+                    if slip is not None and abs(slip) > PDT_DRIFT_MAX:
+                        if a.slip_restarts >= MAX_SLIP_RESTARTS:
+                            if a.slip_restarts == MAX_SLIP_RESTARTS:
+                                logger.error("[LIVE] %s clock slipped %.1fs but the %d slip restarts "
+                                             "are used up — cards on this angle will be off by it",
+                                             a.angle, slip, MAX_SLIP_RESTARTS)
+                                a.slip_restarts += 1     # log once
+                            continue
+                        a.slip_restarts += 1
                         logger.warning("[LIVE] %s clock slipped %.1fs from real time — restart "
-                                       "%d/%d to re-anchor it", a.angle, slip, a.restarts, MAX_RESTARTS)
+                                       "%d/%d to re-anchor it", a.angle, slip, a.slip_restarts,
+                                       MAX_SLIP_RESTARTS)
                         a._teardown()
+                        if self._stop_evt.is_set():
+                            return
+                        a._slip_warned = False
                         a.start()
                         continue
                     if a.alive() and a.segment_count() > 0:

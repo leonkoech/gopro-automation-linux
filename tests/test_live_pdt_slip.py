@@ -49,6 +49,21 @@ def test_a_restart_rebaselines_on_the_new_run():
 
 
 @pytest.mark.unit
+def test_one_late_segment_is_not_a_slip():
+    entries = _run(50)
+    p, d, w, disc = entries[-1]
+    entries[-1] = (p, d, w + 6.0, disc)                 # the newest file closed 6 s late
+    assert abs(_pdt_slip(entries)) < PDT_DRIFT_MAX
+
+
+@pytest.mark.unit
+def test_slip_is_confirmed_once_it_holds_for_the_newest_segments():
+    n_after = live_stream.PDT_CONFIRM_SEGS
+    assert _pdt_slip(_run(30 + n_after - 1, lost_at=30, lost=25.6)) < PDT_DRIFT_MAX
+    assert _pdt_slip(_run(30 + n_after, lost_at=30, lost=25.6)) == pytest.approx(25.6)
+
+
+@pytest.mark.unit
 def test_no_verdict_before_a_baseline_exists():
-    assert _pdt_slip(_run(live_stream.PDT_BASELINE_SEGS)) is None
+    assert _pdt_slip(_run(live_stream.PDT_BASELINE_SEGS + live_stream.PDT_CONFIRM_SEGS - 1)) is None
     assert _pdt_slip([]) is None
