@@ -67,3 +67,13 @@ def test_register_sends_start_wallclock(monkeypatch):
 @pytest.mark.unit
 def test_register_without_anchor_omits_the_field(monkeypatch):
     assert "start_wallclock" not in _register(monkeypatch)
+
+
+@pytest.mark.unit
+def test_anchor_kept_when_master_finalized_at_the_stop(master):
+    assert ingest._live_anchor({"path": master, "duration": 2675.0}, "2026-10-14T16:19:40.000000Z")
+
+
+@pytest.mark.unit
+def test_no_anchor_when_master_was_touched_long_after_the_stop(master):
+    assert ingest._live_anchor({"path": master, "duration": 2675.0}, "2026-10-14T15:59:44.000000Z") is None
