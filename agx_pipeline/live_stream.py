@@ -84,6 +84,29 @@ MAX_MIN = int(os.getenv("LIVE_MAX_MIN", "180"))
 MIN_FREE_GB = float(os.getenv("LIVE_MIN_FREE_GB", "40"))
 # Bounded so a camera that is genuinely gone does not spin forever.
 MAX_RESTARTS = int(os.getenv("LIVE_MAX_RESTARTS", "10"))
+# ffmpeg writes each segment's PROGRAM-DATE-TIME as the previous one plus its
+# duration, so time the pipeline loses (a decode/network pause) never reaches the
+# clock: on 14 Oct both angles' PDT fell 25.6 s behind real time at 14:40 and stayed
+# there, and every card made afterwards was stamped 26 s early. A restart re-anchors
+# the clock on the wall clock; this is how far it may slip before one.
+PDT_DRIFT_MAX = float(os.getenv("LIVE_PDT_DRIFT_MAX_SEC", "3.0"))
+PDT_BASELINE_SEGS = 3   # segments after a (re)start that set the normal lag
+
+
+def _pdt_slip(entries) -> Optional[float]:
+    """Seconds the PDT clock has fallen behind since this run of the publisher began.
+
+    entries: [(pdt_epoch, duration, written_epoch, discontinuity_before)] per segment, in
+    playlist order. written - (pdt + duration) is the normal pipeline lag (about -5 s:
+    the clock runs ahead of the file write); it is constant while the clock keeps up and
+    jumps when time is lost. Only the run after the last discontinuity counts, because a
+    restart re-anchors the clock. None until there is a baseline and a later segment."""
+    start = max((i for i, e in enumerate(entries) if e[3]), default=0)
+    run = [w - (p + d) for p, d, w, _ in entries[start:]]
+    if len(run) <= PDT_BASELINE_SEGS:
+        return None
+    base = sorted(run[:PDT_BASELINE_SEGS])[PDT_BASELINE_SEGS // 2]
+    return run[-1] - base
 
 
 def _now_iso() -> str:
@@ -320,6 +343,28 @@ class _AnglePublisher:
             pass
         return None
 
+    def pdt_slip(self) -> Optional[float]:
+        """_pdt_slip() of this angle's playlist on disk."""
+        entries, pdt, dur, disc = [], None, None, False
+        try:
+            with open(self.playlist) as fh:
+                for line in fh:
+                    line = line.strip()
+                    if line.startswith("#EXT-X-DISCONTINUITY"):
+                        disc = True
+                    elif line.startswith("#EXT-X-PROGRAM-DATE-TIME:"):
+                        pdt = datetime.strptime(line.split(":", 1)[1],
+                                                "%Y-%m-%dT%H:%M:%S.%f%z").timestamp()
+                    elif line.startswith("#EXTINF:"):
+                        dur = float(line[8:].rstrip(","))
+                    elif line and not line.startswith("#") and pdt is not None and dur is not None:
+                        written = os.path.getmtime(os.path.join(self.dir, line))
+                        entries.append((pdt, dur, written, disc))
+                        pdt, dur, disc = None, None, False
+        except (OSError, ValueError):
+            return None
+        return _pdt_slip(entries)
+
     def segment_count(self) -> int:
         try:
             return len([f for f in os.listdir(self.dir) if f.endswith(".ts")])
@@ -473,6 +518,14 @@ class LivePublisher:
                         # Tear the old group down first. `alive()` only watches
                         # the bash wrapper, so its children can still be running
                         # and would otherwise keep writing beside the new ones.
+                        a._teardown()
+                        a.start()
+                        continue
+                    slip = a.pdt_slip() if a.alive() else None
+                    if slip is not None and abs(slip) > PDT_DRIFT_MAX and a.restarts < MAX_RESTARTS:
+                        a.restarts += 1
+                        logger.warning("[LIVE] %s clock slipped %.1fs from real time — restart "
+                                       "%d/%d to re-anchor it", a.angle, slip, a.restarts, MAX_RESTARTS)
                         a._teardown()
                         a.start()
                         continue
