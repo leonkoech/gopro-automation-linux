@@ -690,8 +690,9 @@ class RecordingController:
         way it already keeps holes for frames lost to RTSP packet loss, and every
         angle stays on one shared timeline.
 
-        Returns {angle: {segments, restarts, inserted_s, gaps}} for the caller to
-        surface on the session/ingestion record."""
+        Returns {angle: {segments, restarts, inserted_s, gaps, end_epoch}} for the caller to
+        surface on the session/ingestion record. end_epoch is the last segment's mtime taken
+        before the rewrite, i.e. when the master's final frame was written."""
         with self._wd_lock:
             sess = self._sessions.get(label)
         if not sess:
@@ -707,6 +708,10 @@ class RecordingController:
                 continue
             durs = [self._seg_duration(p) for p in segs]
             gaps = self._stall_gaps(run, segs, durs)
+            try:      # the last segment ends at the stop, like an unstitched master
+                end_epoch = round(os.path.getmtime(segs[-1]), 3)
+            except OSError:
+                end_epoch = None
             inserted = round(sum(gaps), 3)
             tmp, lst = master + ".concat.mp4", master + ".concat.txt"
             try:
@@ -733,7 +738,8 @@ class RecordingController:
                     report[run["angle"]] = {
                         "segments": len(segs), "restarts": run.get("restart", 0),
                         "inserted_s": inserted,
-                        "gaps": [round(g, 3) for g in gaps[1:]]}
+                        "gaps": [round(g, 3) for g in gaps[1:]],
+                        "end_epoch": end_epoch}
                     logger.info("watchdog: concatenated %d segments for %s "
                                 "(re-inserted %.1fs of stall gap: %s)",
                                 len(segs), run["angle"], inserted,
