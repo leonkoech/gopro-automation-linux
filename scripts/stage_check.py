@@ -84,59 +84,73 @@ def check_who() -> Tuple[str, str]:
 
 
 def _detector_weight() -> str:
-    """The exact file the detector will open, resolved the way node.py resolves
-    it -- imported rather than re-derived, so this can never name a different
-    weight than production loads."""
+    """The .pt the detector will open, resolved the way node.py resolves it --
+    imported rather than re-derived, so this can never name a different file
+    than production loads."""
     from agx_pipeline.shot_detect import node  # noqa: PLC0415
     return os.getenv("SHOT_DET_WEIGHT", node._DEFAULT_WEIGHT)
 
 
 def check_detector(load: bool = False) -> Tuple[str, str]:
-    """Will the shot detector's weight actually load and run here?
+    """Is the detector going to run the engine it was configured with?
 
-    A1 adopts TensorRT by pointing SHOT_DET_WEIGHT at a .engine file. No code
-    changes, which is the appeal -- and the reason it needs a check. An engine is
-    built for one GPU and one TensorRT build, and a wrong one is indistinguishable
-    from a right one on disk: the path resolves, the service starts clean, and it
-    dies on the first shot of the game. We have also already been bitten by an
-    engine that loaded fine and then refused a single-frame predict because it
-    was exported at a fixed batch.
+    The detector runs a TensorRT engine when SHOT_DET_ENGINE points at one, and
+    the .pt whenever it cannot. The fallback is deliberate and it is also the
+    thing worth checking: a box configured for the engine and quietly running
+    the .pt works, at roughly half the speed, and says so only in a log line at
+    startup.
 
-    So the file checks always run, and `load` does the only thing that settles
-    it: build the model and push one frame through it at the production image
-    size. That costs GPU and seconds, so it stays opt-in (`--load`) and the
-    deploy gate is where it belongs.
+    Three ways that happens, all checked here: the engine file is gone, a GPU
+    fault disabled it and left the marker behind, or it loads and fails its
+    probe. The .pt is checked too, because it is now the fallback rather than
+    just the default -- if it is missing there is nothing to fall back to.
+
+    `load` runs the detector's own probe in a subprocess. It costs seconds and
+    a CUDA context, so it stays opt-in and belongs on a deploy gate.
     """
     try:
         weight = Path(_detector_weight())
     except Exception as exc:  # noqa: BLE001
         return BLOCKED, f"cannot resolve the detector weight: {exc}"
     if weight.is_symlink() and not weight.exists():
-        return BLOCKED, (f"weight is a DANGLING SYMLINK: {weight} -> "
+        return BLOCKED, (f"the .pt is a DANGLING SYMLINK: {weight} -> "
                          f"{os.readlink(weight)}")
     if not weight.is_file():
-        return BLOCKED, f"weight not found: {weight}"
+        return BLOCKED, f"the .pt is missing, so there is no fallback: {weight}"
 
-    engine = weight.suffix == ".engine"
-    backend = "TensorRT engine" if engine else f"PyTorch weight ({weight.suffix})"
-    if not load:
-        note = "" if engine else " — still PyTorch; A1 points this at a .engine"
-        return OK, f"{backend}: {weight}{note} (run with --load to prove it runs)"
+    engine = os.getenv("SHOT_DET_ENGINE", "").strip()
+    if not engine:
+        return OK, (f"PyTorch .pt: {weight} — SHOT_DET_ENGINE is not set, so the "
+                    f"engine is not in use")
 
-    imgsz = int(os.getenv("SHOT_DET_IMGSZ", "1280"))
+    # Reuse the detector's own marker path so the two cannot disagree about
+    # which file means "disabled".
     try:
-        import numpy as np  # noqa: PLC0415
-        from ultralytics import YOLO  # noqa: PLC0415
-        model = YOLO(str(weight))
-        # One frame, not a batch: a fixed-batch export loads happily and only
-        # fails here, which is the failure we actually hit.
-        model.predict(np.zeros((imgsz, imgsz, 3), dtype=np.uint8),
-                      imgsz=imgsz, verbose=False)
+        from agx_pipeline.shot_detect.detect import ENGINE_DISABLED_MARK  # noqa: PLC0415
     except Exception as exc:  # noqa: BLE001
-        return BLOCKED, (f"{backend} at {weight} did not run here (imgsz={imgsz}): "
-                         f"{exc}. An engine is tied to the GPU and the TensorRT "
-                         f"build it was exported on — re-export it on this box.")
-    return OK, f"{backend} loaded and ran one frame at imgsz={imgsz}: {weight}"
+        return BLOCKED, f"cannot import the detector: {exc}"
+    if os.path.exists(ENGINE_DISABLED_MARK):
+        return BLOCKED, (f"the engine was disabled after a GPU fault and the box "
+                         f"is on the .pt: delete {ENGINE_DISABLED_MARK} to "
+                         f"re-enable it")
+    if not Path(engine).is_file():
+        return BLOCKED, (f"SHOT_DET_ENGINE is set but the file is gone, so the "
+                         f"detector will run the .pt at about half speed: {engine}")
+
+    if not load:
+        return OK, f"TensorRT engine: {engine} (run with --load to prove it runs)"
+
+    try:
+        from agx_pipeline.shot_detect.detect import _probe_in_subprocess  # noqa: PLC0415
+        why = _probe_in_subprocess(engine)
+    except Exception as exc:  # noqa: BLE001
+        return BLOCKED, f"the probe itself failed: {exc}"
+    if why:
+        return BLOCKED, (f"the engine fails the detector's own probe ({why}), so "
+                         f"the box will run the .pt. An engine only runs on the "
+                         f"device and TensorRT version that built it — rebuild "
+                         f"with scripts/build_shot_engine.py")
+    return OK, f"TensorRT engine passed the detector's probe: {engine}"
 
 
 def check_eval() -> Tuple[str, str]:
@@ -162,14 +176,14 @@ def main(argv: Optional[List[str]] = ()) -> int:
     import argparse  # noqa: PLC0415
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--load", action="store_true",
-                    help="actually load the detector weight and run one frame "
-                         "through it (needs the GPU; the only way to catch a "
-                         "TensorRT engine built for another box)")
+                    help="run the detector's own probe against the TensorRT "
+                         "engine (needs the GPU; catches an engine built for "
+                         "another box or another TensorRT version)")
     args = ap.parse_args(argv)
 
     checks = (("TYPE (live typing)", check_typing),
               ("WHO (jersey scan)", check_who),
-              ("DETECTOR weight", lambda: check_detector(load=args.load)),
+              ("DETECTOR engine + .pt", lambda: check_detector(load=args.load)),
               ("TYPE eval harness", check_eval))
     print(f"stage check — SHOT_TYPING_CWD={TYPING_CWD}\n")
     failed = False
