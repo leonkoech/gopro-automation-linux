@@ -34,10 +34,17 @@ DET_IMGSZ = int(os.environ.get("SHOT_DET_IMGSZ", "1280"))
 DET_BATCH = int(os.environ.get("SHOT_DET_BATCH", "16"))  # GPU batch for inference
 ENGINE_MAX_BATCH = 16   # what scripts/build_shot_engine.py builds the TensorRT engine for
 ENGINE_MAX_IMGSZ = 640  # ... and the largest image side it accepts
-PROBE_TOL_PX = 3.0      # engine vs .pt on the probe ball (378 real segments: p95 0.14 px, max 3.5 px)
-PROBE_TIMEOUT_S = 180   # loading torch + the engine in a fresh process takes ~15 s on the Orin
+PROBE_TOL_PX = 3.0      # engine vs .pt on the probe ball/hoop (378 real segments: p95 0.14 px, max 3.5 px)
+PROBE_BATCHES = (1, 3, ENGINE_MAX_BATCH)   # the live loop runs full and partial batches
+PROBE_TIMEOUT_S = 90    # the child loads torch + the engine in ~9 s on the Orin
+ENGINE_STRIKES = 3      # ordinary engine exceptions tolerated before it is switched off
+# Written when the engine faults the GPU mid-run: the next service start then stays on the .pt
+# until someone looks (delete the file to re-enable).
+ENGINE_DISABLED_MARK = os.environ.get("SHOT_DET_ENGINE_DISABLED_MARK",
+                                      "/home/dev/shot_det_engine.DISABLED")
 _PROBE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "probe")
 BALL_CLASS = 0  # detector classes: 0 = Basketball, 1 = Basketball Hoop
+HOOP_CLASS = 1
 
 _log = logging.getLogger("agx.shot_detect")
 
@@ -56,22 +63,30 @@ def _best_ball(boxes):
     return best
 
 
+def _is_cuda_fault(e: Exception) -> bool:
+    """A CUDA fault (illegal address and the like) poisons the whole process's CUDA context."""
+    text = "%s %s" % (type(e).__name__, e)
+    return any(k in text for k in ("CUDA error", "cudaError", "AcceleratorError", "illegal memory"))
+
+
 class _EngineWithFallback:
-    """The TensorRT model behind the detector's one predict() door.
+    """The TensorRT model behind the detector's one predict() door, with the .pt beside it.
 
-    - A call the engine was not built for (an image side over ENGINE_MAX_IMGSZ, e.g. the shot rebuild
-      at 960 or a backtest at 1280, or more than ENGINE_MAX_BATCH frames) goes to the .pt; the engine
-      stays on for everyone else.
-    - One lock serialises every call: the live loop, the ingest confirm and auto-detect share this
-      detector, and a TensorRT execution context interleaved by two threads can return wrong boxes
-      without raising.
-    - If the engine fails a call it was built for, that call is answered by the .pt and the engine is
-      not used again in this process (the .pt is loaded once, under the lock)."""
+    - A call the engine was not built for (image side over ENGINE_MAX_IMGSZ, e.g. the shot rebuild at
+      960 or a backtest at 1280, or more than ENGINE_MAX_BATCH frames) goes to the .pt.
+    - Each model has its own lock: the live loop, ingest confirm and auto-detect share this detector,
+      and an interleaved TensorRT context can return wrong boxes without raising. A slow 960 px
+      rebuild on the .pt never blocks the live loop on the engine.
+    - The .pt is loaded up front, so no call ever waits on a model load.
+    - An ordinary engine exception is answered by the .pt; after ENGINE_STRIKES of them the engine is
+      off for this process. A CUDA fault switches it off at once and writes ENGINE_DISABLED_MARK:
+      the fault has poisoned this process's CUDA context, so the .pt may fail too until the service
+      restarts, and the restart must not walk back into the same engine."""
 
-    def __init__(self, engine, load_pt, owner):
-        self._engine, self._load_pt, self._owner, self._pt = engine, load_pt, owner, None
-        self._broken = False
-        self._lock = threading.Lock()
+    def __init__(self, engine, pt, owner):
+        self._engine, self._pt, self._owner = engine, pt, owner
+        self._engine_lock, self._pt_lock = threading.Lock(), threading.Lock()
+        self._strikes, self._off = 0, False
 
     @staticmethod
     def _fits(source, imgsz) -> bool:
@@ -79,42 +94,81 @@ class _EngineWithFallback:
         n = len(source) if isinstance(source, (list, tuple)) else 1
         return side is not None and int(side) <= ENGINE_MAX_IMGSZ and n <= ENGINE_MAX_BATCH
 
+    def _switch_off(self, why: str, fault: bool) -> None:
+        self._off = True
+        self._owner.backend = "pytorch"
+        if fault:
+            try:
+                with open(ENGINE_DISABLED_MARK, "w") as fh:
+                    fh.write("%s\n" % why)
+            except OSError:
+                pass
+            _log.critical("shot detector: TensorRT engine faulted the GPU mid-run (%s) — engine off, "
+                          "%s written; this process's CUDA may be unusable until the service restarts",
+                          why, ENGINE_DISABLED_MARK)
+        else:
+            _log.error("shot detector: TensorRT engine failed %d times (last: %s) — "
+                       "switching to the .pt for the rest of this process", self._strikes, why)
+
     def predict(self, source, imgsz=None, **kwargs):
-        with self._lock:
-            if not self._broken and self._fits(source, imgsz):
-                try:
-                    return self._engine.predict(source, imgsz=imgsz, **kwargs)
-                except Exception as e:  # noqa: BLE001 - any engine failure: the .pt from here on
-                    _log.error("shot detector: TensorRT engine failed mid-run (%s: %s) — "
-                               "switching to the .pt for the rest of this process",
-                               type(e).__name__, str(e)[:200])
-                    self._broken = True
-                    self._owner.backend = "pytorch"
-            if self._pt is None:
-                self._pt = self._load_pt()
+        if not self._off and self._fits(source, imgsz):
+            with self._engine_lock:
+                if not self._off:
+                    try:
+                        return self._engine.predict(source, imgsz=imgsz, **kwargs)
+                    except Exception as e:  # noqa: BLE001 - answered by the .pt below
+                        why = "%s: %s" % (type(e).__name__, str(e)[:200])
+                        self._strikes += 1
+                        if _is_cuda_fault(e):
+                            self._switch_off(why, fault=True)
+                        elif self._strikes >= ENGINE_STRIKES:
+                            self._switch_off(why, fault=False)
+                        else:
+                            _log.warning("shot detector: TensorRT engine call failed (%d/%d): %s — "
+                                         "this call answered by the .pt", self._strikes, ENGINE_STRIKES, why)
+        with self._pt_lock:
             return self._pt.predict(source, imgsz=imgsz, **kwargs)
 
 
+def _best_box(boxes, cls):
+    best = None
+    for b in boxes:
+        if int(b.cls.item()) == cls and (best is None or float(b.conf.item()) > float(best.conf.item())):
+            best = b
+    if best is None:
+        return None
+    x1, y1, x2, y2 = (float(v) for v in best.xyxy[0])
+    return (x1 + x2) / 2.0, (y1 + y2) / 2.0, x2 - x1, y2 - y1
+
+
 def _probe_ok(model, device) -> Optional[str]:
-    """None when the engine finds the fixture's ball where the .pt does, else why not.
+    """None when the engine answers the fixture the way the .pt does, else why not.
 
     A wrong engine does not always raise: one built for 640x640 alone found 39 of 3512 ball frames
-    (14 Oct 2026). So the probe is a real SL frame with a known ball (probe/probe_ball.json, the .pt's
-    answer), a full batch at the size the live loop uses, and every answer must hold that ball."""
+    (14 Oct 2026). The fixture is a real SL frame with the .pt's ball and hoop (probe/probe_ball.json).
+    It is run at the size the live loop uses, in full and partial batches (the live loop runs both),
+    and every answer must hold the ball (the track) and the hoop (the rim the make/miss is judged on)
+    within PROBE_TOL_PX of the .pt's."""
     import cv2
     want = json.load(open(os.path.join(_PROBE_DIR, "probe_ball.json")))
     frame = cv2.imread(os.path.join(_PROBE_DIR, "probe_ball.png"))
     if frame is None:
         return "probe frame missing"
-    results = model.predict([frame] * ENGINE_MAX_BATCH, imgsz=ENGINE_MAX_IMGSZ, conf=DET_CONF,
-                            verbose=False, device=device)
-    for r in results:
-        ball = _best_ball(r.boxes)
-        if ball is None:
-            return "probe ball not found"
-        off = ((ball[0] - want["ball_cx"]) ** 2 + (ball[1] - want["ball_cy"]) ** 2) ** 0.5
-        if off > PROBE_TOL_PX:
-            return "probe ball %.1f px from the .pt's" % off
+    for n in PROBE_BATCHES:
+        results = model.predict([frame] * n, imgsz=ENGINE_MAX_IMGSZ, conf=DET_CONF,
+                                verbose=False, device=device)
+        if len(results) != n:
+            return "batch %d: %d results" % (n, len(results))
+        for r in results:
+            ball, hoop = _best_box(r.boxes, BALL_CLASS), _best_box(r.boxes, HOOP_CLASS)
+            if ball is None or hoop is None:
+                return "batch %d: probe %s not found" % (n, "ball" if ball is None else "hoop")
+            checks = (("ball", ball[0] - want["ball_cx"], ball[1] - want["ball_cy"]),
+                      ("hoop", hoop[0] - want["hoop_cx"], hoop[1] - want["hoop_cy"]),
+                      ("hoop size", hoop[2] - want["hoop_w"], hoop[3] - want["hoop_h"]))
+            for what, dx, dy in checks:
+                if (dx * dx + dy * dy) ** 0.5 > PROBE_TOL_PX:
+                    return "batch %d: probe %s %.1f px from the .pt's" % (n, what, (dx * dx + dy * dy) ** 0.5)
     return None
 
 
@@ -124,28 +178,46 @@ def _probe_in_subprocess(path: str) -> Optional[str]:
     Measured 15 Oct: a bad engine can fail with a CUDA illegal memory access, which poisons the CUDA
     context of the whole process -- the .pt then fails too, so an in-process probe would take the
     detector down instead of falling back. In a child process the fault dies with the child."""
+    import signal
     import subprocess
     import sys
     code = ("import sys\n"
             "from ultralytics import YOLO\n"
             "from agx_pipeline.shot_detect.detect import _probe_ok\n"
             "why = _probe_ok(YOLO(sys.argv[1], task='detect'), 'cuda')\n"
-            "print('PROBE_OK' if why is None else 'PROBE_FAIL ' + why)\n")
+            "print('PROBE_OK' if why is None else 'PROBE_FAIL ' + why, flush=True)\n")
     root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     env = dict(os.environ, PYTHONPATH=os.pathsep.join(filter(None, [root, os.environ.get("PYTHONPATH")])))
-    try:
-        cp = subprocess.run([sys.executable, "-c", code, path], capture_output=True, text=True,
-                            timeout=PROBE_TIMEOUT_S, stdin=subprocess.DEVNULL, env=env, cwd=root)
-    except subprocess.TimeoutExpired:
-        return "probe timed out after %ds" % PROBE_TIMEOUT_S
-    lines = [ln for ln in cp.stdout.splitlines() if ln.startswith("PROBE_")]
+    import tempfile
+    with tempfile.TemporaryFile("w+") as out, tempfile.TemporaryFile("w+") as err:
+        # Files, not pipes, and its own process group: a child wedged in the GPU driver is killed
+        # with everything it started, and nothing here ever waits on it without a bound.
+        proc = subprocess.Popen([sys.executable, "-c", code, path], stdout=out, stderr=err,
+                                stdin=subprocess.DEVNULL, env=env, cwd=root, start_new_session=True)
+        try:
+            rc = proc.wait(timeout=PROBE_TIMEOUT_S)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except OSError:
+                pass
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass                    # unkillable (stuck in the driver): give up on it, never block
+            return "probe timed out after %ds" % PROBE_TIMEOUT_S
+        out.seek(0)
+        err.seek(0)
+        stdout, stderr = out.read(), err.read()
+    lines = [ln for ln in stdout.splitlines() if ln.startswith("PROBE_")]
     if lines and lines[-1] == "PROBE_OK":
         return None
     if lines:
         return lines[-1][len("PROBE_FAIL "):]
-    err_lines = cp.stderr.strip().splitlines() or ["no output"]
-    err = next((ln for ln in reversed(err_lines) if "Error" in ln), err_lines[-1])
-    return "probe process exited %d: %s" % (cp.returncode, err[:200])
+    err_lines = stderr.strip().splitlines() or ["no output"]
+    last = next((ln for ln in reversed(err_lines) if "Error: " in ln),       # the exception line
+                next((ln for ln in reversed(err_lines) if "Error" in ln), err_lines[-1]))
+    return "probe process exited %d: %s" % (rc, last[:200])
 
 
 class ShotDetector:
@@ -165,8 +237,8 @@ class ShotDetector:
             else "mps" if torch.backends.mps.is_available() else "cpu")
         self.backend = "pytorch"
         engine = self._load_engine(YOLO)
-        self.model = (_EngineWithFallback(engine, lambda: YOLO(weight_path), self)
-                      if engine is not None else YOLO(weight_path))
+        pt = YOLO(weight_path)
+        self.model = _EngineWithFallback(engine, pt, self) if engine is not None else pt
 
     def _load_engine(self, YOLO):
         """The TensorRT build of the same detector (SHOT_DET_ENGINE), or None to use the .pt.
@@ -182,6 +254,8 @@ class ShotDetector:
         why = None
         if not os.path.isfile(path):
             why = "file not found"
+        elif os.path.exists(ENGINE_DISABLED_MARK):
+            why = "disabled after a GPU fault (%s exists)" % ENGINE_DISABLED_MARK
         elif not str(self.device).startswith("cuda"):
             why = "no CUDA device"
         if why is None:

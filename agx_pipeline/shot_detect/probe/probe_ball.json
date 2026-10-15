@@ -1,1 +1,1 @@
-{"ball_cx": 421.1, "ball_cy": 102.8, "pt_conf": 0.881, "source": "seg_00082_SL.mp4 frame 128"}
+{"ball_cx": 421.1, "ball_cy": 102.8, "pt_conf": 0.881, "hoop_cx": 353.8, "hoop_cy": 246.8, "hoop_w": 221.1, "hoop_h": 207.6, "hoop_conf": 0.977, "source": "seg_00082_SL.mp4 frame 128 (game_20260821_011351), answers from ball_yolo26s_gray_hifps_v3_best.pt at imgsz 640"}
