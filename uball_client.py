@@ -224,6 +224,44 @@ class UballClient:
             logger.error(f"[UballClient] Create game error: {e}")
             return None
 
+    def update_game(self, game_id: str, fields: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """
+        Partial-update a game.
+
+        Used by ingest to fill in what was not knowable when the game was
+        created. A live-streamed game is created at tip-off (so the Live tab
+        has something to open) when the final score does not exist yet, so
+        ingest patches it in once the game is over.
+
+        Args:
+            game_id: Annotation game UUID
+            fields: Only the fields to change
+
+        Returns:
+            Updated game data, or None on failure
+        """
+        if not fields:
+            return None
+        if not self._ensure_authenticated():
+            logger.error("[UballClient] Failed to authenticate for game update")
+            return None
+        try:
+            response = requests.patch(
+                f"{self.backend_url}/api/games/{game_id}",
+                json=fields,
+                headers=self._get_headers(),
+                timeout=15
+            )
+            if response.status_code in (200, 201):
+                logger.info(f"[UballClient] Game {game_id} updated: {sorted(fields)}")
+                return response.json()
+            logger.error(f"[UballClient] Update game failed: "
+                         f"{response.status_code} - {response.text[:200]}")
+            return None
+        except Exception as e:
+            logger.error(f"[UballClient] Update game error: {e}")
+            return None
+
     def get_game_by_firebase_id(self, firebase_game_id: str) -> Optional[Dict[str, Any]]:
         """
         Get a game by its Firebase game ID.
@@ -414,6 +452,18 @@ class UballClient:
             logger.error(f"[UballClient] list_plays failed: {e}")
             return []
 
+    def update_play(self, play_id: str, fields: Dict[str, Any]) -> Dict[str, Any]:
+        """PATCH a play (only the given fields). Raises requests.HTTPError on failure."""
+        self._ensure_authenticated()
+        response = requests.patch(
+            f"{self.backend_url}/api/plays/{play_id}",
+            json=fields,
+            headers=self._get_headers(),
+            timeout=30
+        )
+        response.raise_for_status()
+        return response.json()
+
     def create_play(self, play_data: Dict[str, Any]) -> Dict[str, Any]:
         """
         Create a play in the annotation tool.
@@ -492,7 +542,8 @@ class UballClient:
         duration: Optional[float] = None,
         file_size: Optional[int] = None,
         file_hash: Optional[str] = None,
-        s3_bucket: str = 'uball-videos-production'
+        s3_bucket: str = 'uball-videos-production',
+        start_wallclock: Optional[str] = None
     ) -> Optional[Dict[str, Any]]:
         """
         Register a video in Uball Backend using confirm-upload endpoint.
@@ -506,6 +557,8 @@ class UballClient:
             file_size: Video file size in bytes
             file_hash: MD5 hash of the file (optional, will use placeholder if not provided)
             s3_bucket: S3 bucket name
+            start_wallclock: ISO time of the first frame on the live stream's clock; the
+                backend moves this game's live cards onto the master when it is set
 
         Returns:
             Created video metadata or None on failure
@@ -534,6 +587,8 @@ class UballClient:
 
             # Duration is required by video_metadata table - default to 0.0 if not provided
             payload["duration"] = duration if duration is not None else 0.0
+            if start_wallclock:
+                payload["start_wallclock"] = start_wallclock
 
             logger.info(f"[UballClient] Registering video with payload: {payload}")
 

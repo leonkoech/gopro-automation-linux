@@ -25,20 +25,30 @@ def tracker_queue_enabled() -> bool:
     return os.getenv("SHOT_TRACKER_QUEUE", "false").strip().lower() in ("1", "true", "yes", "on")
 
 
+def track_misses_enabled() -> bool:
+    """Missed shots go to the tracker too (shot type, shooter, team) -- a local clip only, never
+    a highlight. Needs the tracker queue. Default OFF: SHOT_TRACK_MISSES=true."""
+    return tracker_queue_enabled() and os.getenv("SHOT_TRACK_MISSES", "false").strip().lower() in (
+        "1", "true", "yes", "on")
+
+
 def job_path(queue_dir: str, state: str, game_id: str, log_id: str) -> str:
     return os.path.join(queue_dir, state, "%s__%s.json" % (game_id, log_id))
 
 
 def enqueue_tracker_job(game_id: str, log_id: str, angle: str, clip_path: str, pre_s: float,
                         s3_key: Optional[str], made: Optional[bool],
-                        queue_dir: Optional[str] = None) -> Optional[str]:
-    """Write the job atomically (tmp + rename) so the worker never reads half a file."""
+                        queue_dir: Optional[str] = None, extra: Optional[dict] = None) -> Optional[str]:
+    """Write the job atomically (tmp + rename) so the worker never reads half a file.
+    `extra` adds fields to the job (a raw, untrimmed clip carries raw/offset/dur)."""
     qd = queue_dir or QUEUE_DIR
     try:
         os.makedirs(os.path.join(qd, "pending"), exist_ok=True)
-        dst = job_path(qd, "pending", game_id, log_id)
+        # a miss and the make right after it can share cv_<epoch>_<side>: separate job files
+        dst = job_path(qd, "pending", game_id, log_id + ("_miss" if made is False else ""))
         job = {"game_id": game_id, "log_id": log_id, "angle": angle, "clip": clip_path,
                "pre": float(pre_s), "s3_key": s3_key, "made": made, "queued_at": time.time()}
+        job.update(extra or {})
         tmp = dst + ".tmp"
         with open(tmp, "w") as f:
             json.dump(job, f)

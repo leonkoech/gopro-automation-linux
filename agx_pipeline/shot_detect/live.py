@@ -70,7 +70,13 @@ def _seg_real_time(path: str, prev: Optional[tuple]) -> tuple:
     return close, gap
 
 POLL_SEC = float(os.getenv("SHOT_LIVE_POLL_SEC", "2"))
-DEDUP_SEC = float(os.getenv("SHOT_LIVE_DEDUP_SEC", "2.5"))   # same-side makes within this window = one shot
+# Same side, within this many seconds = one shot -- EXCEPT a make AFTER a miss,
+# which is always kept: a ball that bounces off and drops in (or is put back)
+# gets a MISS verdict and then a MAKE verdict, and dropping the second one as a
+# duplicate lost 21 of the 31 annotated makes missing over seven test games.
+# A make just BEFORE a miss stays a duplicate: that is the ball seen entering
+# the ring and then bouncing out (3 of 3 such makes were phantoms by eye).
+DEDUP_SEC = float(os.getenv("SHOT_LIVE_DEDUP_SEC", "2.5"))
 SHADOW_CAP = int(os.getenv("SHOT_LIVE_SHADOW_CAP", "500"))   # max shots kept in the shadow doc
 # Recall fixes (raise live recall from the fragmented-segment baseline):
 #  - WINDOW: scan [prev_segment + current] so a shot straddling a 4s boundary is
@@ -135,6 +141,11 @@ def clip_window(made: bool) -> tuple:
                 float(os.getenv("CV_CLIP_POST_MAKE_S", "2")))
     return (float(os.getenv("CV_CLIP_PRE_MISS_S", "3")),
             float(os.getenv("CV_CLIP_POST_MISS_S", "4")))
+
+
+def track_misses_enabled() -> bool:
+    from agx_pipeline.tracker_queue import track_misses_enabled as _on
+    return _on()
 
 
 def autoscore_enabled() -> bool:
@@ -226,7 +237,7 @@ class LiveShotScorer:
         self._confirm_keep: Dict[str, Dict[int, str]] = {}  # angle -> {idx: path} to re-read at full rate
         self._seg_reals: Dict[str, List[float]] = {}        # angle -> measured segment durations (s)
         processed: set = set()
-        scored: List[Dict] = []          # {wallclock_epoch, side} — dedup ledger
+        scored: List[Dict] = []          # {wallclock_epoch, side, made} — dedup ledger
         shadow: List[Dict] = []          # detections for the shadow field
         n_seg = 0
         backlog = {"now": 0, "max": 0}   # unprocessed-closed-segments queue depth
@@ -415,14 +426,15 @@ class LiveShotScorer:
                 # the shot, and let the drift show up in latency_s as before.
                 wc_iso = self._wallclock(spawned_iso, window_base + t_shot)
                 wc_epoch = self._epoch(wc_iso)
-            if self._is_dup(scored, wc_epoch, side):
+            made = v["verdict"] == "MAKE"
+            if self._is_dup(scored, wc_epoch, side, made):
                 continue   # overlap between consecutive windows -> one shot
-            scored.append({"wc": wc_epoch, "side": side})
+            scored.append({"wc": wc_epoch, "side": side, "made": made})
             # latency_s: shot happened (wallclock) -> verdict now. THE number the
             # green-button target is tuned on; scan_s isolates the decode+infer
             # share of it per window.
             rec = {"cam": angle, "side": side, "seg": base_idx,
-                   "t_shot": round(t_shot, 3), "made": v["verdict"] == "MAKE",
+                   "t_shot": round(t_shot, 3), "made": made,
                    "verdict": v["verdict"], "rho": v.get("rho"),
                    "wallclock": wc_iso, "detected_at": _utcnow_iso(),
                    "latency_s": (round(time.time() - wc_epoch, 1)
@@ -444,6 +456,10 @@ class LiveShotScorer:
             # miss needs a timestamp, not a clip.
             if rec["made"] and autohighlight_enabled():
                 self._maybe_highlight(game_id, rec)
+            elif not rec["made"] and track_misses_enabled():
+                # still no highlight for a miss -- only a local clip for the possession
+                # tracker (type, shooter, team onto its card), joined by stream copy
+                self._maybe_track_miss(game_id, rec)
         self._advance_prev(prev_seg, angle, idx, path)
 
     def _concat(self, a: str, b: str) -> Optional[str]:
@@ -518,6 +534,25 @@ class LiveShotScorer:
                         shot.get("latency_s"), resp)
         except Exception as e:  # noqa: BLE001 — never break the detector
             logger.warning("shot-live auto-highlight failed for %s: %s", cmd["logId"], e)
+
+    def _maybe_track_miss(self, game_id: str, shot: Dict) -> None:
+        """Ask the service for a tracker-only clip of a CV miss (same id scheme as a make,
+        `cv_<epoch>_<side>`; the window is the make's, which the tracker was built on).
+        Best-effort: a failure leaves the miss an untyped card, as before."""
+        if self._on_make is None:
+            return
+        wc, side = shot.get("wallclock"), shot.get("side")
+        epoch = self._epoch(wc)
+        if not (wc and epoch and side in ("left", "right")):
+            return
+        pre_s, post_s = clip_window(True)
+        cmd = {"logId": f"cv_{int(epoch)}_{side}", "ts": wc, "side": side,
+               "firebase_game_id": game_id, "pre": pre_s, "post": post_s,
+               "made": False, "track_only": True}
+        try:
+            self._on_make(cmd)
+        except Exception as e:  # noqa: BLE001 — never break the detector
+            logger.warning("shot-live tracker clip failed for %s: %s", cmd["logId"], e)
 
     def _maybe_autoscore(self, game_id: str, shot: Dict, starting_side: Optional[str]) -> None:
         """Phase C: turn a CV make into +2 on the live scoreboard. Deliberately a
@@ -632,11 +667,16 @@ class LiveShotScorer:
         return out
 
     @staticmethod
-    def _is_dup(scored: List[Dict], wc_epoch: Optional[float], side: Optional[str]) -> bool:
+    def _is_dup(scored: List[Dict], wc_epoch: Optional[float], side: Optional[str],
+                made: bool = False) -> bool:
+        """A miss repeats any shot near it; a make repeats a nearby make, or a
+        nearby miss that is not before it."""
         if wc_epoch is None:
             return False
         return any(s["side"] == side and s["wc"] is not None
-                   and abs(s["wc"] - wc_epoch) <= DEDUP_SEC for s in scored)
+                   and abs(s["wc"] - wc_epoch) <= DEDUP_SEC
+                   and (not made or s.get("made", True) or s["wc"] >= wc_epoch)
+                   for s in scored)
 
     @staticmethod
     def _wallclock(spawned_iso: Optional[str], t: float) -> Optional[str]:

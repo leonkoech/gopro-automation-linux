@@ -67,6 +67,13 @@ MAX_PARALLEL = int(os.getenv("TRANSCODE_PARALLEL", "2"))
 # MAX_PARALLEL if a game is being captured. See _stage1_parallel().
 MAX_PARALLEL_IDLE = int(os.getenv("TRANSCODE_PARALLEL_IDLE", "4"))
 UBALL_ANGLE = {"FL": "LEFT", "FR": "RIGHT"}  # registered angles (annotation is 2-angle today)
+# How far the live stream's PROGRAM-DATE-TIME runs ahead of the master: a frame the
+# master holds at box time T is stamped about T + 5 s in the live HLS (decode, encode and mux in
+# the publisher). Frame-matched on the 14 Oct test game, the anchor below lands 0.01 s (FL) and
+# 0.06-0.14 s (FR) from the true one; the burned-in clock gave +5.06 s on 8 Oct. Live cards
+# carry that PDT, so the anchor is shifted the same way.
+LIVE_PDT_LAG_SEC = float(os.getenv("LIVE_PDT_LAG_SEC", "5.0"))
+ANCHOR_STOP_TOLERANCE_SEC = 300.0   # a master finalizes seconds after the stop; minutes = touched since
 SETTINGS_COLLECTION = "agx-settings"
 TRANSCODE_DEFAULT = os.getenv("TRANSCODE_ENABLED", "true").lower() in ("1", "true", "yes")
 
@@ -272,6 +279,37 @@ def _probe_dur(path: str) -> Optional[float]:
         return None
 
 
+def _live_anchor(f: Dict, stopped_at: Optional[str] = None) -> Optional[str]:
+    """The master's first frame on the live stream's clock (ISO, UTC), for the live-card rebase.
+
+    A finalized master's mtime is when its last frame was written, so mtime - duration is when
+    the first one arrived. A master the watchdog stitched from restart segments is rewritten
+    after stop, so its own mtime is useless; the recorder keeps the last segment's mtime from
+    before the rewrite (stall.end_epoch), and the stitched duration already holds the
+    re-inserted gaps. None when the end cannot be trusted -- its live cards then stay pending
+    and can still be rebased by hand (POST /live/games/{id}/rebase):
+      - a stitched master without end_epoch (recorded before this was kept);
+      - a master whose end is far from the recorder's stop (copied, repaired or restored)."""
+    stall = f.get("stall")
+    try:
+        dur = float(f["duration"])
+        end = float(stall["end_epoch"]) if stall else os.path.getmtime(f["path"])
+    except (KeyError, TypeError, ValueError, OSError):
+        return None
+    if dur <= 0:
+        return None
+    if stopped_at:
+        try:
+            stop = datetime.fromisoformat(stopped_at.replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            stop = None
+        if stop is not None and abs(end - stop) > ANCHOR_STOP_TOLERANCE_SEC:
+            logger.warning("no live anchor for %s: master ends %.0fs from the stop", f.get("angle"),
+                           end - stop)
+            return None
+    return datetime.fromtimestamp(end - dur + LIVE_PDT_LAG_SEC, timezone.utc).isoformat()
+
+
 _s3_lock = threading.Lock()
 _s3_singleton = None
 
@@ -366,13 +404,23 @@ def _resolve_checkin_roster(fb, game: Dict) -> "tuple[Optional[list], Optional[l
     return roster1, roster2
 
 
-def _create_or_get_game(client, fb, game: Dict, firebase_game_id: str, date: str) -> Optional[Dict]:
+def _create_or_get_game(client, fb, game: Dict, firebase_game_id: str, date: str,
+                        final: bool = True) -> Optional[Dict]:
+    """Find or create the annotation game for a firebase game.
+
+    `final=False` is the live-publisher path, which runs at TIP-OFF: the final
+    score does not exist yet, so it is left unset rather than written as 0-0.
+    Ingest then calls this with `final=True` after the game and fills in what
+    was not knowable at the start — see `_backfill_live_game`.
+    """
     existing = client.get_game_by_firebase_id(firebase_game_id) if firebase_game_id else None
     # Reuse ONLY on an exact firebase-id match — a fuzzy/arbitrary match here
     # attaches this recording's uploads to another game's S3 keys (the
     # 2026-08-13 manual-recording overwrite). No firebase game => always a NEW
     # annotation game.
     if existing and existing.get("firebase_game_id") == firebase_game_id:
+        if final:
+            _backfill_live_game(client, fb, game, existing)
         return existing
     left, right = game.get("leftTeam", {}) or {}, game.get("rightTeam", {}) or {}
     roster1, roster2 = _resolve_checkin_roster(fb, game)
@@ -395,9 +443,13 @@ def _create_or_get_game(client, fb, game: Dict, firebase_game_id: str, date: str
         # be born with the new convention; the annotation tool only sets it for
         # games created through its own UI, not for ones we create here.
         "timestamps_in_base_coords": True,
-        "team1_score": left.get("finalScore"),
-        "team2_score": right.get("finalScore"),
     }
+    # At tip-off `finalScore` is 0-0 for every game. Writing that would be
+    # indistinguishable from a real 0-0 and nothing would ever correct it, so
+    # the live path leaves the scores NULL and ingest fills them in later.
+    if final:
+        payload["team1_score"] = left.get("finalScore")
+        payload["team2_score"] = right.get("finalScore")
     # Only send rosters when we actually have them, so an empty list never
     # overwrites anything and matches the /api/games/sync payload shape.
     if roster1:
@@ -405,6 +457,35 @@ def _create_or_get_game(client, fb, game: Dict, firebase_game_id: str, date: str
     if roster2:
         payload["roster_team2"] = roster2
     return client.create_game(payload)
+
+
+def _backfill_live_game(client, fb, game: Dict, existing: Dict) -> None:
+    """Fill in what a tip-off-created game could not know yet.
+
+    A game streamed live is created when it starts, so its final score is NULL
+    and its roster may be empty (players check in after the game is created).
+    Only ever fills a hole: a score already on the row is left alone, so an
+    annotator's correction is never overwritten and a re-run is a no-op.
+    """
+    left, right = game.get("leftTeam", {}) or {}, game.get("rightTeam", {}) or {}
+    fields: Dict = {}
+    if existing.get("team1_score") is None and left.get("finalScore") is not None:
+        fields["team1_score"] = left.get("finalScore")
+    if existing.get("team2_score") is None and right.get("finalScore") is not None:
+        fields["team2_score"] = right.get("finalScore")
+    if not existing.get("roster_team1") or not existing.get("roster_team2"):
+        roster1, roster2 = _resolve_checkin_roster(fb, game)
+        if roster1 and not existing.get("roster_team1"):
+            fields["roster_team1"] = roster1
+        if roster2 and not existing.get("roster_team2"):
+            fields["roster_team2"] = roster2
+    if not fields:
+        return
+    try:
+        client.update_game(existing["id"], fields)
+    except Exception as e:  # noqa: BLE001
+        # Never fail ingestion over a backfill — the footage matters more.
+        logger.warning("live-game backfill failed for %s: %s", existing.get("id"), e)
 
 
 def _notify_annotators_ready(cfg, date: str, game: Dict, game_uuid: Optional[str]) -> None:
@@ -512,7 +593,7 @@ def run_ingestion(fb, cfg, pipeline_id: str, state: Dict, stopped: Dict, tracker
                 if throttled:
                     _capture_throttle.release()
             return f["angle"], {"src": f["path"], "dst": dst, "filename": fn,
-                                "key": key, "ok": ok,
+                                "key": key, "ok": ok, "anchor": _live_anchor(f, stopped.get("stopped_at")),
                                 "dur": _probe_dur(dst) if ok else None,
                                 "size": os.path.getsize(dst) if ok and os.path.exists(dst) else 0,
                                 "uploaded": False}
@@ -583,7 +664,8 @@ def run_ingestion(fb, cfg, pipeline_id: str, state: Dict, stopped: Dict, tracker
                 continue
             try:
                 client.register_video(game_id=game_uuid, s3_key=r["key"], angle=UBALL_ANGLE[angle],
-                                      filename=r["filename"], duration=r["dur"], file_size=r["size"])
+                                      filename=r["filename"], duration=r["dur"], file_size=r["size"],
+                                      start_wallclock=r.get("anchor"))
                 run.angle_done("register", angle)
                 registered_angles.append(angle)
             except Exception as e:  # noqa: BLE001
@@ -746,9 +828,13 @@ def run_ingestion(fb, cfg, pipeline_id: str, state: Dict, stopped: Dict, tracker
                 else:
                     run.set_shot_detection(0, 0, 0, 0, 0, source="live", status="none")
                 if SHOT_CARDS_ENABLED and client and game_uuid and live.get("shots"):
-                    from plays_sync import create_plays_from_shot_live
+                    from plays_sync import create_plays_from_shot_live, rosters_from_annotation_game
                     csum: Dict = {}
-                    n_cv = create_plays_from_shot_live(client, game_uuid, fresh, summary=csum)
+                    try:   # jersey suggestions only from the shooting team's roster, with names
+                        rosters = rosters_from_annotation_game(client.get_game_by_firebase_id(firebase_game_id))
+                    except Exception:  # noqa: BLE001 - suggestions fall back to the plain number
+                        rosters = {}
+                    n_cv = create_plays_from_shot_live(client, game_uuid, fresh, summary=csum, rosters=rosters)
                     run.log("info", f"CV cards: {n_cv} created"
                             + (" (skipped — already carded)" if csum.get("skipped_existing") else ""))
             except Exception as e:  # noqa: BLE001

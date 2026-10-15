@@ -109,9 +109,19 @@ def build_reel(firebase_game_id: str, game: Dict, game_date: Optional[str] = Non
         if lg.get("id"):
             running[str(lg["id"])] = (l_run, r_run)
 
+    # Warm-ups, half-time / timeout shootarounds and post-game shooting: CV clips from a burst of
+    # makes at one basket are not game play (see agx_pipeline/deadball.py). CORE_REEL_DROP_DENSE=false
+    # keeps them.
+    from agx_pipeline import deadball
+    dense = deadball.dense_shooting(highlights.keys()) if deadball.enabled() else set()
+    if dense:
+        logger.info("core highlight %s: %d dense-shooting CV clips left out", firebase_game_id, len(dense))
+
     clips: List[Dict] = []
     for log_id, h in highlights.items():
         if h.get("status") != "ready" or not h.get("url"):
+            continue
+        if str(log_id) in dense:
             continue
         # A CV-detected MISS is cut and stored (the typing stage needs it) but
         # is not normally a highlight: Core cannot tell one from a make -- a clip

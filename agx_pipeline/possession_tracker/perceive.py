@@ -49,10 +49,21 @@ def load_frames(clip, rim_t):
     return full, np.array(times), fps
 
 
-def sam3_players(full):
+_MODELS = {}       # keep=True: loaded once and reused across clips (a long-running worker)
+
+
+def _sam3(keep):
+    if "sam3" in _MODELS:
+        return _MODELS["sam3"]
     from transformers import Sam3VideoModel, Sam3VideoProcessor
-    proc = Sam3VideoProcessor.from_pretrained(SAM3)
-    model = Sam3VideoModel.from_pretrained(SAM3, dtype=DTYPE).to(DEV).eval()
+    pm = (Sam3VideoProcessor.from_pretrained(SAM3), Sam3VideoModel.from_pretrained(SAM3, dtype=DTYPE).to(DEV).eval())
+    if keep:
+        _MODELS["sam3"] = pm
+    return pm
+
+
+def sam3_players(full, keep=False):
+    proc, model = _sam3(keep)
     H0, W0 = full[0].shape[:2]
     sc = SAM_W / float(W0)
     sh = int(round(H0 * sc))
@@ -77,14 +88,18 @@ def sam3_players(full):
                 m = cv2.resize(m.astype(np.uint8), (SAM_W // MASK_DS, sh // MASK_DS),
                                interpolation=cv2.INTER_NEAREST) > 0
                 masks.append(np.packbits(m))
-    del model, proc, sess
+    del sess
+    if not keep:
+        del model, proc
     torch.cuda.empty_cache()
     return np.array(rows, float).reshape(-1, 7), np.array(masks), (sh // MASK_DS, SAM_W // MASK_DS)
 
 
-def detections(full):
+def detections(full, keep=False):
     from ultralytics import YOLO
-    m = YOLO(BALL_W)
+    m = _MODELS.get("ball") or YOLO(BALL_W)
+    if keep:
+        _MODELS["ball"] = m
     rows = []                         # (frame, cls, conf, x1, y1, x2, y2); cls 0 ball, 1 hoop
     for i in range(0, len(full), 8):
         for k, r in enumerate(m.predict(full[i:i + 8], imgsz=1280, conf=0.05, verbose=False, device=DEV)):
@@ -94,20 +109,24 @@ def detections(full):
     return np.array(rows, float).reshape(-1, 7)
 
 
-def main():
-    clip, out = sys.argv[1:3]
-    rim_t = float(sys.argv[3]) if len(sys.argv) > 3 else 5.0
+def perceive(clip, out, rim_t=5.0, keep=False):
+    """Perceive one clip into <out>/cache/<name>.npz; returns (name, seconds)."""
     name = os.path.splitext(os.path.basename(clip))[0]
     os.makedirs(os.path.join(out, "cache"), exist_ok=True)
     t0 = time.time()
     full, times, fps = load_frames(clip, rim_t)
-    players, masks, mshape = sam3_players(full)
-    dets = detections(full)
+    players, masks, mshape = sam3_players(full, keep)
+    dets = detections(full, keep)
     np.savez_compressed(os.path.join(out, "cache", name + ".npz"), times=times, rim_t=rim_t,
                         players=players, masks=masks, mask_shape=mshape, dets=dets,
                         frame_shape=full[0].shape[:2], sam_w=SAM_W, mask_ds=MASK_DS)
     print(name, "frames", len(full), "player rows", len(players), "dets", len(dets),
           "%.0fs" % (time.time() - t0), flush=True)
+    return name, time.time() - t0
+
+
+def main():
+    perceive(sys.argv[1], sys.argv[2], float(sys.argv[3]) if len(sys.argv) > 3 else 5.0)
 
 
 if __name__ == "__main__":

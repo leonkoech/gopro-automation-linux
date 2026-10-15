@@ -59,12 +59,15 @@ def _flag(name, default):
 QUEUE = os.environ.get("TRACKER_QUEUE_DIR", "/home/dev/possession/queue")
 USE_SAM3 = _flag("TRACKER_SAM3", "false")
 SAM3_MAX = int(os.environ.get("TRACKER_SAM3_MAX_PER_GAME", "6"))
+REFRESH_CARDS = os.environ.get("TRACKER_REFRESH_CARDS", "true").lower() in ("1", "true", "yes")
 SAM3_NEAR_PX = float(os.environ.get("TRACKER_SAM3_NEAR_PX", "40"))
 DO_2K = _flag("TRACKER_2K", "true")
 TV_2K = _flag("TRACKER_TV_2K", "false")
 PUBLISH = _flag("TRACKER_PUBLISH_CORE", "true")
 WHO = _flag("TRACKER_WHO", "false")
 WHO_EXTEND = _flag("TRACKER_WHO_EXTEND", "false")
+LOOKS = _flag("TRACKER_LOOKS", "false")       # appearance model: name a shooter whose number is hidden
+LOOKS_DIR = os.environ.get("TRACKER_LOOKS_DIR", "/home/dev/possession/looks")
 WHO_PYSRC = os.environ.get("TRACKER_WHO_PYSRC", "/home/dev/who_deps_staging/pysrc")
 BACKLOG_MAX = int(os.environ.get("TRACKER_BACKLOG_MAX", "6"))
 BUCKET = os.environ.get("UPLOAD_BUCKET", "uball-videos-production")
@@ -180,12 +183,30 @@ def track(clip, cam, name, work, pre, how):
 
 
 def stage_clip(job, work):
-    """Copy the clip into the work dir under a name that carries the camera (FL_/FR_)."""
+    """Put the clip into the work dir under a name that carries the camera (FL_/FR_). A RAW job
+    (a missed shot: untrimmed 4K buffer segments) is trimmed and scaled here to the same 1080p,
+    30 fps shape as a highlight clip."""
     cam = job["angle"]
     name = "%s_%s" % (cam, job["log_id"])
     dst = os.path.join(work, name + ".mp4")
-    shutil.copyfile(job["clip"], dst)
+    if job.get("raw"):
+        subprocess.run(["nice", "-n", "19", "ionice", "-c3", "ffmpeg", "-nostdin", "-y", "-loglevel", "error",
+                        "-ss", "%.2f" % float(job.get("offset") or 0.0), "-i", job["clip"],
+                        "-t", "%.2f" % float(job.get("dur") or 7.0), "-vf", "scale=1920:1080",
+                        "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-r", "30", "-vsync", "cfr",
+                        "-g", "30", "-an", dst], capture_output=True, text=True, timeout=600, check=True)
+    else:
+        shutil.copyfile(job["clip"], dst)
     return name, dst
+
+
+def drop_raw(job):
+    """A raw miss clip is only the tracker's: remove it once the job is finished."""
+    if job.get("raw"):
+        try:
+            os.remove(job["clip"])
+        except OSError:
+            pass
 
 
 def write_type(job, zone, source, extra):
@@ -193,7 +214,12 @@ def write_type(job, zone, source, extra):
            "typed_at": datetime.now(timezone.utc).isoformat(), "confidence": 0.9 if source == "sam3" else 0.8,
            "zone_source": "tracker_" + source}
     rec.update(extra)
-    game_doc(job["game_id"]).set({"cv_points": {job["log_id"]: rec}}, merge=True)
+    # a missed shot's verdict lives beside the makes', never among them: cv_points feeds the
+    # scorecard and the reel, and a miss can share its id with the make that follows it
+    field = "cv_misses" if job.get("made") is False else "cv_points"
+    if field == "cv_misses":
+        rec.update(points=0, made=False)
+    game_doc(job["game_id"]).set({field: {job["log_id"]: rec}}, merge=True)
 
 
 def render_2k(job, work, name, S, res, zone):
@@ -240,7 +266,8 @@ def read_who(clip, res, shot, job=None):
     import who_eval as W
     boxes = (res.get("tracks") or {}).get(str(shot["shooter"]), [])
     reads = W.read_track(jersey_stack(), clip, boxes)
-    if WHO_EXTEND and job is not None and W.speak(reads, None) is None:
+    who_from = "clip" if W.speak(reads, None) is not None else None
+    if WHO_EXTEND and job is not None and who_from is None:
         try:
             import who_extend_live as XL
             n0 = len(reads)
@@ -249,12 +276,14 @@ def read_who(clip, res, shot, job=None):
         except Exception as e:  # noqa: BLE001 - the clip-only answer stands
             job["who_extend_error"] = "%s: %s" % (type(e).__name__, e)
     num = W.speak(reads, None)
+    if num is not None and who_from is None:
+        who_from = "timeline"          # found only after following the player back
     votes = {}
     for n, c in reads:
         if c >= W.READ_MIN:
             votes[n] = round(votes.get(n, 0) + c, 2)
     top = sorted(votes.items(), key=lambda kv: -kv[1])[:3]
-    return num, top
+    return num, top, who_from
 
 
 def process_fast(name, job):
@@ -278,11 +307,26 @@ def process_fast(name, job):
                 job["kit_error"] = "%s: %s" % (type(e).__name__, e)
         if WHO and shot is not None:
             try:
-                num, top = read_who(clip, res, shot, job)
+                num, top, who_from = read_who(clip, res, shot, job)
                 job["who"] = num
-                extra.update({"who": num, "who_votes": dict(top), "who_source": "tracker"})
+                extra.update({"who": num, "who_votes": dict(top), "who_source": "tracker", "who_from": who_from})
             except Exception as e:  # noqa: BLE001 - WHO never blocks the type
                 job["who_error"] = "%s: %s" % (type(e).__name__, e)
+        if LOOKS:
+            # every player's reads + appearance in this clip, kept beside the queue until the
+            # game ends: the per-game model that names shooters by their looks is fitted then
+            try:
+                import holder as H
+                import looks as LK
+                t1 = time.time()
+                rec = LK.collect(jersey_stack(), S, clip, None if shot is None else shot["shooter"],
+                                 H.off_court_tracks(S, H.Camera(job["angle"])))
+                lid = job["log_id"].split("_")
+                LK.save(os.path.join(LOOKS_DIR, job["game_id"], name[:-5].split("__", 1)[1] + ".npz"), rec,
+                        {"side": lid[2], "epoch": float(lid[1]), "made": job.get("made")})
+                job["looks_s"] = round(time.time() - t1, 1)
+            except Exception as e:  # noqa: BLE001 - the number read stands on its own
+                job["looks_error"] = "%s: %s" % (type(e).__name__, e)
         if zone:
             job["line_px"] = round(line_px(job["angle"], feet), 1)
             write_type(job, zone, "fast", dict(extra, feet_px=[round(v) for v in feet], line_px=job["line_px"]))
@@ -298,8 +342,10 @@ def process_fast(name, job):
         move(name, "pending", "sam3", job)
         log("%s fast=%s line=%s -> SAM3 queue (%.0fs)" % (job["log_id"], zone, job.get("line_px"), job["fast_s"]))
     else:
+        drop_raw(job)
         move(name, "pending", "done", job)
-        log("%s fast=%s line=%s 2k=%s who=%s (%.0fs)" % (job["log_id"], zone, job.get("line_px"),
+        log("%s%s fast=%s line=%s 2k=%s who=%s (%.0fs)" % (job["log_id"], " MISS" if job.get("made") is False else "",
+                                                         zone, job.get("line_px"),
                                                          "yes" if job.get("url_2k") else "no", job.get("who"), job["fast_s"]))
 
 
@@ -322,10 +368,13 @@ def maybe_publish():
         return
     games = {f.split("__")[0] for st in ("done", "failed") for f in os.listdir(qpath(st)) if f.endswith(".json")}
     for g in games:
-        if jobs("pending", g):
-            continue
+        pend = jobs("pending", g)
+        if any(j.get("made") is not False for _, j in pend):
+            continue                    # makes still to do: the reel is not ready
         n_done = len(jobs("done", g))
         if os.path.exists(qpath("published", g)):
+            if pend:
+                continue                # published once the makes were done; again when the misses are
             try:
                 if json.load(open(qpath("published", g))).get("done", 0) >= n_done:
                     continue            # nothing new since the last publish
@@ -334,10 +383,24 @@ def maybe_publish():
         d = game_doc(g).get().to_dict() or {}
         if d.get("status") != "completed" and not d.get("endedAt"):
             continue
-        # team for every shot: one half-time switch found from the shooters' kit colours
+        # the two rosters (from the annotation game, once ingest or tip-off has made it): the team
+        # call reads them against the jersey numbers, and the card refresh below names players
+        ag, rosters = None, {}
+        try:
+            sys.path.insert(0, "/home/dev/gopro-automation-linux")
+            from uball_client import UballClient
+            from plays_sync import rosters_from_annotation_game
+            uc = UballClient()
+            ag = uc.get_game_by_firebase_id(g)
+            rosters = rosters_from_annotation_game(ag) if ag else {}
+        except Exception as e:  # noqa: BLE001 - the team call falls back to kit colour alone
+            log("roster lookup failed for %s: %s" % (g, e))
+        # team for every shot: one half-time switch found from the jersey numbers read on the
+        # shooters (against the rosters) and their kit colours
+        tt = None
         try:
             from agx_pipeline.team_assign import assign_game, team_for_shot
-            tt = assign_game(d)
+            tt = assign_game(d, rosters)
             if tt:
                 patch = {"tracker_teams": tt}
                 for lid in (d.get("cv_points") or {}):
@@ -348,9 +411,41 @@ def maybe_publish():
                             patch["cv_points.%s.team" % lid] = team
                 game_doc(g).update(patch)
                 d = game_doc(g).get().to_dict() or {}
-                log("game %s teams: half-time %s, left basket first: %s" % (g, tt.get("switch_epoch"), tt.get("left_basket_first")))
+                log("game %s teams (%s): half-time %s, left basket first: %s" % (
+                    g, tt.get("source"), tt.get("switch_epoch"), tt.get("left_basket_first")))
         except Exception as e:  # noqa: BLE001
             log("team pass failed for %s: %s" % (g, e))
+        # shooters by appearance: a hint for the shots whose number could not be read
+        if LOOKS and tt and rosters:
+            try:
+                import looks as LK
+                from agx_pipeline.team_assign import team_for_shot
+                clips = LK.load_game(os.path.join(LOOKS_DIR, g))
+                ans = LK.name_shooters(clips, rosters, lambda c: team_for_shot(tt, c.get("side"), c.get("epoch")))
+                patch = {}
+                for cname, a in ans.items():
+                    field, lid = ("cv_misses", cname[:-5]) if cname.endswith("_miss") else ("cv_points", cname)
+                    if lid in (d.get(field) or {}):
+                        patch["%s.%s.who_looks" % (field, lid)] = a
+                if patch:
+                    game_doc(g).update(patch)
+                    d = game_doc(g).get().to_dict() or {}
+                log("game %s shooters by appearance: %d of %d clips" % (g, len(patch), len(clips)))
+                if not pend:
+                    shutil.rmtree(os.path.join(LOOKS_DIR, g), ignore_errors=True)      # final publish
+            except Exception as e:  # noqa: BLE001
+                log("appearance pass failed for %s: %s" % (g, e))
+        # the game's annotation cards, if ingest has already made them: bring them up to date with
+        # this game's tracker results (type, jersey, green/yellow/red flag); cards an annotator
+        # changed are never touched. If ingest comes later it builds the cards from these results.
+        if REFRESH_CARDS:
+            try:
+                from plays_sync import refresh_cv_cards
+                if ag and ag.get("id"):
+                    st = refresh_cv_cards(uc, ag["id"], d, rosters)
+                    log("game %s cards refreshed: %s" % (g, st))
+            except Exception as e:  # noqa: BLE001
+                log("card refresh failed for %s: %s" % (g, e))
         from agx_pipeline.core_highlight import publish_core_highlight
         date = None
         for h in (d.get("highlights") or {}).values():
@@ -366,7 +461,7 @@ def maybe_publish():
 # ---------------------------------------------------------------- main loop
 def step():
     """Do one unit of work. Returns True if something was processed."""
-    pend = jobs("pending")
+    pend = sorted(jobs("pending"), key=lambda nj: nj[1].get("made") is False)   # makes first: they feed the reel
     for name, job in pend:
         if detector_behind(job["game_id"]):
             continue

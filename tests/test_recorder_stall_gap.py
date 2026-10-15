@@ -152,3 +152,48 @@ def test_failed_angles_are_excluded():
 def test_one_angle_alone_is_not_comparable():
     assert _check_angle_skew(_res(FL=2929.0)) is None
     assert _check_angle_skew([]) is None
+
+
+# ---- concat keeps the true end of the master ------------------------------ #
+
+class FakeConcatController(FakeController):
+    _concat_segments = recording.RecordingController._concat_segments
+
+    def __init__(self, sessions):
+        import threading
+        self._wd_lock = threading.Lock()
+        self._sessions = sessions
+
+    @staticmethod
+    def _seg_ok(path):
+        return True
+
+    @staticmethod
+    def _seg_duration(path):
+        return 100.0
+
+
+def test_concat_reports_when_the_last_segment_ended(tmp_path, monkeypatch):
+    """The rewrite gives the master a new mtime; the live-card anchor needs the old end."""
+    import subprocess
+
+    session = tmp_path / "game"
+    session.mkdir()
+    master, seg2 = session / "game_FL.mp4", session / "game_FL.r1.mp4"
+    for p, t in ((master, 1_000_100.0), (seg2, 1_000_230.0)):
+        p.write_bytes(b"x")
+        os.utime(p, (t, t))
+
+    def fake_ffmpeg(cmd, **kw):
+        open(cmd[-1], "wb").write(b"stitched")       # the -c copy output, written "now"
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(recording.subprocess, "run", fake_ffmpeg)
+    run = {"angle": "FL", "session_dir": str(session), "segments": [str(master), str(seg2)],
+           "seg_starts": [1_000_000.0, 1_000_130.0], "restart": 1}
+    ctl = FakeConcatController({"game": {"runs": [run]}})
+
+    report = ctl._concat_segments("game")
+
+    assert report["FL"]["end_epoch"] == 1_000_230.0
+    assert os.path.getmtime(master) > 1_000_230.0                   # the file itself moved
