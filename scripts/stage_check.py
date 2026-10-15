@@ -83,6 +83,76 @@ def check_who() -> Tuple[str, str]:
     return OK, "scan script, models and roster all present"
 
 
+def _detector_weight() -> str:
+    """The .pt the detector will open, resolved the way node.py resolves it --
+    imported rather than re-derived, so this can never name a different file
+    than production loads."""
+    from agx_pipeline.shot_detect import node  # noqa: PLC0415
+    return os.getenv("SHOT_DET_WEIGHT", node._DEFAULT_WEIGHT)
+
+
+def check_detector(load: bool = False) -> Tuple[str, str]:
+    """Is the detector going to run the engine it was configured with?
+
+    The detector runs a TensorRT engine when SHOT_DET_ENGINE points at one, and
+    the .pt whenever it cannot. The fallback is deliberate and it is also the
+    thing worth checking: a box configured for the engine and quietly running
+    the .pt works, at roughly half the speed, and says so only in a log line at
+    startup.
+
+    Three ways that happens, all checked here: the engine file is gone, a GPU
+    fault disabled it and left the marker behind, or it loads and fails its
+    probe. The .pt is checked too, because it is now the fallback rather than
+    just the default -- if it is missing there is nothing to fall back to.
+
+    `load` runs the detector's own probe in a subprocess. It costs seconds and
+    a CUDA context, so it stays opt-in and belongs on a deploy gate.
+    """
+    try:
+        weight = Path(_detector_weight())
+    except Exception as exc:  # noqa: BLE001
+        return BLOCKED, f"cannot resolve the detector weight: {exc}"
+    if weight.is_symlink() and not weight.exists():
+        return BLOCKED, (f"the .pt is a DANGLING SYMLINK: {weight} -> "
+                         f"{os.readlink(weight)}")
+    if not weight.is_file():
+        return BLOCKED, f"the .pt is missing, so there is no fallback: {weight}"
+
+    engine = os.getenv("SHOT_DET_ENGINE", "").strip()
+    if not engine:
+        return OK, (f"PyTorch .pt: {weight} — SHOT_DET_ENGINE is not set, so the "
+                    f"engine is not in use")
+
+    # Reuse the detector's own marker path so the two cannot disagree about
+    # which file means "disabled".
+    try:
+        from agx_pipeline.shot_detect.detect import ENGINE_DISABLED_MARK  # noqa: PLC0415
+    except Exception as exc:  # noqa: BLE001
+        return BLOCKED, f"cannot import the detector: {exc}"
+    if os.path.exists(ENGINE_DISABLED_MARK):
+        return BLOCKED, (f"the engine was disabled after a GPU fault and the box "
+                         f"is on the .pt: delete {ENGINE_DISABLED_MARK} to "
+                         f"re-enable it")
+    if not Path(engine).is_file():
+        return BLOCKED, (f"SHOT_DET_ENGINE is set but the file is gone, so the "
+                         f"detector will run the .pt at about half speed: {engine}")
+
+    if not load:
+        return OK, f"TensorRT engine: {engine} (run with --load to prove it runs)"
+
+    try:
+        from agx_pipeline.shot_detect.detect import _probe_in_subprocess  # noqa: PLC0415
+        why = _probe_in_subprocess(engine)
+    except Exception as exc:  # noqa: BLE001
+        return BLOCKED, f"the probe itself failed: {exc}"
+    if why:
+        return BLOCKED, (f"the engine fails the detector's own probe ({why}), so "
+                         f"the box will run the .pt. An engine only runs on the "
+                         f"device and TensorRT version that built it — rebuild "
+                         f"with scripts/build_shot_engine.py")
+    return OK, f"TensorRT engine passed the detector's probe: {engine}"
+
+
 def check_eval() -> Tuple[str, str]:
     """The eval is only useful if it scores what production runs."""
     sys.path.insert(0, str(REPO / "scripts" / "gt_eval"))
@@ -99,9 +169,21 @@ def check_eval() -> Tuple[str, str]:
     return OK, f"matches production ({prod.get('SHOT_ATTRIB')})"
 
 
-def main() -> int:
+def main(argv: Optional[List[str]] = ()) -> int:
+    # Defaults to no flags rather than sys.argv so that callers (and the tests)
+    # can invoke main() bare without inheriting whatever ran the process; the
+    # CLI passes sys.argv[1:] explicitly below.
+    import argparse  # noqa: PLC0415
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--load", action="store_true",
+                    help="run the detector's own probe against the TensorRT "
+                         "engine (needs the GPU; catches an engine built for "
+                         "another box or another TensorRT version)")
+    args = ap.parse_args(argv)
+
     checks = (("TYPE (live typing)", check_typing),
               ("WHO (jersey scan)", check_who),
+              ("DETECTOR engine + .pt", lambda: check_detector(load=args.load)),
               ("TYPE eval harness", check_eval))
     print(f"stage check — SHOT_TYPING_CWD={TYPING_CWD}\n")
     failed = False
@@ -120,4 +202,4 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(main(sys.argv[1:]))
