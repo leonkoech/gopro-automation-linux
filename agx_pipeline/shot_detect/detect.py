@@ -19,6 +19,7 @@ Frame extraction (sequential decode of a window from an mp4 — OpenCV seeks lan
 """
 from __future__ import annotations
 
+import logging
 import os
 from typing import List, Optional
 
@@ -29,7 +30,11 @@ from agx_pipeline.shot_detect import logic
 DET_CONF = float(os.environ.get("SHOT_DET_CONF", "0.20"))
 DET_IMGSZ = int(os.environ.get("SHOT_DET_IMGSZ", "1280"))
 DET_BATCH = int(os.environ.get("SHOT_DET_BATCH", "16"))  # GPU batch for inference
+ENGINE_MAX_BATCH = 16   # what scripts/build_shot_engine.py builds the TensorRT engine for
+ENGINE_MAX_IMGSZ = 640  # ... and the largest image side it accepts
 BALL_CLASS = 0  # detector classes: 0 = Basketball, 1 = Basketball Hoop
+
+_log = logging.getLogger("agx.shot_detect")
 
 
 def _best_ball(boxes):
@@ -44,6 +49,29 @@ def _best_ball(boxes):
             best = ((x1 + x2) / 2.0, (y1 + y2) / 2.0,
                     max(x2 - x1, y2 - y1) / 2.0, cfd)
     return best
+
+
+class _EngineWithFallback:
+    """The TensorRT model, swapped for the .pt for good on its first failed call.
+
+    Every caller (live loop, ingest confirm, auto-detect, QA) only calls predict(). An engine that
+    loaded and answered its probe can still fail later; without this every later scan would raise and
+    the live loop would skip segment after segment. Here the failing call is answered by the .pt."""
+
+    def __init__(self, engine, load_pt, owner):
+        self._engine, self._load_pt, self._owner, self._pt = engine, load_pt, owner, None
+
+    def predict(self, *args, **kwargs):
+        if self._pt is None:
+            try:
+                return self._engine.predict(*args, **kwargs)
+            except Exception as e:  # noqa: BLE001 - any engine failure: switch to the .pt
+                _log.error("shot detector: TensorRT engine failed mid-run (%s: %s) — "
+                           "switching to the .pt for the rest of this process",
+                           type(e).__name__, str(e)[:200])
+                self._pt = self._load_pt()
+                self._owner.backend = "pytorch"
+        return self._pt.predict(*args, **kwargs)
 
 
 class ShotDetector:
@@ -61,7 +89,43 @@ class ShotDetector:
         self.device = device or (
             "cuda" if torch.cuda.is_available()
             else "mps" if torch.backends.mps.is_available() else "cpu")
-        self.model = YOLO(weight_path)
+        self.backend = "pytorch"
+        engine = self._load_engine(YOLO)
+        self.model = (_EngineWithFallback(engine, lambda: YOLO(weight_path), self)
+                      if engine is not None else YOLO(weight_path))
+
+    def _load_engine(self, YOLO):
+        """The TensorRT build of the same detector (SHOT_DET_ENGINE), or None to use the .pt.
+
+        On the Orin the engine takes inference from 1.39 s to 0.60 s per segment with the same calls
+        (60 segments: 19 / 19 verdicts identical, ball positions within 0.3 px). An engine only runs
+        on the device and TensorRT version that built it, and only for the shapes it was built for,
+        so it is used only when it loads AND answers a real-shaped batch; anything else falls back
+        to the .pt with the reason logged. Rebuild: scripts/build_shot_engine.py."""
+        path = os.environ.get("SHOT_DET_ENGINE", "").strip()
+        if not path:
+            return None
+        why = None
+        if not os.path.isfile(path):
+            why = "file not found"
+        elif DET_IMGSZ > ENGINE_MAX_IMGSZ:
+            why = "SHOT_DET_IMGSZ %d is above the engine's %d" % (DET_IMGSZ, ENGINE_MAX_IMGSZ)
+        elif DET_BATCH > ENGINE_MAX_BATCH:
+            why = "SHOT_DET_BATCH %d is above the engine's %d" % (DET_BATCH, ENGINE_MAX_BATCH)
+        elif not str(self.device).startswith("cuda"):
+            why = "no CUDA device"
+        if why is None:
+            try:
+                model = YOLO(path, task="detect")
+                probe = [np.zeros((540, 720, 3), np.uint8)] * ENGINE_MAX_BATCH
+                model.predict(probe, imgsz=DET_IMGSZ, conf=DET_CONF, verbose=False, device=self.device)
+                self.backend = "tensorrt"
+                _log.info("shot detector: TensorRT engine %s", path)
+                return model
+            except Exception as e:  # noqa: BLE001 - any load or run failure means: use the .pt
+                why = "%s: %s" % (type(e).__name__, str(e)[:200])
+        _log.error("shot detector: TensorRT engine %s not used (%s) — running the .pt, slower", path, why)
+        return None
 
     def _infer_batch(self, chunk, base_idx: int, track: List[tuple]) -> None:
         """Run one GPU batch and append any ball boxes to `track` (idx=base+j)."""

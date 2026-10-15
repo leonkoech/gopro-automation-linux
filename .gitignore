@@ -14,3 +14,7 @@ id_rsa
 # Alert dedup state written by scripts/monitor/monitor_jetsons.py
 .monitor-alert-state.json
 agx_pipeline/possession_tracker/assets/
+
+# TensorRT engines are device-specific; built on the AGX by scripts/build_shot_engine.py
+agx_pipeline/shot_detect/weights/*.engine
+agx_pipeline/shot_detect/weights/*.onnx
